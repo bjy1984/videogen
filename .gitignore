@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.gemini-bridge/
+.vite/
+.DS_Store
+*.log
