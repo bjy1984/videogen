@@ -2512,6 +2512,10 @@ label.secondary-button:focus-within {
   font-weight: 650;
 }
 
+.mask-control-grid .mask-control-wide {
+  grid-column: 1 / -1;
+}
+
 .mask-control-grid input,
 .mask-control-grid select {
   width: 100%;
@@ -2522,6 +2526,12 @@ label.secondary-button:focus-within {
   background: white;
   color: var(--text);
   font-size: 12px;
+}
+
+.mask-control-grid input[type="range"] {
+  min-height: 30px;
+  padding: 0;
+  accent-color: var(--accent);
 }
 
 .keyframe-list {

@@ -20,6 +20,15 @@ import numpy as np
 
 Rect = tuple[float, float, float, float]
 
+DEFAULT_EXPAND_RATIO = 0.06
+MAX_EXPAND_RATIO = 0.12
+MIN_TRACKED_AREA_RATIO = 0.42
+MAX_TRACKED_AREA_RATIO = 1.85
+MIN_ANCHOR_AREA_RATIO = 0.28
+MAX_ANCHOR_AREA_RATIO = 2.35
+MAX_ASPECT_RATIO_CHANGE = 1.75
+MAX_CENTER_SHIFT = 0.22
+
 
 @dataclass
 class Keyframe:
@@ -70,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block", type=int, default=20, help="Mosaic block size.")
     parser.add_argument("--blur", type=int, default=51, help="Gaussian blur kernel size.")
     parser.add_argument("--solid-color", default="0,0,0", help="BGR solid fill color.")
+    parser.add_argument("--edge-strength", type=float, default=0.55, help="Mask opacity at the rectangle edge; center stays fully masked.")
     parser.add_argument("--block-on-red", action="store_true", help="Exit non-zero if any red issue is produced.")
     parser.add_argument("--keep-temp", action="store_true")
     return parser.parse_args()
@@ -122,6 +132,7 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
     processed_frames = 0
     masked_frames = 0
     skipped_low_confidence_frames: set[int] = set()
+    skipped_scale_frames: set[int] = set()
     started_at = time.time()
     solid_color = parse_solid_color(args.solid_color)
 
@@ -137,7 +148,20 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
 
             for track in tracks:
                 previous_state = states.get(track.id)
-                rect, confidence = resolve_track_rect(track, previous_state, frame, gray, processed_frames, frame_time)
+                rect, confidence, reject_reason = resolve_track_rect(track, previous_state, frame, gray, processed_frames, frame_time)
+                if reject_reason:
+                    skipped_scale_frames.add(processed_frames)
+                    issues.append(
+                        FrameIssue(
+                            track_id=track.id,
+                            frame_index=processed_frames,
+                            time=round(frame_time, 3),
+                            severity="error",
+                            reason=f"{track.label} {reject_reason}，已跳过该帧。",
+                            confidence=round(confidence, 3) if confidence is not None else None,
+                        )
+                    )
+                    continue
                 if rect is None:
                     continue
                 exact = exact_keyframe(track, processed_frames, frame_time)
@@ -149,13 +173,13 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
                             frame_index=processed_frames,
                             time=round(frame_time, 3),
                             severity="error",
-                            reason=f"{track.label} tracking confidence is low; mask skipped.",
+                            reason=f"{track.label} 追踪置信度不足，已跳过该帧。",
                             confidence=round(confidence, 3),
                         )
                     )
                     if not exact:
                         continue
-                apply_mask(output, expand_rect(rect, track.expand_ratio), track.effect, args.block, args.blur, solid_color)
+                apply_mask(output, expand_rect(rect, track.expand_ratio), track.effect, args.block, args.blur, solid_color, args.edge_strength)
                 states[track.id] = TrackState(
                     rect=rect,
                     previous_gray=gray,
@@ -183,6 +207,7 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
         "sourceFrameCount": frame_count,
         "maskedFrames": masked_frames,
         "skippedLowConfidenceFrames": len(skipped_low_confidence_frames),
+        "skippedScaleFrames": len(skipped_scale_frames),
         "trackCount": len(tracks),
         "manualKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "manual"),
         "correctedKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "correction"),
@@ -216,7 +241,11 @@ def parse_tracks(spec: Any, fps: float) -> list[TrackSpec]:
                 target_type=str(raw.get("targetType") or "logo"),
                 effect=str(raw.get("effect") or ("solid" if raw.get("targetType") == "text" else "mosaic")),
                 track_mode=str(raw.get("trackMode") or "planar"),
-                expand_ratio=float(raw.get("expandRatio") if raw.get("expandRatio") is not None else 0.16),
+                expand_ratio=clamp_float(
+                    float(raw.get("expandRatio") if raw.get("expandRatio") is not None else DEFAULT_EXPAND_RATIO),
+                    0.0,
+                    MAX_EXPAND_RATIO,
+                ),
                 confidence_threshold=float(raw.get("confidenceThreshold") if raw.get("confidenceThreshold") is not None else 0.45),
                 keyframes=keyframes,
             )
@@ -259,44 +288,69 @@ def resolve_track_rect(
     gray: np.ndarray,
     frame_index: int,
     frame_time: float,
-) -> tuple[Rect | None, float | None]:
+) -> tuple[Rect | None, float | None, str | None]:
     exact = exact_keyframe(track, frame_index, frame_time)
     if exact:
-        return exact.rect, 1.0
+        return exact.rect, 1.0, None
 
     if track.track_mode == "manual":
-        return None, None
+        return None, None, None
 
     if track.track_mode == "static":
-        return nearest_track_rect(track, frame_index), 1.0
+        return nearest_track_rect(track, frame_index), 1.0, None
 
     interpolated = interpolate_rect(track, frame_index)
     if track.track_mode == "interpolate":
-        return interpolated or nearest_track_rect(track, frame_index), 0.9
+        return interpolated or nearest_track_rect(track, frame_index), 0.9, None
 
+    reject_reason = None
+    reject_score = 0.0
     if state and state.previous_gray is not None:
-        tracked, score = track_with_cv_tracker(state.tracker, frame, state.rect)
+        tracked, score, reason = track_with_cv_tracker(state.tracker, frame, state.rect)
         if tracked is not None:
-            return tracked, score
+            anchored, anchor_reason = validate_anchor_scale(tracked, state.anchor_rect)
+            if anchored is not None:
+                return anchored, score, None
+            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
+        else:
+            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+
         anchor_gray = state.anchor_gray if state.anchor_gray is not None else state.previous_gray
         anchor_rect = state.anchor_rect if state.anchor_rect is not None else state.rect
         if track.track_mode == "planar":
-            tracked, score = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
+            tracked, score, reason = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
             if tracked is not None and score >= track.confidence_threshold * 0.75:
-                return tracked, score
-            tracked, score = track_with_lk(state.previous_gray, gray, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
-                tracked, score = track_with_features(state.previous_gray, gray, state.rect)
-        else:
-            tracked, score = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
-                tracked, score = track_with_lk(state.previous_gray, gray, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
-                tracked, score = track_with_features(state.previous_gray, gray, state.rect)
-        if tracked is not None:
-            return tracked, score
+                anchored, anchor_reason = validate_anchor_scale(tracked, anchor_rect)
+                if anchored is not None:
+                    return anchored, score, None
+                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
+            else:
+                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
 
-    return interpolated or nearest_track_rect(track, frame_index), 0.5 if interpolated else 0.35
+            tracked, score, reason = track_with_lk(state.previous_gray, gray, state.rect)
+            if tracked is None or score < track.confidence_threshold * 0.75:
+                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+                tracked, score, reason = track_with_features(state.previous_gray, gray, state.rect)
+        else:
+            tracked, score, reason = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
+            if tracked is None or score < track.confidence_threshold * 0.75:
+                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+                tracked, score, reason = track_with_lk(state.previous_gray, gray, state.rect)
+            if tracked is None or score < track.confidence_threshold * 0.75:
+                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+                tracked, score, reason = track_with_features(state.previous_gray, gray, state.rect)
+        if tracked is not None:
+            anchored, anchor_reason = validate_anchor_scale(tracked, anchor_rect)
+            if anchored is not None:
+                return anchored, score, None
+            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
+        else:
+            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+
+    if reject_reason:
+        return None, reject_score, reject_reason
+
+    return interpolated or nearest_track_rect(track, frame_index), 0.5 if interpolated else 0.35, None
 
 def exact_keyframe(track: TrackSpec, frame_index: int, frame_time: float) -> Keyframe | None:
     for keyframe in track.keyframes:
@@ -329,17 +383,17 @@ def interpolate_rect(track: TrackSpec, frame_index: int) -> Rect | None:
     return tuple(left.rect[index] + (right.rect[index] - left.rect[index]) * t for index in range(4))  # type: ignore[return-value]
 
 
-def track_with_features(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tuple[Rect | None, float]:
+def track_with_features(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tuple[Rect | None, float, str | None]:
     prev_crop, prev_offset = crop_from_rect(previous, rect, pad=0.15)
     search_crop, search_offset = crop_from_rect(current, rect, pad=0.55)
     if prev_crop.size == 0 or search_crop.size == 0:
-        return None, 0.0
+        return None, 0.0, None
 
     detector, norm = create_feature_detector()
     kp1, des1 = detector.detectAndCompute(prev_crop, None)
     kp2, des2 = detector.detectAndCompute(search_crop, None)
     if des1 is None or des2 is None or len(kp1) < 6 or len(kp2) < 6:
-        return None, 0.0
+        return None, 0.0, None
 
     matcher = cv2.BFMatcher(norm)
     matches = matcher.knnMatch(des1, des2, k=2)
@@ -351,13 +405,13 @@ def track_with_features(previous: np.ndarray, current: np.ndarray, rect: Rect) -
         if first.distance < 0.75 * second.distance:
             good.append(first)
     if len(good) < 6:
-        return None, 0.0
+        return None, 0.0, None
 
     src = np.float32([kp1[match.queryIdx].pt for match in good]).reshape(-1, 1, 2)
     dst = np.float32([kp2[match.trainIdx].pt for match in good]).reshape(-1, 1, 2)
     matrix, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=4.0)
     if matrix is None or inliers is None:
-        return None, 0.0
+        return None, 0.0, None
 
     x, y, w, h = rect_to_pixels(rect, previous.shape[1], previous.shape[0])
     local_corners = np.float32(
@@ -373,31 +427,33 @@ def track_with_features(previous: np.ndarray, current: np.ndarray, rect: Rect) -
     transformed[:, 1] += search_offset[1]
     next_rect = pixels_to_rect(points_to_bbox(transformed), current.shape[1], current.shape[0])
     score = float(np.count_nonzero(inliers)) / max(1, len(good))
-    return validate_rect(next_rect, rect), score
+    validated, reason = validate_tracked_rect(next_rect, rect)
+    return validated, score if validated is not None else 0.0, reason
 
 
-def track_with_lk(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tuple[Rect | None, float]:
+def track_with_lk(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tuple[Rect | None, float, str | None]:
     x, y, w, h = rect_to_pixels(rect, previous.shape[1], previous.shape[0])
     mask = np.zeros_like(previous)
     mask[y : y + h, x : x + w] = 255
     points = cv2.goodFeaturesToTrack(previous, maxCorners=80, qualityLevel=0.01, minDistance=5, mask=mask)
     if points is None or len(points) < 4:
-        return None, 0.0
+        return None, 0.0, None
     next_points, status, _ = cv2.calcOpticalFlowPyrLK(previous, current, points, None)
     if next_points is None or status is None:
-        return None, 0.0
+        return None, 0.0, None
     good_prev = points[status.reshape(-1) == 1]
     good_next = next_points[status.reshape(-1) == 1]
     if len(good_prev) < 4:
-        return None, 0.0
+        return None, 0.0, None
     matrix, inliers = cv2.estimateAffinePartial2D(good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=4.0)
     if matrix is None or inliers is None:
-        return None, 0.0
+        return None, 0.0, None
     corners = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]).reshape(-1, 1, 2)
     transformed = cv2.transform(corners, matrix).reshape(-1, 2)
     next_rect = pixels_to_rect(points_to_bbox(transformed), current.shape[1], current.shape[0])
     score = float(np.count_nonzero(inliers)) / max(1, len(good_prev))
-    return validate_rect(next_rect, rect), score
+    validated, reason = validate_tracked_rect(next_rect, rect)
+    return validated, score if validated is not None else 0.0, reason
 
 
 def create_cv_tracker(frame: np.ndarray, rect: Rect) -> Any | None:
@@ -412,35 +468,36 @@ def create_cv_tracker(frame: np.ndarray, rect: Rect) -> Any | None:
         return None
 
 
-def track_with_cv_tracker(tracker: Any | None, current: np.ndarray, previous_rect: Rect) -> tuple[Rect | None, float]:
+def track_with_cv_tracker(tracker: Any | None, current: np.ndarray, previous_rect: Rect) -> tuple[Rect | None, float, str | None]:
     if tracker is None:
-        return None, 0.0
+        return None, 0.0, None
     try:
         ok, bbox = tracker.update(current)
     except cv2.error:
-        return None, 0.0
+        return None, 0.0, None
     if not ok:
-        return None, 0.0
+        return None, 0.0, None
     x, y, w, h = bbox
     candidate = pixels_to_rect((int(round(x)), int(round(y)), int(round(w)), int(round(h))), current.shape[1], current.shape[0])
-    return validate_rect(candidate, previous_rect), 0.76
+    validated, reason = validate_tracked_rect(candidate, previous_rect)
+    return validated, 0.76 if validated is not None else 0.0, reason
 
 
-def track_with_template(template_frame: np.ndarray, current: np.ndarray, template_rect: Rect, search_rect: Rect | None = None) -> tuple[Rect | None, float]:
+def track_with_template(template_frame: np.ndarray, current: np.ndarray, template_rect: Rect, search_rect: Rect | None = None) -> tuple[Rect | None, float, str | None]:
     search_rect = search_rect or template_rect
     template_crop, template_offset = crop_from_rect(template_frame, template_rect, pad=0.08)
     search_crop, search_offset = crop_from_rect(current, search_rect, pad=0.9)
     if template_crop.size == 0 or search_crop.size == 0:
-        return None, 0.0
+        return None, 0.0, None
     if template_crop.shape[0] < 10 or template_crop.shape[1] < 10:
-        return None, 0.0
+        return None, 0.0, None
     if search_crop.shape[0] < template_crop.shape[0] or search_crop.shape[1] < template_crop.shape[1]:
-        return None, 0.0
+        return None, 0.0, None
 
     template_signal = matching_signal(template_crop)
     search_signal = matching_signal(search_crop)
     if float(np.std(template_signal)) < 4.0:
-        return None, 0.0
+        return None, 0.0, None
 
     work_scale = min(1.0, 420.0 / max(search_signal.shape[:2]))
     if work_scale < 1.0:
@@ -450,6 +507,8 @@ def track_with_template(template_frame: np.ndarray, current: np.ndarray, templat
     x, y, w, h = rect_to_pixels(template_rect, template_frame.shape[1], template_frame.shape[0])
     best_rect: Rect | None = None
     best_score = 0.0
+    best_reject_reason = None
+    best_reject_score = 0.0
     rect_offset_x = x - template_offset[0]
     rect_offset_y = y - template_offset[1]
     for scale in (0.94, 1.0, 1.06):
@@ -468,12 +527,15 @@ def track_with_template(template_frame: np.ndarray, current: np.ndarray, templat
             max(1, int(round(w * scale))),
             max(1, int(round(h * scale))),
         )
-        candidate = validate_rect(pixels_to_rect(candidate_pixels, current.shape[1], current.shape[0]), search_rect)
+        candidate, reject_reason = validate_tracked_rect(pixels_to_rect(candidate_pixels, current.shape[1], current.shape[0]), search_rect)
         if candidate is not None and max_value > best_score:
             best_rect = candidate
             best_score = float(max_value)
+        elif reject_reason and max_value > best_reject_score:
+            best_reject_reason = reject_reason
+            best_reject_score = float(max_value)
 
-    return best_rect, best_score
+    return best_rect, best_score, None if best_rect is not None else best_reject_reason
 
 
 def matching_signal(gray: np.ndarray) -> np.ndarray:
@@ -510,17 +572,71 @@ def points_to_bbox(points: np.ndarray) -> tuple[int, int, int, int]:
     return x1, y1, max(1, x2 - x1), max(1, y2 - y1)
 
 
-def validate_rect(candidate: Rect | None, previous: Rect) -> Rect | None:
+def validate_tracked_rect(candidate: Rect | None, previous: Rect) -> tuple[Rect | None, str | None]:
     if candidate is None:
-        return None
+        return None, None
     _, _, pw, ph = previous
     x, y, w, h = candidate
     if w <= 0.004 or h <= 0.004:
-        return None
+        return None, "追踪框过小"
+    if center_distance(candidate, previous) > MAX_CENTER_SHIFT:
+        return None, "追踪跳变过大"
+    aspect_reason = aspect_ratio_reason(candidate, previous)
+    if aspect_reason:
+        return None, aspect_reason
     area_ratio = (w * h) / max(0.000001, pw * ph)
-    if area_ratio < 0.18 or area_ratio > 4.5:
-        return None
-    return clamp_rect((x, y, w, h))
+    if area_ratio < MIN_TRACKED_AREA_RATIO:
+        return None, "追踪尺度缩小过多"
+    if area_ratio > MAX_TRACKED_AREA_RATIO:
+        return None, "追踪尺度放大过多"
+    return clamp_rect((x, y, w, h)), None
+
+
+def validate_anchor_scale(candidate: Rect, anchor: Rect | None) -> tuple[Rect | None, str | None]:
+    if anchor is None:
+        return candidate, None
+    aspect_reason = aspect_ratio_reason(candidate, anchor)
+    if aspect_reason:
+        return None, aspect_reason
+    area_ratio = rect_area(candidate) / max(0.000001, rect_area(anchor))
+    if area_ratio < MIN_ANCHOR_AREA_RATIO:
+        return None, "追踪尺度小于人工关键帧范围"
+    if area_ratio > MAX_ANCHOR_AREA_RATIO:
+        return None, "追踪尺度超出人工关键帧范围"
+    return candidate, None
+
+
+def aspect_ratio_reason(candidate: Rect, reference: Rect) -> str | None:
+    _, _, cw, ch = candidate
+    _, _, rw, rh = reference
+    candidate_ratio = cw / max(0.000001, ch)
+    reference_ratio = rw / max(0.000001, rh)
+    ratio_change = candidate_ratio / max(0.000001, reference_ratio)
+    if ratio_change > MAX_ASPECT_RATIO_CHANGE or ratio_change < 1.0 / MAX_ASPECT_RATIO_CHANGE:
+        return "追踪框宽高比例变化过大"
+    return None
+
+
+def center_distance(candidate: Rect, reference: Rect) -> float:
+    cx, cy = rect_center(candidate)
+    rx, ry = rect_center(reference)
+    return math.hypot(cx - rx, cy - ry)
+
+
+def rect_center(rect: Rect) -> tuple[float, float]:
+    x, y, w, h = rect
+    return x + w / 2, y + h / 2
+
+
+def rect_area(rect: Rect) -> float:
+    _, _, w, h = rect
+    return max(0.0, w * h)
+
+
+def remember_rejection(current_reason: str | None, current_score: float, reason: str | None, score: float) -> tuple[str | None, float]:
+    if reason and score >= current_score:
+        return reason, score
+    return current_reason, current_score
 
 
 def apply_mask(
@@ -530,19 +646,35 @@ def apply_mask(
     block_size: int,
     blur_size: int,
     solid_color: tuple[int, int, int],
+    edge_strength: float,
 ) -> None:
     x, y, w, h = rect_to_pixels(rect, frame.shape[1], frame.shape[0])
     if w <= 0 or h <= 0:
         return
     roi = frame[y : y + h, x : x + w]
     if effect == "solid":
-        roi[:] = solid_color
-        return
-    if effect == "blur":
+        masked = np.full_like(roi, solid_color)
+    elif effect == "blur":
         kernel = max(3, blur_size | 1)
-        frame[y : y + h, x : x + w] = cv2.GaussianBlur(roi, (kernel, kernel), 0)
-        return
-    frame[y : y + h, x : x + w] = mosaic(roi, block_size)
+        masked = cv2.GaussianBlur(roi, (kernel, kernel), 0)
+    else:
+        masked = mosaic(roi, block_size)
+    frame[y : y + h, x : x + w] = center_weighted_blend(roi, masked, edge_strength)
+
+
+def center_weighted_blend(original: np.ndarray, masked: np.ndarray, edge_strength: float) -> np.ndarray:
+    edge = clamp_float(edge_strength, 0.0, 1.0)
+    if edge >= 0.995:
+        return masked
+    height, width = original.shape[:2]
+    yy, xx = np.ogrid[:height, :width]
+    cx = max(1.0, (width - 1) / 2.0)
+    cy = max(1.0, (height - 1) / 2.0)
+    distance = np.sqrt(((xx - cx) / cx) ** 2 + ((yy - cy) / cy) ** 2)
+    falloff = np.clip(distance, 0.0, 1.0) ** 1.35
+    alpha = (1.0 - (1.0 - edge) * falloff).astype(np.float32)[..., None]
+    blended = masked.astype(np.float32) * alpha + original.astype(np.float32) * (1.0 - alpha)
+    return np.clip(blended, 0, 255).astype(np.uint8)
 
 
 def mosaic(roi: np.ndarray, block_size: int) -> np.ndarray:
@@ -617,6 +749,12 @@ def clamp01(value: float) -> float:
     if math.isnan(value) or math.isinf(value):
         return 0.0
     return min(1.0, max(0.0, value))
+
+
+def clamp_float(value: float, minimum: float, maximum: float) -> float:
+    if math.isnan(value) or math.isinf(value):
+        return minimum
+    return min(maximum, max(minimum, value))
 
 
 def merge_audio(input_path: Path, temp_video: Path, output_path: Path, crf: str) -> None:

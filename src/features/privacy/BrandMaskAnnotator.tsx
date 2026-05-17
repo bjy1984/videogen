@@ -113,7 +113,7 @@ export function BrandMaskAnnotator({
       targetType,
       effect: brandMaskDefaultEffect(targetType),
       trackMode: "planar",
-      expandRatio: targetType === "text" ? 0.12 : 0.18,
+      expandRatio: 0.06,
       confidenceThreshold: 0.45,
       keyframes: []
     };
@@ -514,6 +514,17 @@ export function BrandMaskAnnotator({
                           onChange={(event) => updateTrack(track.id, { confidenceThreshold: normalizeConfidenceThreshold(event.target.value) })}
                         />
                       </label>
+                      <label className="mask-control-wide">
+                        <span>边距 {formatPercent(clampExpandRatio(track.expandRatio))}</span>
+                        <input
+                          type="range"
+                          min={0}
+                          max={0.12}
+                          step={0.01}
+                          value={clampExpandRatio(track.expandRatio)}
+                          onChange={(event) => updateTrack(track.id, { expandRatio: normalizeExpandRatio(event.target.value) })}
+                        />
+                      </label>
                     </div>
                     <div className="keyframe-list">
                       {track.keyframes.map((keyframe) => (
@@ -537,7 +548,7 @@ export function BrandMaskAnnotator({
 
             <div className="mask-usage-note">
               <strong>使用顺序</strong>
-              <span>1. 新增追踪目标  2. 在首帧框住要遮挡的物体  3. 拖到漂移处补关键帧  4. 运行 CV 预览确认。</span>
+              <span>1. 新增追踪目标  2. 在首帧框住要遮挡的物体  3. 拖到漂移处补关键帧  4. 运行 CV 预览确认。默认小边距，中心重、边缘轻。</span>
             </div>
 
             <div className="mask-review-list">
@@ -764,6 +775,21 @@ function normalizeConfidenceThreshold(value: string) {
   return Math.min(0.9, Math.max(0.2, Math.round(parsed * 100) / 100));
 }
 
+function normalizeExpandRatio(value: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0.06;
+  return clampExpandRatio(Math.round(parsed * 100) / 100);
+}
+
+function clampExpandRatio(value: number) {
+  if (!Number.isFinite(value)) return 0.06;
+  return Math.min(0.12, Math.max(0, value));
+}
+
+function formatPercent(value: number) {
+  return `${Math.round(value * 100)}%`;
+}
+
 function preprocessStatusLabel(status: string) {
   if (status === "done") return "已完成";
   if (status === "running") return "处理中";
@@ -780,6 +806,7 @@ function preprocessSummaryText(summary?: VideoPreprocessTrace["summary"]) {
     frameCount !== undefined ? `${frameCount}帧` : "",
     summary.durationSec !== undefined ? `${summary.durationSec.toFixed(2)}秒素材` : "",
     summary.skippedLowConfidenceFrames !== undefined ? `跳过低置信${summary.skippedLowConfidenceFrames}帧` : "",
+    summary.skippedScaleFrames !== undefined ? `跳过尺度异常${summary.skippedScaleFrames}帧` : "",
     summary.elapsedSec !== undefined ? `耗时${summary.elapsedSec.toFixed(2)}秒` : ""
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "暂无处理统计";

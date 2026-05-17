@@ -66,6 +66,7 @@ export interface VideoPreprocessTrace {
     manualKeyframes?: number;
     correctedKeyframes?: number;
     skippedLowConfidenceFrames?: number;
+    skippedScaleFrames?: number;
     warningFrames?: number;
     blockedFrames?: number;
     elapsedSec?: number;

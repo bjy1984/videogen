@@ -175,7 +175,7 @@ export function MaskTestPage({
           onChange={updateBrandMasks}
           onPreviewTrace={(trace) => {
             setSegment((current) => applyPreprocessTraces(current, [trace]));
-            setStatusText(`物体追踪预览完成：${trace.summary?.trackCount ?? 0}个目标，跳过低置信 ${trace.summary?.skippedLowConfidenceFrames ?? 0}帧，阻塞 ${trace.summary?.blockedFrames ?? 0}帧。`);
+            setStatusText(`物体追踪预览完成：${trace.summary?.trackCount ?? 0}个目标，跳过低置信 ${trace.summary?.skippedLowConfidenceFrames ?? 0}帧，跳过尺度异常 ${trace.summary?.skippedScaleFrames ?? 0}帧，阻塞 ${trace.summary?.blockedFrames ?? 0}帧。`);
           }}
           onClose={() => setIsAnnotatorOpen(false)}
         />
