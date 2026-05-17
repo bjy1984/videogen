@@ -88,8 +88,17 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
     const sourcePath = path.join(outputDir, `source.${extension}`);
     const outputPath = path.join(outputDir, `face_mosaic.${extension}`);
     await copyFile(req.file.path, sourcePath);
-    await runFaceMosaicCommand(commandTemplate, sourcePath, outputPath);
+    const commandResult = await runPreprocessCommand({
+      commandTemplate,
+      inputPath: sourcePath,
+      outputPath,
+      timeoutMs: Number(process.env.VIDEOGEN_FACE_MOSAIC_TIMEOUT_MS || 180_000),
+      placeholderError: "VIDEOGEN_FACE_MOSAIC_COMMAND 必须包含 {input} 和 {output} 占位符。",
+      failurePrefix: "人脸打码预处理命令失败",
+      timeoutMessage: "人脸打码预处理超时"
+    });
     await stat(outputPath);
+    const summary = parseCommandSummary(commandResult.stdout);
 
     const now = new Date().toISOString();
     res.json({
@@ -103,6 +112,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
         outputVideoUrl: assetUrl(req, relativeDir, `face_mosaic.${extension}`),
         localPath: outputPath,
         publicAssetRequired: true,
+        summary,
         createdAt: now,
         updatedAt: now
       }
@@ -111,6 +121,85 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
     const status = error instanceof BridgeError ? error.status : 500;
     res.status(status).json({
       error: error instanceof Error ? error.message : "Face mosaic preprocessing failed."
+    });
+  }
+});
+
+app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
+  try {
+    const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand();
+    const tracks = parseTracks(String(req.body.tracks || "[]"));
+    if (!tracks.length) {
+      throw new BridgeError("品牌/文字打码至少需要一个用户标注遮罩。", 400);
+    }
+
+    const sourceLocalPath = String(req.body.sourceLocalPath || "").trim();
+    if (!req.file && !sourceLocalPath) {
+      throw new BridgeError("请上传需要预处理的原素材视频，或传入上一步预处理的 sourceLocalPath。", 400);
+    }
+
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const segmentId = safePathPart(String(req.body.segmentId || "segment"));
+    const preprocessId = safePathPart(`brand_mask_${Date.now()}`);
+    const sourceName = req.file?.originalname || String(req.body.sourceVideoName || "source.mp4");
+    const extension =
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(sourceName) ||
+      extensionFromUrl(sourceLocalPath) ||
+      "mp4";
+    const relativeDir = path.join("privacy", projectId, segmentId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    const outputPath = path.join(outputDir, `brand_mask.${extension}`);
+    const specPath = path.join(outputDir, "brand_mask_spec.json");
+    if (req.file) {
+      await copyFile(req.file.path, sourcePath);
+    } else {
+      await copyFile(resolveAssetLocalPath(sourceLocalPath), sourcePath);
+    }
+    await writeFile(specPath, JSON.stringify({ tracks }, null, 2), "utf8");
+
+    const commandResult = await runPreprocessCommand({
+      commandTemplate,
+      inputPath: sourcePath,
+      outputPath,
+      specPath,
+      timeoutMs: Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000),
+      placeholderError: "VIDEOGEN_BRAND_MASK_COMMAND 必须包含 {input}、{output} 和 {spec} 占位符。",
+      requiredPlaceholders: ["{input}", "{output}", "{spec}"],
+      failurePrefix: "品牌/文字打码预处理命令失败",
+      timeoutMessage: "品牌/文字打码预处理超时"
+    });
+    await stat(outputPath);
+    const parsed = parseCommandSummary(commandResult.stdout);
+    const issues = Array.isArray(parsed?.issues) ? parsed.issues : undefined;
+    const summary = parsed && typeof parsed === "object" ? { ...parsed } : undefined;
+    if (summary && "issues" in summary) delete summary.issues;
+
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "brand-mask",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: sourceName,
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, `brand_mask.${extension}`),
+        localPath: outputPath,
+        publicAssetRequired: true,
+        summary,
+        issues,
+        createdAt: now,
+        updatedAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Brand mask preprocessing failed."
     });
   }
 });
@@ -430,21 +519,34 @@ async function fetchWithTimeout(url: string, init: TimedRequestInit = {}) {
   }
 }
 
-async function runFaceMosaicCommand(commandTemplate: string, inputPath: string, outputPath: string) {
-  if (!commandTemplate.includes("{input}") || !commandTemplate.includes("{output}")) {
-    throw new BridgeError("VIDEOGEN_FACE_MOSAIC_COMMAND 必须包含 {input} 和 {output} 占位符。", 500);
+async function runPreprocessCommand(input: {
+  commandTemplate: string;
+  inputPath: string;
+  outputPath: string;
+  specPath?: string;
+  timeoutMs: number;
+  placeholderError: string;
+  failurePrefix: string;
+  timeoutMessage: string;
+  requiredPlaceholders?: string[];
+}) {
+  const requiredPlaceholders = input.requiredPlaceholders ?? ["{input}", "{output}"];
+  if (!requiredPlaceholders.every((placeholder) => input.commandTemplate.includes(placeholder))) {
+    throw new BridgeError(input.placeholderError, 500);
   }
-  const command = commandTemplate
-    .replaceAll("{input}", shellQuote(inputPath))
-    .replaceAll("{output}", shellQuote(outputPath));
-  const timeoutMs = Number(process.env.VIDEOGEN_FACE_MOSAIC_TIMEOUT_MS || 180_000);
-  await new Promise<void>((resolve, reject) => {
+  const command = input.commandTemplate
+    .replaceAll("{input}", shellQuote(input.inputPath))
+    .replaceAll("{output}", shellQuote(input.outputPath))
+    .replaceAll("{spec}", shellQuote(input.specPath || ""));
+  return await new Promise<{ stdout: string }>((resolve, reject) => {
     const child = spawn(command, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const timeoutId = setTimeout(() => {
       child.kill("SIGTERM");
-      reject(new BridgeError(`人脸打码预处理超时：${Math.round(timeoutMs / 1000)}秒未完成。`, 504));
-    }, timeoutMs);
+      reject(new BridgeError(`${input.timeoutMessage}：${Math.round(input.timeoutMs / 1000)}秒未完成。`, 504));
+    }, input.timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
     child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
     child.on("error", (error) => {
       clearTimeout(timeoutId);
@@ -453,11 +555,11 @@ async function runFaceMosaicCommand(commandTemplate: string, inputPath: string, 
     child.on("close", (code) => {
       clearTimeout(timeoutId);
       if (code === 0) {
-        resolve();
+        resolve({ stdout: Buffer.concat(stdout).toString("utf8").trim() });
         return;
       }
       const detail = Buffer.concat(stderr).toString("utf8").trim();
-      reject(new BridgeError(`人脸打码预处理命令失败：${code}${detail ? `，${detail}` : ""}`, 500));
+      reject(new BridgeError(`${input.failurePrefix}：${code}${detail ? `，${detail}` : ""}`, 500));
     });
   });
 }
@@ -473,6 +575,48 @@ function defaultFaceMosaicCommand() {
       : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
   const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
   return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --input {input} --output {output}`;
+}
+
+function defaultBrandMaskCommand() {
+  const pythonPath = process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "brand_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec} --block-on-red`;
+}
+
+function parseCommandSummary(stdout: string) {
+  if (!stdout) return undefined;
+  const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  for (const line of [...lines].reverse()) {
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      return isRecord(parsed) ? parsed : undefined;
+    } catch {
+      // Try earlier lines.
+    }
+  }
+  return undefined;
+}
+
+function parseTracks(value: string) {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    throw new BridgeError("品牌/文字打码 tracks JSON 解析失败。", 400);
+  }
+}
+
+function resolveAssetLocalPath(value: string) {
+  const resolved = path.resolve(value);
+  const assetRoot = path.resolve(assetRootDir);
+  if (!resolved.startsWith(`${assetRoot}${path.sep}`)) {
+    throw new BridgeError("sourceLocalPath 必须来自当前 Video Generation Bridge 的资产目录。", 400);
+  }
+  return resolved;
 }
 
 async function readPayload(response: Response) {

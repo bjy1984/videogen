@@ -16,6 +16,7 @@ export interface GenerationJobInput {
   sourceVideoLocalPath?: string;
   sourceVideoName?: string;
   preprocessingTrace?: VideoPreprocessTrace;
+  preprocessingTraces?: VideoPreprocessTrace[];
   providerParams?: Record<string, unknown>;
 }
 

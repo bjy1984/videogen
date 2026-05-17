@@ -13,7 +13,7 @@ import type {
   SeedanceTaskResponse
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
-import type { VideoPreprocessTrace } from "../types";
+import type { BrandMaskTrack, VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
   ok: boolean;
@@ -90,6 +90,32 @@ export async function preprocessFaceMosaicBridge(input: {
     "/privacy/face-mosaic",
     formData,
     180_000
+  );
+}
+
+export async function preprocessBrandMaskBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  segmentId: string;
+  sourceRange?: string;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoName?: string;
+  tracks: BrandMaskTrack[];
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("segmentId", input.segmentId);
+  if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  formData.set("tracks", JSON.stringify(input.tracks));
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
+  return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
+    input.bridgeUrl,
+    "/privacy/brand-mask",
+    formData,
+    240_000
   );
 }
 

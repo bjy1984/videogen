@@ -36,6 +36,7 @@ export interface RemixAssetProviderTrace {
   localAssetPath?: string;
   originalVideoUrl?: string;
   preprocess?: VideoPreprocessTrace;
+  preprocesses?: VideoPreprocessTrace[];
   createdAt?: string;
   updatedAt?: string;
 }

@@ -5,10 +5,51 @@ export type Provider = "mock" | "comfyui" | "seedance" | "veo" | "kling" | "runw
 export type SegmentStatus = "idle" | "queued" | "generating" | "done" | "failed";
 export type SegmentBucketRole = "hook" | "pain" | "usp" | "trust" | "cta";
 export type SegmentContentStatus = "draft" | "needs-review" | "approved" | "blocked";
+export type BrandMaskTargetType = "logo" | "text" | "other";
+export type BrandMaskEffect = "mosaic" | "blur" | "solid";
+export type BrandMaskTrackMode = "static" | "interpolate" | "planar" | "optical-flow" | "manual";
+export type BrandMaskFrameSeverity = "warning" | "error";
+
+export interface BrandMaskRect {
+  type: "rect";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface BrandMaskKeyframe {
+  id: string;
+  time: number;
+  frameIndex?: number;
+  source: "manual" | "auto" | "correction";
+  shape: BrandMaskRect;
+}
+
+export interface BrandMaskFrameIssue {
+  trackId: string;
+  frameIndex: number;
+  time: number;
+  severity: BrandMaskFrameSeverity;
+  reason: string;
+  confidence?: number;
+}
+
+export interface BrandMaskTrack {
+  id: string;
+  label: string;
+  targetType: BrandMaskTargetType;
+  effect: BrandMaskEffect;
+  trackMode: BrandMaskTrackMode;
+  expandRatio: number;
+  confidenceThreshold: number;
+  keyframes: BrandMaskKeyframe[];
+  reviewIssues?: BrandMaskFrameIssue[];
+}
 
 export interface VideoPreprocessTrace {
   id: string;
-  kind: "face-mosaic";
+  kind: "face-mosaic" | "brand-mask";
   provider: "mock" | "local-bridge";
   status: "queued" | "running" | "done" | "failed" | "skipped";
   sourceVideoName?: string;
@@ -16,6 +57,19 @@ export interface VideoPreprocessTrace {
   outputVideoUrl?: string;
   localPath?: string;
   publicAssetRequired?: boolean;
+  summary?: {
+    frameCount?: number;
+    durationSec?: number;
+    width?: number;
+    height?: number;
+    trackCount?: number;
+    manualKeyframes?: number;
+    correctedKeyframes?: number;
+    warningFrames?: number;
+    blockedFrames?: number;
+    elapsedSec?: number;
+  };
+  issues?: BrandMaskFrameIssue[];
   error?: string;
   createdAt: string;
   updatedAt: string;
@@ -114,6 +168,9 @@ export interface VideoSegment {
   privacyEdits?: {
     faceMosaic?: boolean;
     faceMosaicPreprocess?: VideoPreprocessTrace;
+    brandMasks?: BrandMaskTrack[];
+    brandMaskPreprocess?: VideoPreprocessTrace;
+    preprocesses?: VideoPreprocessTrace[];
   };
   duration: number;
   scriptText: string;

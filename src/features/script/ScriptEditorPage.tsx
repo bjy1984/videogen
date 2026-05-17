@@ -1,8 +1,11 @@
-import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ScanFace, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ScanFace, ScanText, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
+import { useState } from "react";
 import { InfoItem } from "../../components/common/InfoItem";
 import { segmentStatusLabel } from "../../domain/labels";
-import type { AnalysisResult, SegmentBucketRole, SegmentContentStatus, VideoSegment } from "../../types";
-import { hasSegmentFaceMosaic } from "./privacyEdits";
+import type { AnalysisResult, BrandMaskTrack, SegmentBucketRole, SegmentContentStatus, VideoSegment } from "../../types";
+import { BrandMaskAnnotator } from "../privacy/BrandMaskAnnotator";
+import { buildBrandMaskReview } from "../privacy/brandMaskReview";
+import { hasSegmentBrandMasks, hasSegmentFaceMosaic } from "./privacyEdits";
 import { buildScriptAudit, type ScriptAuditIssue, type ScriptAuditReport } from "./scriptAudit";
 import type { ScriptRewriteSuggestion, ScriptSuggestionApplyTarget, ScriptRevision } from "./scriptRevision";
 
@@ -11,6 +14,7 @@ export function ScriptEditorPage({
   segments,
   scriptRevisions,
   scriptSuggestions,
+  sourcePreviewUrl,
   onSegment,
   onMove,
   onDuplicate,
@@ -22,6 +26,7 @@ export function ScriptEditorPage({
   onApplySuggestion,
   onToggleFaceMosaic,
   onToggleAllFaceMosaic,
+  onUpdateBrandMasks,
   onCreate,
   onBack,
   onNext
@@ -30,6 +35,7 @@ export function ScriptEditorPage({
   segments: VideoSegment[];
   scriptRevisions: ScriptRevision[];
   scriptSuggestions: Record<string, ScriptRewriteSuggestion>;
+  sourcePreviewUrl: string;
   onSegment: (id: string, patch: Partial<VideoSegment>) => void;
   onMove: (id: string, direction: -1 | 1) => void;
   onDuplicate: (id: string) => void;
@@ -41,16 +47,20 @@ export function ScriptEditorPage({
   onApplySuggestion: (segmentId: string, target: ScriptSuggestionApplyTarget) => void;
   onToggleFaceMosaic: (segmentId: string) => void;
   onToggleAllFaceMosaic: () => void;
+  onUpdateBrandMasks: (segmentId: string, brandMasks: BrandMaskTrack[]) => void;
   onCreate: () => void;
   onBack: () => void;
   onNext: () => void;
 }) {
+  const [brandMaskSegmentId, setBrandMaskSegmentId] = useState("");
   const totalDuration = segments.reduce((total, segment) => total + segment.duration, 0);
   const totalScriptChars = segments.reduce((total, segment) => total + segment.scriptText.length, 0);
   const allFaceMosaic = segments.length > 0 && segments.every(hasSegmentFaceMosaic);
   const audit = buildScriptAudit(segments);
+  const brandMaskSegment = segments.find((segment) => segment.id === brandMaskSegmentId);
 
   return (
+    <>
     <section className="workspace two-columns">
       <div className="panel script-panel">
         <div className="panel-heading">
@@ -96,6 +106,8 @@ export function ScriptEditorPage({
           <div className="segment-editor-list relaxed">
             {segments.map((segment, index) => {
               const faceMosaicEnabled = hasSegmentFaceMosaic(segment);
+              const brandMaskEnabled = hasSegmentBrandMasks(segment);
+              const brandMaskReview = buildBrandMaskReview(segment.privacyEdits?.brandMasks ?? []);
               return (
               <article className="segment-editor" key={segment.id}>
                 <div className="card-title-row">
@@ -104,6 +116,7 @@ export function ScriptEditorPage({
                     <small>
                       {bucketRoleLabel(segment.bucketRole)} · {contentStatusLabel(segment.contentStatus)} · {segment.role} · {segment.duration}秒
                       {faceMosaicEnabled ? " · 生成前打码" : ""}
+                      {brandMaskEnabled ? ` · 品牌遮罩${brandMaskReview.errorCount ? "待补帧" : ""}` : ""}
                     </small>
                   </div>
                   <div className="icon-actions">
@@ -116,6 +129,15 @@ export function ScriptEditorPage({
                       onClick={() => onToggleFaceMosaic(segment.id)}
                     >
                       <ScanFace size={15} />
+                    </button>
+                    <button
+                      className={`icon-button privacy ${brandMaskEnabled ? "active" : ""} ${brandMaskReview.errorCount ? "needs-attention" : ""}`}
+                      title="品牌/文字打码"
+                      aria-label={`编辑${segment.title || "该段落"}品牌文字打码`}
+                      aria-pressed={brandMaskEnabled}
+                      onClick={() => setBrandMaskSegmentId(segment.id)}
+                    >
+                      <ScanText size={15} />
                     </button>
                     <button className="icon-button" title="上移" disabled={index === 0} onClick={() => onMove(segment.id, -1)}>
                       <ArrowUp size={15} />
@@ -253,6 +275,15 @@ export function ScriptEditorPage({
         )}
       </div>
     </section>
+    {brandMaskSegment && (
+      <BrandMaskAnnotator
+        segment={brandMaskSegment}
+        sourcePreviewUrl={sourcePreviewUrl}
+        onChange={(brandMasks) => onUpdateBrandMasks(brandMaskSegment.id, brandMasks)}
+        onClose={() => setBrandMaskSegmentId("")}
+      />
+    )}
+    </>
   );
 }
 

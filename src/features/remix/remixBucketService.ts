@@ -2,7 +2,7 @@ import { createId } from "../../services/id";
 import type { AnalysisResult, GenerationOptions, VideoSegment } from "../../types";
 import type { GenerationJob } from "../generation/generationTypes";
 import type { OperationAnalytics } from "../lineage/operationAnalytics";
-import { faceMosaicCustomTags } from "../script/privacyEdits";
+import { privacyEditCustomTags } from "../script/privacyEdits";
 import type { MaterialBucket, OperationDecisionState, RemixAsset, StandardBucketRole } from "./remixTypes";
 
 export const DEFAULT_MAX_USES = 3;
@@ -57,7 +57,12 @@ export function createMockRemixAssets(input: {
     const job = jobsBySegment.get(segment.id);
     const assetStatus = getAssetStatus(job);
     const jobVideoUrl = job?.resultVideoUrl || job?.asset?.videoUrl;
-    const preprocessTrace = job?.input.preprocessingTrace || segment.privacyEdits?.faceMosaicPreprocess;
+    const preprocesses = job?.input.preprocessingTraces || (job?.input.preprocessingTrace ? [job.input.preprocessingTrace] : undefined) || segment.privacyEdits?.preprocesses || [
+      segment.privacyEdits?.faceMosaicPreprocess,
+      segment.privacyEdits?.brandMaskPreprocess
+    ].filter((trace): trace is NonNullable<typeof trace> => Boolean(trace));
+    const preprocessTrace = job?.input.preprocessingTrace || preprocesses[preprocesses.length - 1];
+    const preprocessTags = preprocessCustomTags(preprocesses);
     const asset: RemixAsset = {
       id: createId(`asset_${role}`),
       sourceSegmentId: segment.id,
@@ -84,10 +89,8 @@ export function createMockRemixAssets(input: {
         promptHash,
         custom: {
           priority: [input.analysisResult?.basicInfo.priorityLevel ?? "unknown"],
-          ...faceMosaicCustomTags(segment),
-          ...(preprocessTrace?.id ? { privacyPreprocessId: [preprocessTrace.id] } : {}),
-          ...(preprocessTrace?.status ? { privacyPreprocessStatus: [preprocessTrace.status] } : {}),
-          ...(preprocessTrace?.outputVideoUrl ? { preprocessedSourceUrl: [preprocessTrace.outputVideoUrl] } : {}),
+          ...privacyEditCustomTags(segment),
+          ...preprocessTags,
           ...(job?.remoteJobId ? { remoteJobId: [job.remoteJobId] } : {}),
           ...(job?.remoteStatus ? { remoteStatus: [job.remoteStatus] } : {})
         }
@@ -107,6 +110,7 @@ export function createMockRemixAssets(input: {
             error: job.error,
             resultLastFrameUrl: job.resultLastFrameUrl,
             preprocess: preprocessTrace,
+            preprocesses,
             createdAt: job.createdAt,
             updatedAt: job.updatedAt
           }
@@ -252,4 +256,15 @@ function hashText(value: string) {
     hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
   }
   return hash.toString(16);
+}
+
+function preprocessCustomTags(preprocesses: NonNullable<GenerationJob["input"]["preprocessingTraces"]>): Record<string, string[]> {
+  const ids = preprocesses.map((trace) => trace.id).filter(Boolean);
+  const statuses = preprocesses.map((trace) => trace.status).filter(Boolean);
+  const outputUrls = preprocesses.map((trace) => trace.outputVideoUrl).filter((url): url is string => Boolean(url));
+  return {
+    ...(ids.length ? { privacyPreprocessId: ids } : {}),
+    ...(statuses.length ? { privacyPreprocessStatus: statuses } : {}),
+    ...(outputUrls.length ? { preprocessedSourceUrl: outputUrls } : {})
+  };
 }

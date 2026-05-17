@@ -9,13 +9,15 @@ import { getVideoGenerationProvider } from "./providers/providerRegistry";
 import {
   getComfyUIBridgeTask,
   getSeedanceBridgeTask,
+  preprocessBrandMaskBridge,
   preprocessFaceMosaicBridge,
   syncComfyUIBridgeAsset,
   syncSeedanceBridgeAsset
 } from "../../services/videoGenerationBridgeClient";
 import { extractComfyUITaskError, mapComfyUITaskStatus, selectBestComfyUIOutputFile } from "./providers/comfyuiApi";
 import { extractSeedanceTaskError, mapSeedanceTaskStatus } from "./providers/seedanceArk";
-import { hasSegmentFaceMosaic } from "../script/privacyEdits";
+import { buildBrandMaskReview } from "../privacy/brandMaskReview";
+import { hasSegmentBrandMasks, hasSegmentFaceMosaic } from "../script/privacyEdits";
 import type { GenerationJob, GenerationJobInput } from "./generationTypes";
 
 export async function generateRemixBuckets(input: {
@@ -58,13 +60,15 @@ export async function generateRemixBuckets(input: {
         sourcePreviewUrl: input.sourcePreviewUrl
       });
       if (prepared.error) {
-        return createFailedPreprocessJob(jobInput, prepared.error, prepared.trace);
+        return createFailedPreprocessJob(jobInput, prepared.error, prepared.traces);
       }
+      const finalTrace = prepared.traces[prepared.traces.length - 1];
       return provider.createJob({
         ...jobInput,
-        sourceVideoUrl: prepared.trace?.outputVideoUrl,
-        sourceVideoLocalPath: prepared.trace?.localPath,
-        preprocessingTrace: prepared.trace
+        sourceVideoUrl: finalTrace?.outputVideoUrl,
+        sourceVideoLocalPath: finalTrace?.localPath,
+        preprocessingTrace: finalTrace,
+        preprocessingTraces: prepared.traces
       });
     })
   );
@@ -125,13 +129,15 @@ export async function regenerateRemixAsset(input: {
     sourceVideo: input.sourceVideo,
     sourcePreviewUrl: input.sourcePreviewUrl
   });
+  const finalTrace = prepared.traces[prepared.traces.length - 1];
   const job = prepared.error
-    ? createFailedPreprocessJob(jobInput, prepared.error, prepared.trace)
+    ? createFailedPreprocessJob(jobInput, prepared.error, prepared.traces)
     : await provider.createJob({
         ...jobInput,
-        sourceVideoUrl: prepared.trace?.outputVideoUrl,
-        sourceVideoLocalPath: prepared.trace?.localPath,
-        preprocessingTrace: prepared.trace
+        sourceVideoUrl: finalTrace?.outputVideoUrl,
+        sourceVideoLocalPath: finalTrace?.localPath,
+        preprocessingTrace: finalTrace,
+        preprocessingTraces: prepared.traces
       });
 
   const nextAsset = createRegeneratedAsset({
@@ -187,12 +193,25 @@ async function prepareSourcePreprocess(input: {
   providerSettings: ProviderSettings;
   sourceVideo?: File;
   sourcePreviewUrl: string;
-}): Promise<{ trace?: VideoPreprocessTrace; error?: string }> {
-  if (!input.segment || !hasSegmentFaceMosaic(input.segment)) return {};
+}): Promise<{ traces: VideoPreprocessTrace[]; error?: string }> {
+  if (!input.segment) return { traces: [] };
+  const needsFaceMosaic = hasSegmentFaceMosaic(input.segment);
+  const needsBrandMask = hasSegmentBrandMasks(input.segment);
+  if (!needsFaceMosaic && !needsBrandMask) return { traces: [] };
+  if (needsBrandMask) {
+    const review = buildBrandMaskReview(input.segment.privacyEdits?.brandMasks ?? []);
+    if (review.errorCount) {
+      return {
+        traces: [],
+        error: `品牌/文字打码还有 ${review.errorCount} 个红色阻塞项，需要补帧后才能生成。`
+      };
+    }
+  }
   const now = new Date().toISOString();
   if (input.providerId === "mock") {
-    return {
-      trace: {
+    const traces: VideoPreprocessTrace[] = [];
+    if (needsFaceMosaic) {
+      traces.push({
         id: createId("preprocess_mock_face_mosaic"),
         kind: "face-mosaic",
         provider: "mock",
@@ -203,26 +222,71 @@ async function prepareSourcePreprocess(input: {
         publicAssetRequired: false,
         createdAt: now,
         updatedAt: now
-      }
+      });
+    }
+    if (needsBrandMask) {
+      const tracks = input.segment.privacyEdits?.brandMasks ?? [];
+      traces.push({
+        id: createId("preprocess_mock_brand_mask"),
+        kind: "brand-mask",
+        provider: "mock",
+        status: "done",
+        sourceVideoName: input.sourceVideo?.name,
+        sourceVideoUrl: input.sourcePreviewUrl || input.segment.videoUrl,
+        outputVideoUrl: input.sourcePreviewUrl || input.segment.videoUrl,
+        publicAssetRequired: false,
+        summary: {
+          trackCount: tracks.length,
+          manualKeyframes: tracks.reduce((total, track) => total + track.keyframes.length, 0),
+          blockedFrames: 0,
+          warningFrames: 0
+        },
+        createdAt: now,
+        updatedAt: now
+      });
+    }
+    return {
+      traces
     };
   }
   if (!input.sourceVideo) {
     return {
-      error: "人脸打码预处理需要先上传原素材视频。"
+      traces: [],
+      error: "隐私打码预处理需要先上传原素材视频。"
     };
   }
+  const traces: VideoPreprocessTrace[] = [];
   try {
-    const result = await preprocessFaceMosaicBridge({
-      bridgeUrl: bridgeUrlForProvider(input.providerId, input.providerSettings),
-      projectId: input.projectId || "default_project",
-      segmentId: input.segment.id,
-      sourceRange: input.segment.role,
-      video: input.sourceVideo
-    });
-    return { trace: result.trace };
+    const bridgeUrl = bridgeUrlForProvider(input.providerId, input.providerSettings);
+    if (needsFaceMosaic) {
+      const result = await preprocessFaceMosaicBridge({
+        bridgeUrl,
+        projectId: input.projectId || "default_project",
+        segmentId: input.segment.id,
+        sourceRange: input.segment.role,
+        video: input.sourceVideo
+      });
+      traces.push(result.trace);
+    }
+    if (needsBrandMask) {
+      const previousTrace = traces[traces.length - 1];
+      const result = await preprocessBrandMaskBridge({
+        bridgeUrl,
+        projectId: input.projectId || "default_project",
+        segmentId: input.segment.id,
+        sourceRange: input.segment.role,
+        video: previousTrace?.localPath ? undefined : input.sourceVideo,
+        sourceLocalPath: previousTrace?.localPath,
+        sourceVideoName: input.sourceVideo.name,
+        tracks: input.segment.privacyEdits?.brandMasks ?? []
+      });
+      traces.push(result.trace);
+    }
+    return { traces };
   } catch (error) {
     return {
-      error: error instanceof Error ? error.message : "人脸打码预处理失败。"
+      traces,
+      error: error instanceof Error ? error.message : "隐私打码预处理失败。"
     };
   }
 }
@@ -236,14 +300,16 @@ function bridgeUrlForProvider(providerId: Provider, providerSettings: ProviderSe
 function createFailedPreprocessJob(
   input: GenerationJobInput,
   error: string,
-  trace?: VideoPreprocessTrace
+  traces: VideoPreprocessTrace[] = []
 ): GenerationJob {
   const now = new Date().toISOString();
+  const trace = traces[traces.length - 1];
   return {
     id: createId("job_preprocess_failed"),
     input: {
       ...input,
-      preprocessingTrace: trace
+      preprocessingTrace: trace,
+      preprocessingTraces: traces
     },
     status: "failed",
     createdAt: now,
@@ -487,7 +553,12 @@ function createRegeneratedAsset(input: {
   const assetStatus = getAssetStatus(input.job);
   const jobVideoUrl = input.job.resultVideoUrl || input.job.asset?.videoUrl;
   const promptHash = hashText(input.prompt);
-  const preprocessTrace = input.job.input.preprocessingTrace || input.segment?.privacyEdits?.faceMosaicPreprocess;
+  const preprocesses = input.job.input.preprocessingTraces || (input.job.input.preprocessingTrace ? [input.job.input.preprocessingTrace] : undefined) || input.segment?.privacyEdits?.preprocesses || [
+    input.segment?.privacyEdits?.faceMosaicPreprocess,
+    input.segment?.privacyEdits?.brandMaskPreprocess
+  ].filter((trace): trace is NonNullable<typeof trace> => Boolean(trace));
+  const preprocessTrace = input.job.input.preprocessingTrace || preprocesses[preprocesses.length - 1];
+  const preprocessTags = preprocessCustomTags(preprocesses);
   return {
     id: createId(`asset_${String(input.bucket.role).replace(/[^a-zA-Z0-9_-]+/g, "_")}`),
     sourceSegmentId: input.sourceAsset.sourceSegmentId,
@@ -516,9 +587,7 @@ function createRegeneratedAsset(input: {
       custom: {
         ...input.sourceAsset.tags.custom,
         regeneratedFrom: [input.sourceAsset.id],
-        ...(preprocessTrace?.id ? { privacyPreprocessId: [preprocessTrace.id] } : {}),
-        ...(preprocessTrace?.status ? { privacyPreprocessStatus: [preprocessTrace.status] } : {}),
-        ...(preprocessTrace?.outputVideoUrl ? { preprocessedSourceUrl: [preprocessTrace.outputVideoUrl] } : {}),
+        ...preprocessTags,
         ...(input.job.remoteJobId ? { remoteJobId: [input.job.remoteJobId] } : {}),
         ...(input.job.remoteStatus ? { remoteStatus: [input.job.remoteStatus] } : {})
       }
@@ -537,6 +606,7 @@ function createRegeneratedAsset(input: {
       error: input.job.error,
       resultLastFrameUrl: input.job.resultLastFrameUrl,
       preprocess: preprocessTrace,
+      preprocesses,
       createdAt: input.job.createdAt,
       updatedAt: input.job.updatedAt
     },
@@ -560,4 +630,15 @@ function hashText(value: string) {
     hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
   }
   return hash.toString(16);
+}
+
+function preprocessCustomTags(preprocesses: VideoPreprocessTrace[]): Record<string, string[]> {
+  const ids = preprocesses.map((trace) => trace.id).filter(Boolean);
+  const statuses = preprocesses.map((trace) => trace.status).filter(Boolean);
+  const outputUrls = preprocesses.map((trace) => trace.outputVideoUrl).filter((url): url is string => Boolean(url));
+  return {
+    ...(ids.length ? { privacyPreprocessId: ids } : {}),
+    ...(statuses.length ? { privacyPreprocessStatus: statuses } : {}),
+    ...(outputUrls.length ? { preprocessedSourceUrl: outputUrls } : {})
+  };
 }

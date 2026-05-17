@@ -52,7 +52,12 @@ import {
 } from "./features/remix/remixBucketService";
 import type { MaterialBucket, OperationDecisionState } from "./features/remix/remixTypes";
 import { ScriptEditorPage } from "./features/script/ScriptEditorPage";
-import { hasSegmentFaceMosaic, setSegmentFaceMosaic } from "./features/script/privacyEdits";
+import {
+  applyPreprocessTraces,
+  hasSegmentFaceMosaic,
+  setSegmentBrandMasks,
+  setSegmentFaceMosaic
+} from "./features/script/privacyEdits";
 import { createSegmentsFromAnalysis } from "./features/script/segmentFactory";
 import { serializeSegments, stripTransientSegmentFields } from "./features/script/segmentSerialization";
 import {
@@ -82,7 +87,7 @@ import {
   saveProjectSnapshot,
   savePrompt as savePromptToStorage
 } from "./services/projectStorage";
-import type { AnalysisResult, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
+import type { AnalysisResult, BrandMaskTrack, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
 
 export default function App() {
   const [page, setPage] = useState<StepKey>("input");
@@ -465,6 +470,25 @@ export default function App() {
     setNotice(shouldEnable ? "已为全部脚本段开启人脸打码。" : "已取消全部脚本段的人脸打码。");
   }
 
+  function updateSegmentBrandMasks(segmentId: string, brandMasks: BrandMaskTrack[]) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要设置品牌打码的脚本段。");
+      return;
+    }
+    setSegments((items) =>
+      items.map((item) => (item.id === segmentId ? setSegmentBrandMasks(item, brandMasks) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
+    });
+    setComposeTimeline(null);
+    const keyframeCount = brandMasks.reduce((total, track) => total + track.keyframes.length, 0);
+    setNotice(`已更新「${target.title || "该段落"}」品牌/文字打码：${brandMasks.length}个遮罩，${keyframeCount}个关键帧。`);
+  }
+
   function deleteScriptSegment(id: string) {
     const segment = segments.find((item) => item.id === id);
     if (!window.confirm(`确认删除「${segment?.title ?? "该段落"}」？关联素材也会从素材桶移除。`)) return;
@@ -539,29 +563,23 @@ export default function App() {
     });
     setMaterialBuckets(result.buckets);
     const jobBySegment = new Map(result.generationJobs.map((job) => [job.input.segmentId, job]));
-    const preprocessBySegment = new Map(
+    const preprocessesBySegment = new Map(
       result.generationJobs
-        .filter((job) => job.input.preprocessingTrace)
-        .map((job) => [job.input.segmentId, job.input.preprocessingTrace])
+        .filter((job) => job.input.preprocessingTraces?.length || job.input.preprocessingTrace)
+        .map((job) => [job.input.segmentId, job.input.preprocessingTraces?.length ? job.input.preprocessingTraces : [job.input.preprocessingTrace!]])
     );
     setSegments((items) =>
       (items.length ? items : activeSegments).map((segment) => {
         const job = jobBySegment.get(segment.id);
-        const preprocess = preprocessBySegment.get(segment.id);
-        return job
-          ? {
+        const preprocesses = preprocessesBySegment.get(segment.id) ?? [];
+        if (!job) return segment;
+        const nextSegment = {
               ...segment,
               status: job.status,
               provider: options.provider,
-              videoUrl: job.resultVideoUrl || segment.videoUrl,
-              privacyEdits: preprocess
-                ? {
-                    ...segment.privacyEdits,
-                    faceMosaicPreprocess: preprocess
-                  }
-                : segment.privacyEdits
-            }
-          : segment;
+              videoUrl: job.resultVideoUrl || segment.videoUrl
+            };
+        return preprocesses.length ? applyPreprocessTraces(nextSegment, preprocesses) : nextSegment;
       })
     );
     setComposeTimeline(null);
@@ -612,20 +630,24 @@ export default function App() {
       setMaterialBuckets(result.buckets);
       setSegments((items) =>
         items.map((segment) =>
-          segment.id === result.asset.sourceSegmentId
-            ? {
+          {
+            if (segment.id !== result.asset.sourceSegmentId) return segment;
+            const nextStatus: VideoSegment["status"] =
+              result.asset.status === "ready" ? "done" : result.asset.status === "failed" ? "failed" : "generating";
+            const nextSegment = {
                 ...segment,
                 provider: options.provider,
-                status: result.asset.status === "ready" ? "done" : result.asset.status === "failed" ? "failed" : "generating",
-                videoUrl: result.asset.videoUrl || segment.videoUrl,
-                privacyEdits: result.asset.providerTrace?.preprocess
-                  ? {
-                      ...segment.privacyEdits,
-                      faceMosaicPreprocess: result.asset.providerTrace.preprocess
-                    }
-                  : segment.privacyEdits
-              }
-            : segment
+                status: nextStatus,
+                videoUrl: result.asset.videoUrl || segment.videoUrl
+              };
+            if (result.asset.providerTrace?.preprocesses?.length) {
+              return applyPreprocessTraces(nextSegment, result.asset.providerTrace.preprocesses);
+            }
+            if (result.asset.providerTrace?.preprocess) {
+              return applyPreprocessTraces(nextSegment, [result.asset.providerTrace.preprocess]);
+            }
+            return nextSegment;
+          }
         )
       );
       setComposeTimeline(null);
@@ -1132,6 +1154,7 @@ export default function App() {
           segments={segments}
           scriptRevisions={scriptRevisions}
           scriptSuggestions={scriptSuggestions}
+          sourcePreviewUrl={sourcePreviewUrl}
           onSegment={updateSegment}
           onMove={moveSegment}
           onDuplicate={duplicateScriptSegment}
@@ -1143,6 +1166,7 @@ export default function App() {
           onApplySuggestion={applyScriptSuggestion}
           onToggleFaceMosaic={toggleSegmentFaceMosaic}
           onToggleAllFaceMosaic={toggleAllSegmentFaceMosaic}
+          onUpdateBrandMasks={updateSegmentBrandMasks}
           onCreate={() => extractScriptsFromReport("script")}
           onBack={() => setPage("report")}
           onNext={() => setPage("generate")}

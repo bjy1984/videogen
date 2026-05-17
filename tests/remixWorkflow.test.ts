@@ -44,7 +44,7 @@ import {
 import { createRemixPlan } from "../src/features/remix/remixPlanner";
 import type { MaterialBucket, RemixAsset } from "../src/features/remix/remixTypes";
 import { createSegmentsFromAnalysis } from "../src/features/script/segmentFactory";
-import { setSegmentFaceMosaic } from "../src/features/script/privacyEdits";
+import { setSegmentBrandMasks, setSegmentFaceMosaic } from "../src/features/script/privacyEdits";
 import { buildScriptAudit } from "../src/features/script/scriptAudit";
 import {
   buildScriptRewriteSuggestion,
@@ -277,6 +277,96 @@ await run("carries face mosaic preprocessing intent into jobs and remix tags", (
 
   const restored = setSegmentFaceMosaic(privateSegment, false);
   assert.equal(restored.privacyEdits?.faceMosaic, false);
+});
+
+await run("carries brand mask tracks and multi-step preprocessing into remix lineage", () => {
+  const privateSegment = setSegmentBrandMasks(setSegmentFaceMosaic(segments[0], true), [
+    {
+      id: "brand_mask_logo_001",
+      label: "主图Logo",
+      targetType: "logo",
+      effect: "mosaic",
+      trackMode: "planar",
+      expandRatio: 0.18,
+      confidenceThreshold: 0.62,
+      keyframes: [
+        {
+          id: "keyframe_001",
+          time: 0,
+          source: "manual",
+          shape: { type: "rect", x: 0.2, y: 0.2, width: 0.2, height: 0.1 }
+        },
+        {
+          id: "keyframe_002",
+          time: 1.2,
+          source: "correction",
+          shape: { type: "rect", x: 0.24, y: 0.22, width: 0.2, height: 0.1 }
+        }
+      ]
+    }
+  ]);
+  const faceTrace = {
+    id: "preprocess_face_002",
+    kind: "face-mosaic" as const,
+    provider: "local-bridge" as const,
+    status: "done" as const,
+    outputVideoUrl: "https://assets.example/face.mp4",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  const brandTrace = {
+    id: "preprocess_brand_001",
+    kind: "brand-mask" as const,
+    provider: "local-bridge" as const,
+    status: "done" as const,
+    outputVideoUrl: "https://assets.example/brand.mp4",
+    summary: {
+      trackCount: 1,
+      manualKeyframes: 1,
+      correctedKeyframes: 1,
+      blockedFrames: 0,
+      warningFrames: 0
+    },
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+  const plan = createRemixPlan({
+    segments: [privateSegment],
+    analysisResult: analysis,
+    options: initialGenerationOptions
+  });
+  const assets = createMockRemixAssets({
+    segments: [privateSegment],
+    analysisResult: analysis,
+    options: initialGenerationOptions,
+    sourcePreviewUrl: "blob:source",
+    generationJobs: [
+      {
+        id: "job_with_multi_preprocess",
+        input: {
+          segmentId: privateSegment.id,
+          bucketId: privateSegment.bucketRole || "hook",
+          providerId: initialGenerationOptions.provider,
+          prompt: privateSegment.generationPrompt,
+          duration: privateSegment.duration,
+          aspectRatio: initialGenerationOptions.aspectRatio,
+          sourceVideoUrl: brandTrace.outputVideoUrl,
+          preprocessingTrace: brandTrace,
+          preprocessingTraces: [faceTrace, brandTrace]
+        },
+        status: "queued",
+        createdAt: brandTrace.createdAt,
+        updatedAt: brandTrace.updatedAt
+      }
+    ]
+  });
+
+  assert.deepEqual(plan.items[0].tags.custom?.privacyEdit, ["face-mosaic", "brand-mask"]);
+  assert.deepEqual(assets[0].tags.custom?.privacyEdit, ["face-mosaic", "brand-mask"]);
+  assert.deepEqual(assets[0].tags.custom?.privacyPreprocessId, ["preprocess_face_002", "preprocess_brand_001"]);
+  assert.deepEqual(assets[0].tags.custom?.preprocessedSourceUrl, [faceTrace.outputVideoUrl, brandTrace.outputVideoUrl]);
+  assert.equal(assets[0].providerTrace?.preprocess?.kind, "brand-mask");
+  assert.equal(assets[0].providerTrace?.preprocesses?.length, 2);
 });
 
 await run("creates script revisions and deterministic rewrite suggestions", () => {
