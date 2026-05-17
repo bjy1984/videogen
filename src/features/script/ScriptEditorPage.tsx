@@ -1,7 +1,8 @@
-import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ScanFace, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
 import { InfoItem } from "../../components/common/InfoItem";
 import { segmentStatusLabel } from "../../domain/labels";
 import type { AnalysisResult, SegmentBucketRole, SegmentContentStatus, VideoSegment } from "../../types";
+import { hasSegmentFaceMosaic } from "./privacyEdits";
 import { buildScriptAudit, type ScriptAuditIssue, type ScriptAuditReport } from "./scriptAudit";
 import type { ScriptRewriteSuggestion, ScriptSuggestionApplyTarget, ScriptRevision } from "./scriptRevision";
 
@@ -19,6 +20,8 @@ export function ScriptEditorPage({
   onRestoreRevision,
   onSuggestRewrite,
   onApplySuggestion,
+  onToggleFaceMosaic,
+  onToggleAllFaceMosaic,
   onCreate,
   onBack,
   onNext
@@ -36,12 +39,15 @@ export function ScriptEditorPage({
   onRestoreRevision: (revisionId: string) => void;
   onSuggestRewrite: (segmentId: string) => void;
   onApplySuggestion: (segmentId: string, target: ScriptSuggestionApplyTarget) => void;
+  onToggleFaceMosaic: (segmentId: string) => void;
+  onToggleAllFaceMosaic: () => void;
   onCreate: () => void;
   onBack: () => void;
   onNext: () => void;
 }) {
   const totalDuration = segments.reduce((total, segment) => total + segment.duration, 0);
   const totalScriptChars = segments.reduce((total, segment) => total + segment.scriptText.length, 0);
+  const allFaceMosaic = segments.length > 0 && segments.every(hasSegmentFaceMosaic);
   const audit = buildScriptAudit(segments);
 
   return (
@@ -70,6 +76,14 @@ export function ScriptEditorPage({
             <Plus size={14} />
             新增段落
           </button>
+          <button
+            className={`secondary-button compact ${allFaceMosaic ? "privacy-active" : ""}`}
+            onClick={onToggleAllFaceMosaic}
+            disabled={!segments.length}
+          >
+            <ScanFace size={14} />
+            {allFaceMosaic ? "取消全段预处理" : "全段生成前打码"}
+          </button>
         </div>
 
         {!segments.length ? (
@@ -80,15 +94,29 @@ export function ScriptEditorPage({
           </div>
         ) : (
           <div className="segment-editor-list relaxed">
-            {segments.map((segment, index) => (
+            {segments.map((segment, index) => {
+              const faceMosaicEnabled = hasSegmentFaceMosaic(segment);
+              return (
               <article className="segment-editor" key={segment.id}>
                 <div className="card-title-row">
                   <div>
                     <h3>{index + 1}. {segment.title || "未命名段落"}</h3>
-                    <small>{bucketRoleLabel(segment.bucketRole)} · {contentStatusLabel(segment.contentStatus)} · {segment.role} · {segment.duration}秒</small>
+                    <small>
+                      {bucketRoleLabel(segment.bucketRole)} · {contentStatusLabel(segment.contentStatus)} · {segment.role} · {segment.duration}秒
+                      {faceMosaicEnabled ? " · 生成前打码" : ""}
+                    </small>
                   </div>
                   <div className="icon-actions">
                     <span className={`status ${segment.status}`}>{segmentStatusLabel(segment.status)}</span>
+                    <button
+                      className={`icon-button privacy ${faceMosaicEnabled ? "active" : ""}`}
+                      title={faceMosaicEnabled ? "取消生成前人脸打码" : "生成前人脸打码"}
+                      aria-label={`${faceMosaicEnabled ? "取消" : "启用"}${segment.title || "该段落"}生成前人脸打码`}
+                      aria-pressed={faceMosaicEnabled}
+                      onClick={() => onToggleFaceMosaic(segment.id)}
+                    >
+                      <ScanFace size={15} />
+                    </button>
                     <button className="icon-button" title="上移" disabled={index === 0} onClick={() => onMove(segment.id, -1)}>
                       <ArrowUp size={15} />
                     </button>
@@ -186,7 +214,8 @@ export function ScriptEditorPage({
                   />
                 )}
               </article>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

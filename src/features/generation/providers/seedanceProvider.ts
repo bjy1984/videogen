@@ -14,7 +14,7 @@ const jobs = new Map<string, GenerationJob>();
 export const seedanceVideoProvider: VideoGenerationProvider = {
   id: "seedance",
   label: "Seedance",
-  capabilities: ["text-to-video", "image-to-video", "reference-image", "seed"],
+  capabilities: ["text-to-video", "image-to-video", "video-to-video", "reference-image", "seed"],
   async createJob(input: GenerationJobInput) {
     const now = new Date().toISOString();
     try {
@@ -24,6 +24,7 @@ export const seedanceVideoProvider: VideoGenerationProvider = {
         aspectRatio: input.aspectRatio,
         duration: input.duration,
         referenceImageUrl: input.referenceImageUrl,
+        sourceVideoUrl: input.sourceVideoUrl,
         params
       });
       const task = await createSeedanceBridgeTask({
@@ -68,6 +69,7 @@ export const seedanceVideoProvider: VideoGenerationProvider = {
         aspectRatio: current.input.aspectRatio,
         duration: current.input.duration,
         referenceImageUrl: current.input.referenceImageUrl,
+        sourceVideoUrl: current.input.sourceVideoUrl,
         params
       });
       const task = await getSeedanceBridgeTask({

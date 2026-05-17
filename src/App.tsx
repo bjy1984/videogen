@@ -52,6 +52,7 @@ import {
 } from "./features/remix/remixBucketService";
 import type { MaterialBucket, OperationDecisionState } from "./features/remix/remixTypes";
 import { ScriptEditorPage } from "./features/script/ScriptEditorPage";
+import { hasSegmentFaceMosaic, setSegmentFaceMosaic } from "./features/script/privacyEdits";
 import { createSegmentsFromAnalysis } from "./features/script/segmentFactory";
 import { serializeSegments, stripTransientSegmentFields } from "./features/script/segmentSerialization";
 import {
@@ -196,15 +197,23 @@ export default function App() {
   }
 
   function saveProject() {
-    const snapshot = buildSnapshot();
-    saveProjectSnapshot(snapshot);
-    setLastSavedAt(snapshot.updatedAt);
-    setNotice("工程已保存到浏览器本地。");
+    try {
+      const snapshot = buildSnapshot();
+      saveProjectSnapshot(snapshot);
+      setLastSavedAt(snapshot.updatedAt);
+      setNotice("工程已保存到浏览器本地。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "工程保存失败。");
+    }
   }
 
   function savePrompt() {
-    savePromptToStorage(prompt);
-    setNotice("Prompt 已保存。新建工程和下次打开会默认使用当前 Prompt。");
+    try {
+      savePromptToStorage(prompt);
+      setNotice("Prompt 已保存。新建工程和下次打开会默认使用当前 Prompt。");
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Prompt 保存失败。");
+    }
   }
 
   function loadSavedProject() {
@@ -233,6 +242,7 @@ export default function App() {
   }
 
   function newProject() {
+    if (!window.confirm("确认新建空工程？当前未导出的编辑内容会被清空。")) return;
     if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
     setProjectId(createId("project"));
     setProjectName("未命名爆款视频工程");
@@ -343,6 +353,7 @@ export default function App() {
       setNotice("未找到要恢复的脚本版本。");
       return;
     }
+    if (!window.confirm(`确认恢复脚本版本「${revision.label}」？当前脚本编辑会被覆盖。`)) return;
     setSegments(restoreSegmentsFromRevision(revision));
     setScriptSuggestions({});
     setComposeTimeline(null);
@@ -423,7 +434,40 @@ export default function App() {
     setComposeTimeline(null);
   }
 
+  function toggleSegmentFaceMosaic(id: string) {
+    const target = segments.find((item) => item.id === id);
+    if (!target) {
+      setNotice("未找到要设置人脸打码的脚本段。");
+      return;
+    }
+    const enabled = !hasSegmentFaceMosaic(target);
+    setSegments((items) =>
+      items.map((item) => (item.id === id ? setSegmentFaceMosaic(item, enabled) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[id];
+      return next;
+    });
+    setComposeTimeline(null);
+    setNotice(enabled ? `已为「${target.title || "该段落"}」开启人脸打码。` : `已取消「${target.title || "该段落"}」的人脸打码。`);
+  }
+
+  function toggleAllSegmentFaceMosaic() {
+    if (!segments.length) {
+      setNotice("当前没有可设置的人脸打码段落。");
+      return;
+    }
+    const shouldEnable = !segments.every(hasSegmentFaceMosaic);
+    setSegments((items) => items.map((item) => setSegmentFaceMosaic(item, shouldEnable)));
+    setScriptSuggestions({});
+    setComposeTimeline(null);
+    setNotice(shouldEnable ? "已为全部脚本段开启人脸打码。" : "已取消全部脚本段的人脸打码。");
+  }
+
   function deleteScriptSegment(id: string) {
+    const segment = segments.find((item) => item.id === id);
+    if (!window.confirm(`确认删除「${segment?.title ?? "该段落"}」？关联素材也会从素材桶移除。`)) return;
     setSegments((items) => items.filter((item) => item.id !== id));
     setScriptSuggestions((items) => {
       const next = { ...items };
@@ -489,20 +533,33 @@ export default function App() {
       analysisResult,
       options,
       providerSettings,
+      projectId,
       sourceVideo,
       sourcePreviewUrl
     });
     setMaterialBuckets(result.buckets);
     const jobBySegment = new Map(result.generationJobs.map((job) => [job.input.segmentId, job]));
+    const preprocessBySegment = new Map(
+      result.generationJobs
+        .filter((job) => job.input.preprocessingTrace)
+        .map((job) => [job.input.segmentId, job.input.preprocessingTrace])
+    );
     setSegments((items) =>
       (items.length ? items : activeSegments).map((segment) => {
         const job = jobBySegment.get(segment.id);
+        const preprocess = preprocessBySegment.get(segment.id);
         return job
           ? {
               ...segment,
               status: job.status,
               provider: options.provider,
-              videoUrl: job.resultVideoUrl || segment.videoUrl
+              videoUrl: job.resultVideoUrl || segment.videoUrl,
+              privacyEdits: preprocess
+                ? {
+                    ...segment.privacyEdits,
+                    faceMosaicPreprocess: preprocess
+                  }
+                : segment.privacyEdits
             }
           : segment;
       })
@@ -548,6 +605,7 @@ export default function App() {
         analysisResult,
         options,
         providerSettings,
+        projectId,
         sourceVideo,
         sourcePreviewUrl
       });
@@ -559,7 +617,13 @@ export default function App() {
                 ...segment,
                 provider: options.provider,
                 status: result.asset.status === "ready" ? "done" : result.asset.status === "failed" ? "failed" : "generating",
-                videoUrl: result.asset.videoUrl || segment.videoUrl
+                videoUrl: result.asset.videoUrl || segment.videoUrl,
+                privacyEdits: result.asset.providerTrace?.preprocess
+                  ? {
+                      ...segment.privacyEdits,
+                      faceMosaicPreprocess: result.asset.providerTrace.preprocess
+                    }
+                  : segment.privacyEdits
               }
             : segment
         )
@@ -682,6 +746,8 @@ export default function App() {
   }
 
   function deleteMaterialBucket(bucketId: string) {
+    const bucket = materialBuckets.find((item) => item.id === bucketId);
+    if (!window.confirm(`确认删除素材桶「${bucket?.label ?? bucketId}」？桶内素材也会被移除。`)) return;
     setMaterialBuckets((items) => deleteCustomBucket(items, bucketId));
     setComposeTimeline(null);
   }
@@ -779,6 +845,11 @@ export default function App() {
       const review = buildComposeReview(composeTimeline, materialBuckets);
       if (review.readiness === "blocked") {
         setNotice(`导出前审核未通过：存在 ${review.counts.error} 个阻塞项，请处理后再导出。`);
+        return;
+      }
+      const hasMissingMedia = review.issues.some((issue) => issue.id.endsWith("media-missing"));
+      if (hasMissingMedia && options.provider !== "mock") {
+        setNotice("真实 Provider 模式不允许导出占位素材。请先轮询/同步生成结果，确保每段都有真实视频文件或可拉取素材 URL。");
         return;
       }
       const outputName = sanitizeFileName(projectName || `videogen_${new Date().toISOString().slice(0, 10)}`);
@@ -1070,6 +1141,8 @@ export default function App() {
           onRestoreRevision={restoreScriptRevision}
           onSuggestRewrite={suggestScriptRewrite}
           onApplySuggestion={applyScriptSuggestion}
+          onToggleFaceMosaic={toggleSegmentFaceMosaic}
+          onToggleAllFaceMosaic={toggleAllSegmentFaceMosaic}
           onCreate={() => extractScriptsFromReport("script")}
           onBack={() => setPage("report")}
           onNext={() => setPage("generate")}

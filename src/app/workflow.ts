@@ -11,11 +11,7 @@ export const workflowPages: Array<{ key: StepKey; title: string; subtitle: strin
 export const generationProviders: Array<{ value: Provider; label: string }> = [
   { value: "mock", label: "Local Mock" },
   { value: "comfyui", label: "ComfyUI" },
-  { value: "seedance", label: "Seedance" },
-  { value: "veo", label: "Veo" },
-  { value: "kling", label: "Kling" },
-  { value: "runway", label: "Runway" },
-  { value: "pika", label: "Pika" }
+  { value: "seedance", label: "Seedance" }
 ];
 
 export const analysisReportSections = [

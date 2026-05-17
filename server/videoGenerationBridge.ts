@@ -1,6 +1,8 @@
 import cors from "cors";
 import express from "express";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import multer from "multer";
+import { spawn } from "node:child_process";
+import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -30,10 +32,13 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const assetRootDir = process.env.VIDEOGEN_ASSET_ROOT || path.join(rootDir, ".videogen-assets");
+const uploadTempDir = path.join(assetRootDir, "_uploads");
 const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8788);
 const app = express();
+const upload = multer({ dest: uploadTempDir });
 
 await mkdir(assetRootDir, { recursive: true });
+await mkdir(uploadTempDir, { recursive: true });
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "64mb" }));
@@ -48,7 +53,7 @@ app.get("/health", async (req, res) => {
     service: "video-generation-bridge",
     port,
     assetRootDir,
-    assetBaseUrl: `${publicBaseUrl(req)}/assets`,
+    assetBaseUrl: assetBaseUrl(req),
     seedance: {
       endpoint: DEFAULT_SEEDANCE_ARK_BASE_URL,
       apiKeyEnvName,
@@ -60,6 +65,54 @@ app.get("/health", async (req, res) => {
       error: comfyHealth.error
     }
   });
+});
+
+app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
+  try {
+    if (!req.file) {
+      throw new BridgeError("请上传需要预处理的原素材视频。", 400);
+    }
+    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand();
+
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const segmentId = safePathPart(String(req.body.segmentId || "segment"));
+    const preprocessId = safePathPart(`face_mosaic_${Date.now()}`);
+    const extension =
+      extensionFromContentType(req.file.mimetype) ||
+      extensionFromUrl(req.file.originalname) ||
+      "mp4";
+    const relativeDir = path.join("privacy", projectId, segmentId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    const outputPath = path.join(outputDir, `face_mosaic.${extension}`);
+    await copyFile(req.file.path, sourcePath);
+    await runFaceMosaicCommand(commandTemplate, sourcePath, outputPath);
+    await stat(outputPath);
+
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "face-mosaic",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: req.file.originalname,
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, `face_mosaic.${extension}`),
+        localPath: outputPath,
+        publicAssetRequired: true,
+        createdAt: now,
+        updatedAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Face mosaic preprocessing failed."
+    });
+  }
 });
 
 app.post("/seedance/tasks", async (req, res) => {
@@ -110,7 +163,7 @@ app.post("/seedance/tasks/:id/sync", async (req, res) => {
       assetId,
       fileName,
       localPath: outputPath,
-      localAssetUrl: `${publicBaseUrl(req)}/assets/${relativeDir.split(path.sep).map(encodeURIComponent).join("/")}/${encodeURIComponent(fileName)}`,
+      localAssetUrl: assetUrl(req, relativeDir, fileName),
       sourceUrl,
       savedAt: new Date().toISOString()
     };
@@ -154,6 +207,7 @@ app.post("/comfyui/tasks", async (req, res) => {
       seed: request.seed,
       steps: request.steps,
       cfgScale: request.cfgScale,
+      sourceVideoUrl: request.sourceVideoUrl,
       clientId: request.clientId
     });
     const upstreamUrl = buildComfyUIPromptUrl(request.endpoint || DEFAULT_COMFYUI_ENDPOINT);
@@ -217,7 +271,7 @@ app.post("/comfyui/tasks/:id/sync", async (req, res) => {
       assetId,
       fileName,
       localPath: outputPath,
-      localAssetUrl: `${publicBaseUrl(req)}/assets/${relativeDir.split(path.sep).map(encodeURIComponent).join("/")}/${encodeURIComponent(fileName)}`,
+      localAssetUrl: assetUrl(req, relativeDir, fileName),
       sourceUrl,
       savedAt: new Date().toISOString()
     };
@@ -238,9 +292,14 @@ app.listen(port, () => {
   console.log(`Video generation bridge listening on http://localhost:${port}`);
 });
 
-async function requestSeedanceTask(url: string, apiKey: string, init: RequestInit) {
-  const response = await fetch(url, {
+interface TimedRequestInit extends RequestInit {
+  timeoutMs?: number;
+}
+
+async function requestSeedanceTask(url: string, apiKey: string, init: TimedRequestInit) {
+  const response = await fetchWithTimeout(url, {
     ...init,
+    timeoutMs: init.timeoutMs ?? 45_000,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`
@@ -256,9 +315,10 @@ async function requestSeedanceTask(url: string, apiKey: string, init: RequestIni
   return normalizeSeedanceTaskResponse(payload);
 }
 
-async function requestComfyUIJson(url: string, init: RequestInit = {}) {
-  const response = await fetch(url, {
+async function requestComfyUIJson(url: string, init: TimedRequestInit = {}) {
+  const response = await fetchWithTimeout(url, {
     ...init,
+    timeoutMs: init.timeoutMs ?? 30_000,
     headers: {
       "Content-Type": "application/json",
       ...init.headers
@@ -339,7 +399,7 @@ async function checkComfyUIHealth(endpoint: string) {
 }
 
 async function downloadAsset(url: string, providerLabel = "Seedance") {
-  const response = await fetch(url);
+  const response = await fetchWithTimeout(url, { timeoutMs: 120_000 });
   if (!response.ok) {
     throw new BridgeError(`下载 ${providerLabel} 产物失败：${response.status}`, 502);
   }
@@ -348,6 +408,71 @@ async function downloadAsset(url: string, providerLabel = "Seedance") {
     bytes: Buffer.from(arrayBuffer),
     extension: extensionFromContentType(response.headers.get("content-type")) || extensionFromUrl(url) || "mp4"
   };
+}
+
+async function fetchWithTimeout(url: string, init: TimedRequestInit = {}) {
+  const timeoutMs = init.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  const { timeoutMs: _timeoutMs, signal, ...fetchInit } = init;
+  try {
+    return await fetch(url, {
+      ...fetchInit,
+      signal: signal ?? controller.signal
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new BridgeError(`上游请求超时：${Math.round(timeoutMs / 1000)}秒未响应。`, 504);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function runFaceMosaicCommand(commandTemplate: string, inputPath: string, outputPath: string) {
+  if (!commandTemplate.includes("{input}") || !commandTemplate.includes("{output}")) {
+    throw new BridgeError("VIDEOGEN_FACE_MOSAIC_COMMAND 必须包含 {input} 和 {output} 占位符。", 500);
+  }
+  const command = commandTemplate
+    .replaceAll("{input}", shellQuote(inputPath))
+    .replaceAll("{output}", shellQuote(outputPath));
+  const timeoutMs = Number(process.env.VIDEOGEN_FACE_MOSAIC_TIMEOUT_MS || 180_000);
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    const stderr: Buffer[] = [];
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new BridgeError(`人脸打码预处理超时：${Math.round(timeoutMs / 1000)}秒未完成。`, 504));
+    }, timeoutMs);
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeoutId);
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const detail = Buffer.concat(stderr).toString("utf8").trim();
+      reject(new BridgeError(`人脸打码预处理命令失败：${code}${detail ? `，${detail}` : ""}`, 500));
+    });
+  });
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function defaultFaceMosaicCommand() {
+  const pythonPath = process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --input {input} --output {output}`;
 }
 
 async function readPayload(response: Response) {
@@ -441,6 +566,15 @@ function readApiKey(apiKeyEnvName: string) {
 
 function publicBaseUrl(req: express.Request) {
   return `${req.protocol}://${req.get("host")}`;
+}
+
+function assetBaseUrl(req: express.Request) {
+  return (process.env.VIDEOGEN_PUBLIC_ASSET_BASE_URL || `${publicBaseUrl(req)}/assets`).replace(/\/+$/, "");
+}
+
+function assetUrl(req: express.Request, relativeDir: string, fileName: string) {
+  const encodedDir = relativeDir.split(path.sep).map(encodeURIComponent).join("/");
+  return `${assetBaseUrl(req)}/${encodedDir}/${encodeURIComponent(fileName)}`;
 }
 
 function safePathPart(value: string) {

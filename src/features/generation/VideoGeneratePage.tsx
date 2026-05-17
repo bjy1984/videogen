@@ -1,4 +1,5 @@
 import { Boxes, Edit3, Film, Image as ImageIcon, Loader2, Plus, RefreshCw, Trash2, Upload, Wand2 } from "lucide-react";
+import type { KeyboardEvent } from "react";
 import { generationProviders } from "../../app/workflow";
 import { providerLabel, segmentStatusLabel } from "../../domain/labels";
 import type { GenerationOptions, Provider, VideoSegment } from "../../types";
@@ -188,7 +189,13 @@ export function VideoGeneratePage({
                       </div>
                     )}
                     <div className="reference-actions">
-                      <label className="secondary-button compact">
+                      <label
+                        className="secondary-button compact"
+                        tabIndex={0}
+                        role="button"
+                        aria-label={`为 ${segment.title} 上传参考图片`}
+                        onKeyDown={triggerNestedFileInput}
+                      >
                         <Upload size={14} />
                         上传图片
                         <input
@@ -275,6 +282,12 @@ export function VideoGeneratePage({
   );
 }
 
+function triggerNestedFileInput(event: KeyboardEvent<HTMLLabelElement>) {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  event.currentTarget.querySelector("input")?.click();
+}
+
 function MaterialBucketGrid({
   buckets,
   onAssetMaxUses,
@@ -325,7 +338,7 @@ function MaterialBucketGrid({
             <div className="bucket-asset-list">
               {bucket.assets.map((asset) => (
                 <div className={`bucket-asset ${asset.disabled ? "disabled" : ""}`} key={asset.id}>
-                  <div>
+                  <div className="bucket-asset-main">
                     <strong>{asset.title}</strong>
                     <small>
                       {asset.tags.sourceRange} · {asset.providerId} · {assetAvailabilityLabel(asset)}
@@ -339,28 +352,30 @@ function MaterialBucketGrid({
                       {asset.disabled ? "启用" : "禁用"}
                     </button>
                   </div>
-                  <label>
-                    <span>最大使用</span>
-                    <input
-                      type="number"
-                      min={asset.usage.usedCount}
-                      value={asset.usage.maxUses}
-                      onChange={(event) => onAssetMaxUses(asset.id, Number(event.target.value))}
-                    />
-                  </label>
-                  <label>
-                    <span>运营状态</span>
-                    <select
-                      value={asset.operationState ?? "untested"}
-                      onChange={(event) => onAssetOperationState(asset.id, event.target.value as OperationDecisionState)}
-                    >
-                      {operationDecisionOptions.map((option) => (
-                        <option key={option.value} value={option.value}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
+                  <div className="asset-control-grid">
+                    <label>
+                      <span>最大使用</span>
+                      <input
+                        type="number"
+                        min={asset.usage.usedCount}
+                        value={asset.usage.maxUses}
+                        onChange={(event) => onAssetMaxUses(asset.id, Number(event.target.value))}
+                      />
+                    </label>
+                    <label>
+                      <span>运营状态</span>
+                      <select
+                        value={asset.operationState ?? "untested"}
+                        onChange={(event) => onAssetOperationState(asset.id, event.target.value as OperationDecisionState)}
+                      >
+                        {operationDecisionOptions.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
                 </div>
               ))}
             </div>

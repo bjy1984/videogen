@@ -1,4 +1,5 @@
 import { Database, Download, FolderOpen, Plus, Save, Upload } from "lucide-react";
+import type { KeyboardEvent } from "react";
 import type { ProjectSnapshot } from "../../domain/project";
 import { formatDateTime } from "../../services/formatters";
 import type { AnalysisResult, VideoSegment } from "../../types";
@@ -60,7 +61,13 @@ export function ProjectBar({
           <Download size={16} />
           导出JSON
         </button>
-        <label className="secondary-button import-button">
+        <label
+          className="secondary-button import-button"
+          tabIndex={0}
+          role="button"
+          aria-label="导入工程 JSON"
+          onKeyDown={triggerNestedFileInput}
+        >
           <Upload size={16} />
           导入JSON
           <input
@@ -72,4 +79,10 @@ export function ProjectBar({
       </div>
     </section>
   );
+}
+
+function triggerNestedFileInput(event: KeyboardEvent<HTMLLabelElement>) {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  event.currentTarget.querySelector("input")?.click();
 }

@@ -1,5 +1,6 @@
 import { createId } from "../../services/id";
 import type { AnalysisResult, GenerationOptions, VideoSegment } from "../../types";
+import { faceMosaicCustomTags } from "../script/privacyEdits";
 import { DEFAULT_BUCKETS, DEFAULT_MAX_USES } from "./remixBucketService";
 import type { RemixAction, RemixPlan, StandardBucketRole } from "./remixTypes";
 
@@ -49,7 +50,8 @@ export function createRemixPlan(input: {
           materialType: input.analysisResult?.basicInfo.materialType,
           targetAudience: input.analysisResult?.basicInfo.targetAudience,
           visualStyle: input.analysisResult?.techniques.visualStyle,
-          providerId: input.options.provider
+          providerId: input.options.provider,
+          custom: faceMosaicCustomTags(segment)
         }
       };
     })

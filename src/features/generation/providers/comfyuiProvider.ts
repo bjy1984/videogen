@@ -25,6 +25,7 @@ export const comfyuiVideoProvider: VideoGenerationProvider = {
         duration: input.duration,
         aspectRatio: input.aspectRatio,
         referenceImageUrl: input.referenceImageUrl,
+        sourceVideoUrl: input.sourceVideoUrl,
         params
       });
       const task = await createComfyUIBridgeTask({
@@ -69,6 +70,7 @@ export const comfyuiVideoProvider: VideoGenerationProvider = {
         duration: current.input.duration,
         aspectRatio: current.input.aspectRatio,
         referenceImageUrl: current.input.referenceImageUrl,
+        sourceVideoUrl: current.input.sourceVideoUrl,
         params
       });
       const task = await getComfyUIBridgeTask({

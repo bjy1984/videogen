@@ -1,6 +1,9 @@
 node_modules/
 dist/
 .gemini-bridge/
+.venv-face-mosaic/
+.videogen-assets/
 .vite/
+models/*.onnx
 .DS_Store
 *.log

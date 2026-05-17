@@ -28,6 +28,7 @@ export interface ComfyUICreateTaskBridgeRequest {
   duration: number;
   aspectRatio: string;
   referenceImageUrl?: string;
+  sourceVideoUrl?: string;
   clientId: string;
 }
 
@@ -68,6 +69,7 @@ export function buildComfyUICreateTaskRequest(input: {
   duration: number;
   aspectRatio: string;
   referenceImageUrl?: string;
+  sourceVideoUrl?: string;
   params?: ComfyUIProviderParams;
 }) {
   const params = input.params ?? {};
@@ -84,6 +86,7 @@ export function buildComfyUICreateTaskRequest(input: {
     duration: input.duration,
     aspectRatio: input.aspectRatio,
     referenceImageUrl: input.referenceImageUrl,
+    sourceVideoUrl: input.sourceVideoUrl,
     clientId: createClientId()
   } satisfies ComfyUICreateTaskBridgeRequest;
 }
@@ -120,6 +123,7 @@ export function buildComfyUIPromptBody(input: {
   seed: string;
   steps: number;
   cfgScale: number;
+  sourceVideoUrl?: string;
   clientId: string;
 }) {
   return {
@@ -129,7 +133,8 @@ export function buildComfyUIPromptBody(input: {
       promptNodeId: input.promptNodeId,
       seed: input.seed,
       steps: input.steps,
-      cfgScale: input.cfgScale
+      cfgScale: input.cfgScale,
+      sourceVideoUrl: input.sourceVideoUrl
     }),
     client_id: input.clientId
   };
@@ -142,6 +147,7 @@ export function prepareComfyUIWorkflow(input: {
   seed: string;
   steps: number;
   cfgScale: number;
+  sourceVideoUrl?: string;
 }) {
   if (!isRecord(input.workflow)) {
     throw new Error("ComfyUI workflow 必须是 API 格式 JSON 对象。");
@@ -149,6 +155,7 @@ export function prepareComfyUIWorkflow(input: {
   const workflow = structuredClone(input.workflow) as Record<string, unknown>;
   injectPrompt(workflow, input.promptNodeId, input.prompt);
   injectSamplerControls(workflow, input.seed, input.steps, input.cfgScale);
+  if (input.sourceVideoUrl) injectSourceVideoControls(workflow, input.sourceVideoUrl);
   return workflow;
 }
 
@@ -247,6 +254,18 @@ function injectSamplerControls(workflow: Record<string, unknown>, seed: string, 
     if ("steps" in inputs) inputs.steps = Math.max(1, Math.floor(steps));
     if ("cfg" in inputs) inputs.cfg = cfgScale;
     if ("cfg_scale" in inputs) inputs.cfg_scale = cfgScale;
+  }
+}
+
+function injectSourceVideoControls(workflow: Record<string, unknown>, sourceVideoUrl: string) {
+  const sourceKeys = ["video_url", "source_video", "sourceVideo", "input_video", "inputVideo"];
+  for (const node of Object.values(workflow)) {
+    if (!isRecord(node)) continue;
+    const inputs = isRecord(node.inputs) ? node.inputs : undefined;
+    if (!inputs) continue;
+    for (const key of sourceKeys) {
+      if (key in inputs) inputs[key] = sourceVideoUrl;
+    }
   }
 }
 

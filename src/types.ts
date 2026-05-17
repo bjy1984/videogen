@@ -6,6 +6,21 @@ export type SegmentStatus = "idle" | "queued" | "generating" | "done" | "failed"
 export type SegmentBucketRole = "hook" | "pain" | "usp" | "trust" | "cta";
 export type SegmentContentStatus = "draft" | "needs-review" | "approved" | "blocked";
 
+export interface VideoPreprocessTrace {
+  id: string;
+  kind: "face-mosaic";
+  provider: "mock" | "local-bridge";
+  status: "queued" | "running" | "done" | "failed" | "skipped";
+  sourceVideoName?: string;
+  sourceVideoUrl?: string;
+  outputVideoUrl?: string;
+  localPath?: string;
+  publicAssetRequired?: boolean;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface AnalysisResult {
   basicInfo: {
     duration: number;
@@ -96,6 +111,10 @@ export interface VideoSegment {
   role: string;
   bucketRole?: SegmentBucketRole;
   contentStatus?: SegmentContentStatus;
+  privacyEdits?: {
+    faceMosaic?: boolean;
+    faceMosaicPreprocess?: VideoPreprocessTrace;
+  };
   duration: number;
   scriptText: string;
   subtitleText?: string;

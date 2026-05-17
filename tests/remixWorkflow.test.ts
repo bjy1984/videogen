@@ -44,6 +44,7 @@ import {
 import { createRemixPlan } from "../src/features/remix/remixPlanner";
 import type { MaterialBucket, RemixAsset } from "../src/features/remix/remixTypes";
 import { createSegmentsFromAnalysis } from "../src/features/script/segmentFactory";
+import { setSegmentFaceMosaic } from "../src/features/script/privacyEdits";
 import { buildScriptAudit } from "../src/features/script/scriptAudit";
 import {
   buildScriptRewriteSuggestion,
@@ -81,6 +82,7 @@ await run("builds official Ark Seedance task payload and URLs", () => {
     aspectRatio: "9:16",
     duration: 3,
     referenceImageUrl: "https://example.com/ref.png",
+    sourceVideoUrl: "https://assets.example/preprocessed-source.mp4",
     params: {
       model: DEFAULT_SEEDANCE_MODEL,
       endpoint: DEFAULT_SEEDANCE_ARK_BASE_URL,
@@ -98,6 +100,7 @@ await run("builds official Ark Seedance task payload and URLs", () => {
   assert.equal(request.body.model, DEFAULT_SEEDANCE_MODEL);
   assert.equal(request.body.content[0].type, "text");
   assert.equal(request.body.content[1].type, "image_url");
+  assert.equal(request.body.content[2].type, "video_url");
   assert.equal(request.body.duration, 5);
   assert.equal(request.body.seed, 11);
   assert.equal(request.body.generate_audio, true);
@@ -128,6 +131,12 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
           steps: 12,
           cfg: 5
         }
+      },
+      "12": {
+        class_type: "LoadVideo",
+        inputs: {
+          input_video: "old.mp4"
+        }
       }
     },
     prompt: "new product demo prompt",
@@ -135,6 +144,7 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
     seed: "42",
     steps: 24,
     cfgScale: 7,
+    sourceVideoUrl: "https://assets.example/preprocessed-source.mp4",
     clientId: "videogen_test"
   });
   const workflow = body.prompt as Record<string, { inputs: Record<string, unknown> }>;
@@ -142,6 +152,7 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
   assert.equal(workflow["3"].inputs.seed, 42);
   assert.equal(workflow["3"].inputs.steps, 24);
   assert.equal(workflow["3"].inputs.cfg, 7);
+  assert.equal(workflow["12"].inputs.input_video, "https://assets.example/preprocessed-source.mp4");
 
   const history = normalizeComfyUIHistoryResponse({
     endpoint: "http://127.0.0.1:8188",
@@ -208,6 +219,64 @@ await run("uses editable segment bucket roles when planning remix assets", () =>
   assert.equal(plan.items[0].duration, 5);
   assert.equal(assets[0].bucketId, "cta");
   assert.equal(assets[0].tags.sourceRange, "45-50秒");
+});
+
+await run("carries face mosaic preprocessing intent into jobs and remix tags", () => {
+  const privateSegment = setSegmentFaceMosaic(segments[0], true);
+  assert.equal(privateSegment.generationPrompt, segments[0].generationPrompt);
+  const preprocessTrace = {
+    id: "preprocess_face_001",
+    kind: "face-mosaic" as const,
+    provider: "local-bridge" as const,
+    status: "done" as const,
+    sourceVideoName: "source.mp4",
+    sourceVideoUrl: "https://assets.example/source.mp4",
+    outputVideoUrl: "https://assets.example/face-mosaic.mp4",
+    localPath: "/tmp/face-mosaic.mp4",
+    publicAssetRequired: true,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z"
+  };
+
+  const plan = createRemixPlan({
+    segments: [privateSegment],
+    analysisResult: analysis,
+    options: initialGenerationOptions
+  });
+  const assets = createMockRemixAssets({
+    segments: [privateSegment],
+    analysisResult: analysis,
+    options: initialGenerationOptions,
+    sourcePreviewUrl: "blob:source",
+    generationJobs: [
+      {
+        id: "job_with_preprocess",
+        input: {
+          segmentId: privateSegment.id,
+          bucketId: privateSegment.bucketRole || "hook",
+          providerId: initialGenerationOptions.provider,
+          prompt: privateSegment.generationPrompt,
+          duration: privateSegment.duration,
+          aspectRatio: initialGenerationOptions.aspectRatio,
+          sourceVideoUrl: preprocessTrace.outputVideoUrl,
+          preprocessingTrace: preprocessTrace
+        },
+        status: "queued",
+        createdAt: preprocessTrace.createdAt,
+        updatedAt: preprocessTrace.updatedAt
+      }
+    ]
+  });
+  assert.equal(plan.items[0].prompt, privateSegment.generationPrompt);
+  assert.deepEqual(plan.items[0].tags.custom?.privacyEdit, ["face-mosaic"]);
+  assert.equal(assets[0].prompt, privateSegment.generationPrompt);
+  assert.deepEqual(assets[0].tags.custom?.privacyEdit, ["face-mosaic"]);
+  assert.deepEqual(assets[0].tags.custom?.privacyPreprocessId, ["preprocess_face_001"]);
+  assert.deepEqual(assets[0].tags.custom?.preprocessedSourceUrl, [preprocessTrace.outputVideoUrl]);
+  assert.equal(assets[0].providerTrace?.preprocess?.outputVideoUrl, preprocessTrace.outputVideoUrl);
+
+  const restored = setSegmentFaceMosaic(privateSegment, false);
+  assert.equal(restored.privacyEdits?.faceMosaic, false);
 });
 
 await run("creates script revisions and deterministic rewrite suggestions", () => {

@@ -1,4 +1,5 @@
 import type { Provider } from "../../types";
+import type { VideoPreprocessTrace } from "../../types";
 
 export type StandardBucketRole = "hook" | "pain" | "usp" | "trust" | "cta";
 export type BucketRole = StandardBucketRole | string;
@@ -34,6 +35,7 @@ export interface RemixAssetProviderTrace {
   localAssetUrl?: string;
   localAssetPath?: string;
   originalVideoUrl?: string;
+  preprocess?: VideoPreprocessTrace;
   createdAt?: string;
   updatedAt?: string;
 }

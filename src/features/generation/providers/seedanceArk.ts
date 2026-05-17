@@ -32,7 +32,15 @@ export interface SeedanceArkContentImage {
   role?: "first_frame" | "last_frame" | "reference_image";
 }
 
-export type SeedanceArkContentItem = SeedanceArkContentText | SeedanceArkContentImage;
+export interface SeedanceArkContentVideo {
+  type: "video_url";
+  video_url: {
+    url: string;
+  };
+  role?: "source_video" | "reference_video";
+}
+
+export type SeedanceArkContentItem = SeedanceArkContentText | SeedanceArkContentImage | SeedanceArkContentVideo;
 
 export interface SeedanceCreateTaskRequest {
   model: string;
@@ -94,6 +102,7 @@ export function buildSeedanceCreateTaskRequest(input: {
   aspectRatio: "9:16" | "16:9" | "1:1";
   duration: number;
   referenceImageUrl?: string;
+  sourceVideoUrl?: string;
   params?: SeedanceProviderParams;
 }): SeedanceCreateTaskBridgeRequest {
   const params = input.params ?? {};
@@ -106,6 +115,13 @@ export function buildSeedanceCreateTaskRequest(input: {
       type: "image_url",
       image_url: { url: input.referenceImageUrl.trim() },
       role: "reference_image"
+    });
+  }
+  if (input.sourceVideoUrl?.trim()) {
+    content.push({
+      type: "video_url",
+      video_url: { url: input.sourceVideoUrl.trim() },
+      role: "source_video"
     });
   }
 

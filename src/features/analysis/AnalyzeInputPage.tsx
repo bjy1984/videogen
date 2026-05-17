@@ -88,15 +88,16 @@ export function AnalyzeInputPage({
             <h2>视频分析输入</h2>
           </div>
           <div className="prompt-actions">
-            <button className="icon-button" onClick={onSavePrompt} title="保存 Prompt">
+            <button className="icon-button" onClick={onSavePrompt} title="保存 Prompt" aria-label="保存 Prompt">
               <Save size={18} />
             </button>
-            <button className="icon-button" onClick={onResetPrompt} title="恢复默认提示词">
+            <button className="icon-button" onClick={onResetPrompt} title="恢复默认提示词" aria-label="恢复默认提示词">
               <RefreshCw size={18} />
             </button>
           </div>
         </div>
 
+        <label className="field-label" htmlFor="prompt-editor">分析 Prompt</label>
         <textarea
           id="prompt-editor"
           className="prompt-editor"

@@ -11,6 +11,7 @@ import {
   Shuffle,
   Upload
 } from "lucide-react";
+import type { KeyboardEvent } from "react";
 import { segmentStatusLabel } from "../../domain/labels";
 import type { VideoSegment } from "../../types";
 import { buildOperationAnalytics, type OperationAggregate } from "../lineage/operationAnalytics";
@@ -152,10 +153,13 @@ export function ComposeExportPage({
                       </button>
                     </div>
                   </div>
-                  <textarea
-                    value={segment.scriptText}
-                    onChange={(event) => onSegment(segment.id, { scriptText: event.target.value })}
-                  />
+                  <label className="compose-main-text">
+                    <span>脚本</span>
+                    <textarea
+                      value={segment.scriptText}
+                      onChange={(event) => onSegment(segment.id, { scriptText: event.target.value })}
+                    />
+                  </label>
                   <div className="compose-text-grid">
                     <label>
                       <span>字幕</span>
@@ -281,7 +285,13 @@ function OperationRunsPanel({
             <Download size={15} />
             导出JSON
           </button>
-          <label className="secondary-button compact">
+          <label
+            className="secondary-button compact"
+            tabIndex={0}
+            role="button"
+            aria-label="导入运营反馈 JSON"
+            onKeyDown={triggerNestedFileInput}
+          >
             <Upload size={15} />
             导入JSON
             <input
@@ -358,6 +368,12 @@ function OperationRunsPanel({
       )}
     </section>
   );
+}
+
+function triggerNestedFileInput(event: KeyboardEvent<HTMLLabelElement>) {
+  if (event.key !== "Enter" && event.key !== " ") return;
+  event.preventDefault();
+  event.currentTarget.querySelector("input")?.click();
 }
 
 function OperationAnalyticsPanel({ analytics }: { analytics: ReturnType<typeof buildOperationAnalytics> }) {
@@ -557,21 +573,24 @@ function TimelinePreview({
               </div>
               <div className="icon-actions">
                 <span className="source-pill">{clip.tags.sourceRange}</span>
-                <button className="icon-button" title="上移" onClick={() => onMoveTimelineClip(clip.id, -1)}>
+                <button className="icon-button" title="上移" aria-label={`上移 ${clip.title}`} onClick={() => onMoveTimelineClip(clip.id, -1)}>
                   <ArrowUp size={16} />
                 </button>
-                <button className="icon-button" title="下移" onClick={() => onMoveTimelineClip(clip.id, 1)}>
+                <button className="icon-button" title="下移" aria-label={`下移 ${clip.title}`} onClick={() => onMoveTimelineClip(clip.id, 1)}>
                   <ArrowDown size={16} />
                 </button>
-                <button className="icon-button" title="重抽该段" onClick={() => onRerollTimelineClip(clip.id)}>
+                <button className="icon-button" title="重抽该段" aria-label={`重抽 ${clip.title}`} onClick={() => onRerollTimelineClip(clip.id)}>
                   <Shuffle size={16} />
                 </button>
               </div>
             </div>
-            <textarea
-              value={clip.scriptText}
-              onChange={(event) => onTimelineClip(clip.id, { scriptText: event.target.value })}
-            />
+            <label className="compose-main-text">
+              <span>脚本</span>
+              <textarea
+                value={clip.scriptText}
+                onChange={(event) => onTimelineClip(clip.id, { scriptText: event.target.value })}
+              />
+            </label>
             <div className="compose-text-grid">
               <label>
                 <span>字幕</span>

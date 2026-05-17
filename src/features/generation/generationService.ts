@@ -1,4 +1,4 @@
-import type { AnalysisResult, GenerationOptions, VideoSegment } from "../../types";
+import type { AnalysisResult, GenerationOptions, Provider, VideoPreprocessTrace, VideoSegment } from "../../types";
 import { createMockRemixAssets, ensureDefaultBuckets, mergeAssetsIntoBuckets } from "../remix/remixBucketService";
 import { createRemixPlan } from "../remix/remixPlanner";
 import type { MaterialBucket, RemixAsset } from "../remix/remixTypes";
@@ -9,11 +9,14 @@ import { getVideoGenerationProvider } from "./providers/providerRegistry";
 import {
   getComfyUIBridgeTask,
   getSeedanceBridgeTask,
+  preprocessFaceMosaicBridge,
   syncComfyUIBridgeAsset,
   syncSeedanceBridgeAsset
 } from "../../services/videoGenerationBridgeClient";
 import { extractComfyUITaskError, mapComfyUITaskStatus, selectBestComfyUIOutputFile } from "./providers/comfyuiApi";
 import { extractSeedanceTaskError, mapSeedanceTaskStatus } from "./providers/seedanceArk";
+import { hasSegmentFaceMosaic } from "../script/privacyEdits";
+import type { GenerationJob, GenerationJobInput } from "./generationTypes";
 
 export async function generateRemixBuckets(input: {
   buckets: MaterialBucket[];
@@ -21,6 +24,7 @@ export async function generateRemixBuckets(input: {
   analysisResult: AnalysisResult | null;
   options: GenerationOptions;
   providerSettings: ProviderSettings;
+  projectId?: string;
   sourceVideo?: File;
   sourcePreviewUrl: string;
 }) {
@@ -31,18 +35,38 @@ export async function generateRemixBuckets(input: {
   });
   const provider = getVideoGenerationProvider(input.options.provider);
   const generationJobs = await Promise.all(
-    plan.items.map((item) =>
-      provider.createJob({
+    plan.items.map(async (item): Promise<GenerationJob> => {
+      const segment = input.segments.find((segmentItem) => segmentItem.id === item.segmentId);
+      const providerParams = providerParamsFor(String(input.options.provider), input.providerSettings);
+      const jobInput: GenerationJobInput = {
         segmentId: item.segmentId,
         bucketId: item.bucketId,
         providerId: input.options.provider,
         prompt: item.prompt,
         duration: item.duration,
         aspectRatio: input.options.aspectRatio,
+        referenceImageUrl: segment?.referenceImageUrl,
         sourceVideoName: input.sourceVideo?.name,
-        providerParams: providerParamsFor(String(input.options.provider), input.providerSettings)
-      })
-    )
+        providerParams
+      };
+      const prepared = await prepareSourcePreprocess({
+        projectId: input.projectId,
+        segment,
+        providerId: input.options.provider,
+        providerSettings: input.providerSettings,
+        sourceVideo: input.sourceVideo,
+        sourcePreviewUrl: input.sourcePreviewUrl
+      });
+      if (prepared.error) {
+        return createFailedPreprocessJob(jobInput, prepared.error, prepared.trace);
+      }
+      return provider.createJob({
+        ...jobInput,
+        sourceVideoUrl: prepared.trace?.outputVideoUrl,
+        sourceVideoLocalPath: prepared.trace?.localPath,
+        preprocessingTrace: prepared.trace
+      });
+    })
   );
   const assets = createMockRemixAssets({
     segments: input.segments,
@@ -69,6 +93,7 @@ export async function regenerateRemixAsset(input: {
   analysisResult: AnalysisResult | null;
   options: GenerationOptions;
   providerSettings: ProviderSettings;
+  projectId?: string;
   sourceVideo?: File;
   sourcePreviewUrl: string;
 }) {
@@ -81,7 +106,7 @@ export async function regenerateRemixAsset(input: {
   const duration = segment?.duration || asset.duration;
   const provider = getVideoGenerationProvider(input.options.provider);
   const providerParams = providerParamsFor(String(input.options.provider), input.providerSettings);
-  const job = await provider.createJob({
+  const jobInput: GenerationJobInput = {
     segmentId: asset.sourceSegmentId,
     bucketId: bucket.id,
     providerId: input.options.provider,
@@ -91,7 +116,23 @@ export async function regenerateRemixAsset(input: {
     referenceImageUrl: segment?.referenceImageUrl || asset.referenceImageUrl,
     sourceVideoName: input.sourceVideo?.name,
     providerParams
+  };
+  const prepared = await prepareSourcePreprocess({
+    projectId: input.projectId,
+    segment,
+    providerId: input.options.provider,
+    providerSettings: input.providerSettings,
+    sourceVideo: input.sourceVideo,
+    sourcePreviewUrl: input.sourcePreviewUrl
   });
+  const job = prepared.error
+    ? createFailedPreprocessJob(jobInput, prepared.error, prepared.trace)
+    : await provider.createJob({
+        ...jobInput,
+        sourceVideoUrl: prepared.trace?.outputVideoUrl,
+        sourceVideoLocalPath: prepared.trace?.localPath,
+        preprocessingTrace: prepared.trace
+      });
 
   const nextAsset = createRegeneratedAsset({
     bucket,
@@ -136,6 +177,78 @@ export async function regenerateRemixAsset(input: {
           }
         : item
     )
+  };
+}
+
+async function prepareSourcePreprocess(input: {
+  projectId?: string;
+  segment?: VideoSegment;
+  providerId: Provider;
+  providerSettings: ProviderSettings;
+  sourceVideo?: File;
+  sourcePreviewUrl: string;
+}): Promise<{ trace?: VideoPreprocessTrace; error?: string }> {
+  if (!input.segment || !hasSegmentFaceMosaic(input.segment)) return {};
+  const now = new Date().toISOString();
+  if (input.providerId === "mock") {
+    return {
+      trace: {
+        id: createId("preprocess_mock_face_mosaic"),
+        kind: "face-mosaic",
+        provider: "mock",
+        status: "done",
+        sourceVideoName: input.sourceVideo?.name,
+        sourceVideoUrl: input.sourcePreviewUrl || input.segment.videoUrl,
+        outputVideoUrl: input.sourcePreviewUrl || input.segment.videoUrl,
+        publicAssetRequired: false,
+        createdAt: now,
+        updatedAt: now
+      }
+    };
+  }
+  if (!input.sourceVideo) {
+    return {
+      error: "人脸打码预处理需要先上传原素材视频。"
+    };
+  }
+  try {
+    const result = await preprocessFaceMosaicBridge({
+      bridgeUrl: bridgeUrlForProvider(input.providerId, input.providerSettings),
+      projectId: input.projectId || "default_project",
+      segmentId: input.segment.id,
+      sourceRange: input.segment.role,
+      video: input.sourceVideo
+    });
+    return { trace: result.trace };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "人脸打码预处理失败。"
+    };
+  }
+}
+
+function bridgeUrlForProvider(providerId: Provider, providerSettings: ProviderSettings) {
+  if (providerId === "comfyui") return providerSettings.comfyui.bridgeUrl;
+  if (providerId === "seedance") return providerSettings.seedance.bridgeUrl;
+  return undefined;
+}
+
+function createFailedPreprocessJob(
+  input: GenerationJobInput,
+  error: string,
+  trace?: VideoPreprocessTrace
+): GenerationJob {
+  const now = new Date().toISOString();
+  return {
+    id: createId("job_preprocess_failed"),
+    input: {
+      ...input,
+      preprocessingTrace: trace
+    },
+    status: "failed",
+    createdAt: now,
+    updatedAt: now,
+    error
   };
 }
 
@@ -374,6 +487,7 @@ function createRegeneratedAsset(input: {
   const assetStatus = getAssetStatus(input.job);
   const jobVideoUrl = input.job.resultVideoUrl || input.job.asset?.videoUrl;
   const promptHash = hashText(input.prompt);
+  const preprocessTrace = input.job.input.preprocessingTrace || input.segment?.privacyEdits?.faceMosaicPreprocess;
   return {
     id: createId(`asset_${String(input.bucket.role).replace(/[^a-zA-Z0-9_-]+/g, "_")}`),
     sourceSegmentId: input.sourceAsset.sourceSegmentId,
@@ -402,6 +516,9 @@ function createRegeneratedAsset(input: {
       custom: {
         ...input.sourceAsset.tags.custom,
         regeneratedFrom: [input.sourceAsset.id],
+        ...(preprocessTrace?.id ? { privacyPreprocessId: [preprocessTrace.id] } : {}),
+        ...(preprocessTrace?.status ? { privacyPreprocessStatus: [preprocessTrace.status] } : {}),
+        ...(preprocessTrace?.outputVideoUrl ? { preprocessedSourceUrl: [preprocessTrace.outputVideoUrl] } : {}),
         ...(input.job.remoteJobId ? { remoteJobId: [input.job.remoteJobId] } : {}),
         ...(input.job.remoteStatus ? { remoteStatus: [input.job.remoteStatus] } : {})
       }
@@ -419,6 +536,7 @@ function createRegeneratedAsset(input: {
       status: input.job.remoteStatus || input.job.status,
       error: input.job.error,
       resultLastFrameUrl: input.job.resultLastFrameUrl,
+      preprocess: preprocessTrace,
       createdAt: input.job.createdAt,
       updatedAt: input.job.updatedAt
     },

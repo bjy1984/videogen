@@ -1,4 +1,5 @@
 import type { Provider } from "../../types";
+import type { VideoPreprocessTrace } from "../../types";
 import type { RemixAsset } from "../remix/remixTypes";
 
 export type GenerationJobStatus = "queued" | "generating" | "done" | "failed";
@@ -11,7 +12,10 @@ export interface GenerationJobInput {
   duration: number;
   aspectRatio: "9:16" | "16:9" | "1:1";
   referenceImageUrl?: string;
+  sourceVideoUrl?: string;
+  sourceVideoLocalPath?: string;
   sourceVideoName?: string;
+  preprocessingTrace?: VideoPreprocessTrace;
   providerParams?: Record<string, unknown>;
 }
 

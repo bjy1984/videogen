@@ -13,6 +13,7 @@ import type {
   SeedanceTaskResponse
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
+import type { VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
   ok: boolean;
@@ -47,7 +48,8 @@ export async function createSeedanceBridgeTask(input: {
 }) {
   return requestBridge<SeedanceTaskResponse>(input.bridgeUrl, "/seedance/tasks", {
     method: "POST",
-    body: JSON.stringify(input.request)
+    body: JSON.stringify(input.request),
+    timeoutMs: 45_000
   });
 }
 
@@ -57,7 +59,8 @@ export async function createComfyUIBridgeTask(input: {
 }) {
   return requestBridge<ComfyUITaskResponse>(input.bridgeUrl || FALLBACK_COMFYUI_BRIDGE_URL, "/comfyui/tasks", {
     method: "POST",
-    body: JSON.stringify(input.request)
+    body: JSON.stringify(input.request),
+    timeoutMs: 45_000
   });
 }
 
@@ -68,6 +71,26 @@ export async function checkVideoGenerationBridgeHealth(
 ) {
   const searchParams = new URLSearchParams({ apiKeyEnvName, comfyEndpoint });
   return requestBridge<VideoGenerationBridgeHealth>(bridgeUrl, `/health?${searchParams.toString()}`);
+}
+
+export async function preprocessFaceMosaicBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  segmentId: string;
+  sourceRange?: string;
+  video: File;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("segmentId", input.segmentId);
+  if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
+  formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
+  return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
+    input.bridgeUrl,
+    "/privacy/face-mosaic",
+    formData,
+    180_000
+  );
 }
 
 export async function getSeedanceBridgeTask(input: {
@@ -120,7 +143,8 @@ export async function syncSeedanceBridgeAsset(input: {
         projectId: input.projectId,
         assetId: input.assetId,
         sourceUrl: input.sourceUrl
-      })
+      }),
+      timeoutMs: 120_000
     }
   );
 }
@@ -143,27 +167,78 @@ export async function syncComfyUIBridgeAsset(input: {
         projectId: input.projectId,
         assetId: input.assetId,
         outputNodeId: input.outputNodeId
-      })
+      }),
+      timeoutMs: 120_000
     }
   );
 }
 
-async function requestBridge<T>(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL, path: string, init: RequestInit = {}) {
-  const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...init.headers
+interface BridgeRequestInit extends RequestInit {
+  timeoutMs?: number;
+}
+
+async function requestBridge<T>(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL, path: string, init: BridgeRequestInit = {}) {
+  const timeoutMs = init.timeoutMs ?? 30_000;
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  const { timeoutMs: _timeoutMs, signal, ...fetchInit } = init;
+  try {
+    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+      ...fetchInit,
+      signal: signal ?? controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        ...fetchInit.headers
+      }
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new VideoGenerationBridgeError(
+        payload?.error || payload?.message || `视频生成 Bridge 请求失败：${response.status}`,
+        response.status
+      );
     }
-  });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new VideoGenerationBridgeError(
-      payload?.error || payload?.message || `视频生成 Bridge 请求失败：${response.status}`,
-      response.status
-    );
+    return payload as T;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new VideoGenerationBridgeError(`视频生成 Bridge 请求超时：${Math.round(timeoutMs / 1000)}秒未响应。`, 408);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
   }
-  return payload as T;
+}
+
+async function requestBridgeForm<T>(
+  bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL,
+  path: string,
+  body: FormData,
+  timeoutMs = 120_000
+) {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+      method: "POST",
+      body,
+      signal: controller.signal
+    });
+    const payload = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new VideoGenerationBridgeError(
+        payload?.error || payload?.message || `视频生成 Bridge 请求失败：${response.status}`,
+        response.status
+      );
+    }
+    return payload as T;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new VideoGenerationBridgeError(`视频生成 Bridge 请求超时：${Math.round(timeoutMs / 1000)}秒未响应。`, 408);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
 }
 
 function stripTrailingSlash(value: string) {

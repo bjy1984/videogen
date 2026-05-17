@@ -2,6 +2,7 @@ import { createId } from "../../services/id";
 import type { AnalysisResult, GenerationOptions, VideoSegment } from "../../types";
 import type { GenerationJob } from "../generation/generationTypes";
 import type { OperationAnalytics } from "../lineage/operationAnalytics";
+import { faceMosaicCustomTags } from "../script/privacyEdits";
 import type { MaterialBucket, OperationDecisionState, RemixAsset, StandardBucketRole } from "./remixTypes";
 
 export const DEFAULT_MAX_USES = 3;
@@ -51,10 +52,12 @@ export function createMockRemixAssets(input: {
   const jobsBySegment = new Map(input.generationJobs?.map((job) => [job.input.segmentId, job]) ?? []);
   return input.segments.map((segment) => {
     const role = segment.bucketRole ?? segmentRoleMap[segment.id] ?? "hook";
-    const promptHash = hashText(segment.generationPrompt);
+    const prompt = segment.generationPrompt;
+    const promptHash = hashText(prompt);
     const job = jobsBySegment.get(segment.id);
     const assetStatus = getAssetStatus(job);
     const jobVideoUrl = job?.resultVideoUrl || job?.asset?.videoUrl;
+    const preprocessTrace = job?.input.preprocessingTrace || segment.privacyEdits?.faceMosaicPreprocess;
     const asset: RemixAsset = {
       id: createId(`asset_${role}`),
       sourceSegmentId: segment.id,
@@ -64,7 +67,7 @@ export function createMockRemixAssets(input: {
       scriptText: segment.scriptText,
       subtitleText: segment.subtitleText ?? segment.scriptText,
       overlayText: segment.overlayText,
-      prompt: segment.generationPrompt,
+      prompt,
       duration: segment.duration,
       providerId: input.options.provider,
       status: assetStatus,
@@ -81,6 +84,10 @@ export function createMockRemixAssets(input: {
         promptHash,
         custom: {
           priority: [input.analysisResult?.basicInfo.priorityLevel ?? "unknown"],
+          ...faceMosaicCustomTags(segment),
+          ...(preprocessTrace?.id ? { privacyPreprocessId: [preprocessTrace.id] } : {}),
+          ...(preprocessTrace?.status ? { privacyPreprocessStatus: [preprocessTrace.status] } : {}),
+          ...(preprocessTrace?.outputVideoUrl ? { preprocessedSourceUrl: [preprocessTrace.outputVideoUrl] } : {}),
           ...(job?.remoteJobId ? { remoteJobId: [job.remoteJobId] } : {}),
           ...(job?.remoteStatus ? { remoteStatus: [job.remoteStatus] } : {})
         }
@@ -99,6 +106,7 @@ export function createMockRemixAssets(input: {
             status: job.remoteStatus || job.status,
             error: job.error,
             resultLastFrameUrl: job.resultLastFrameUrl,
+            preprocess: preprocessTrace,
             createdAt: job.createdAt,
             updatedAt: job.updatedAt
           }
