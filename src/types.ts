@@ -1,4 +1,4 @@
-export type StepKey = "input" | "report" | "script" | "generate" | "compose";
+export type StepKey = "input" | "report" | "script" | "mask-test" | "generate" | "compose";
 
 export type Provider = "mock" | "comfyui" | "seedance" | "veo" | "kling" | "runway" | "pika";
 

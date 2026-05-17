@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ScanFace, ScanText, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText, Layers, Plus, RotateCcw, Save, ScanFace, ShieldCheck, Sparkles, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { InfoItem } from "../../components/common/InfoItem";
 import { segmentStatusLabel } from "../../domain/labels";
@@ -15,6 +15,8 @@ export function ScriptEditorPage({
   scriptRevisions,
   scriptSuggestions,
   sourcePreviewUrl,
+  facePreviewSegmentId,
+  facePreviewError,
   onSegment,
   onMove,
   onDuplicate,
@@ -26,6 +28,7 @@ export function ScriptEditorPage({
   onApplySuggestion,
   onToggleFaceMosaic,
   onToggleAllFaceMosaic,
+  onPreviewFaceMosaic,
   onUpdateBrandMasks,
   onCreate,
   onBack,
@@ -36,6 +39,8 @@ export function ScriptEditorPage({
   scriptRevisions: ScriptRevision[];
   scriptSuggestions: Record<string, ScriptRewriteSuggestion>;
   sourcePreviewUrl: string;
+  facePreviewSegmentId: string;
+  facePreviewError: string;
   onSegment: (id: string, patch: Partial<VideoSegment>) => void;
   onMove: (id: string, direction: -1 | 1) => void;
   onDuplicate: (id: string) => void;
@@ -47,6 +52,7 @@ export function ScriptEditorPage({
   onApplySuggestion: (segmentId: string, target: ScriptSuggestionApplyTarget) => void;
   onToggleFaceMosaic: (segmentId: string) => void;
   onToggleAllFaceMosaic: () => void;
+  onPreviewFaceMosaic: (segmentId: string) => void;
   onUpdateBrandMasks: (segmentId: string, brandMasks: BrandMaskTrack[]) => void;
   onCreate: () => void;
   onBack: () => void;
@@ -92,7 +98,7 @@ export function ScriptEditorPage({
             disabled={!segments.length}
           >
             <ScanFace size={14} />
-            {allFaceMosaic ? "取消全段预处理" : "全段生成前打码"}
+            {allFaceMosaic ? "取消全段人脸" : "全段人脸打码"}
           </button>
         </div>
 
@@ -115,29 +121,20 @@ export function ScriptEditorPage({
                     <h3>{index + 1}. {segment.title || "未命名段落"}</h3>
                     <small>
                       {bucketRoleLabel(segment.bucketRole)} · {contentStatusLabel(segment.contentStatus)} · {segment.role} · {segment.duration}秒
-                      {faceMosaicEnabled ? " · 生成前打码" : ""}
-                      {brandMaskEnabled ? ` · 品牌遮罩${brandMaskReview.errorCount ? "待补帧" : ""}` : ""}
+                      {faceMosaicEnabled ? " · 人脸打码" : ""}
+                      {brandMaskEnabled ? ` · 物体打码${brandMaskReview.errorCount ? "待补帧" : ""}` : ""}
                     </small>
                   </div>
                   <div className="icon-actions">
                     <span className={`status ${segment.status}`}>{segmentStatusLabel(segment.status)}</span>
                     <button
-                      className={`icon-button privacy ${faceMosaicEnabled ? "active" : ""}`}
-                      title={faceMosaicEnabled ? "取消生成前人脸打码" : "生成前人脸打码"}
-                      aria-label={`${faceMosaicEnabled ? "取消" : "启用"}${segment.title || "该段落"}生成前人脸打码`}
-                      aria-pressed={faceMosaicEnabled}
-                      onClick={() => onToggleFaceMosaic(segment.id)}
-                    >
-                      <ScanFace size={15} />
-                    </button>
-                    <button
-                      className={`icon-button privacy ${brandMaskEnabled ? "active" : ""} ${brandMaskReview.errorCount ? "needs-attention" : ""}`}
-                      title="品牌/文字打码"
-                      aria-label={`编辑${segment.title || "该段落"}品牌文字打码`}
-                      aria-pressed={brandMaskEnabled}
+                      className={`icon-button privacy ${faceMosaicEnabled || brandMaskEnabled ? "active" : ""} ${brandMaskReview.errorCount ? "needs-attention" : ""}`}
+                      title="预处理打码"
+                      aria-label={`编辑${segment.title || "该段落"}预处理打码`}
+                      aria-pressed={faceMosaicEnabled || brandMaskEnabled}
                       onClick={() => setBrandMaskSegmentId(segment.id)}
                     >
-                      <ScanText size={15} />
+                      <ShieldCheck size={15} />
                     </button>
                     <button className="icon-button" title="上移" disabled={index === 0} onClick={() => onMove(segment.id, -1)}>
                       <ArrowUp size={15} />
@@ -279,6 +276,10 @@ export function ScriptEditorPage({
       <BrandMaskAnnotator
         segment={brandMaskSegment}
         sourcePreviewUrl={sourcePreviewUrl}
+        facePreviewSegmentId={facePreviewSegmentId}
+        facePreviewError={facePreviewError}
+        onToggleFaceMosaic={() => onToggleFaceMosaic(brandMaskSegment.id)}
+        onPreviewFaceMosaic={() => onPreviewFaceMosaic(brandMaskSegment.id)}
         onChange={(brandMasks) => onUpdateBrandMasks(brandMaskSegment.id, brandMasks)}
         onClose={() => setBrandMaskSegmentId("")}
       />

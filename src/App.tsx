@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { ShieldCheck } from "lucide-react";
 import {
   initialGenerationOptions,
   workflowPages
@@ -39,6 +40,7 @@ import { VideoGeneratePage } from "./features/generation/VideoGeneratePage";
 import { buildOperationAnalytics } from "./features/lineage/operationAnalytics";
 import type { FinalVideoRun, OperationFeedback } from "./features/lineage/lineageTypes";
 import { createFinalVideoRun, mergeFinalRunsById, mergeRunFeedback } from "./features/lineage/lineageService";
+import { MaskTestPage } from "./features/privacy/MaskTestPage";
 import {
   applyOperationDecisionsToBuckets,
   createCustomBucket,
@@ -79,6 +81,7 @@ import {
 import { createId } from "./services/id";
 import {
   checkVideoGenerationBridgeHealth,
+  preprocessFaceMosaicBridge,
   type VideoGenerationBridgeHealth
 } from "./services/videoGenerationBridgeClient";
 import {
@@ -90,7 +93,7 @@ import {
 import type { AnalysisResult, BrandMaskTrack, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
 
 export default function App() {
-  const [page, setPage] = useState<StepKey>("input");
+  const [page, setPage] = useState<StepKey>(() => readInitialPage());
   const [projectId, setProjectId] = useState(() => createId("project"));
   const [projectName, setProjectName] = useState("未命名爆款视频工程");
   const [lastSavedAt, setLastSavedAt] = useState("");
@@ -114,6 +117,8 @@ export default function App() {
   const [providerSettings, setProviderSettings] = useState<ProviderSettings>(() => mergeProviderSettings());
   const [videoBridgeHealth, setVideoBridgeHealth] = useState<VideoGenerationBridgeHealth | null>(null);
   const [isVideoBridgeBusy, setIsVideoBridgeBusy] = useState(false);
+  const [facePreviewSegmentId, setFacePreviewSegmentId] = useState("");
+  const [facePreviewError, setFacePreviewError] = useState("");
   const [isGenerationPolling, setIsGenerationPolling] = useState(false);
   const [segments, setSegments] = useState<VideoSegment[]>([]);
   const [scriptRevisions, setScriptRevisions] = useState<ScriptRevision[]>([]);
@@ -130,6 +135,12 @@ export default function App() {
     };
   }, [sourcePreviewUrl]);
 
+  useEffect(() => {
+    const handleHashChange = () => setPage(readInitialPage());
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
   const doneCount = segments.filter((item) => item.status === "done").length;
   const totalDuration = useMemo(
     () => segments.reduce((total, segment) => total + segment.duration, 0),
@@ -139,6 +150,14 @@ export default function App() {
     () => buildGeminiManualPrompt({ basePrompt: prompt, sourceVideoMeta, videoDuration }),
     [prompt, sourceVideoMeta, videoDuration]
   );
+
+  function navigatePage(nextPage: StepKey) {
+    setPage(nextPage);
+    const nextHash = `#${nextPage}`;
+    if (window.location.hash !== nextHash) {
+      window.location.hash = nextHash;
+    }
+  }
 
   function buildSnapshot(name = projectName): ProjectSnapshot {
     return {
@@ -190,6 +209,8 @@ export default function App() {
     setProviderSettings(mergeProviderSettings(snapshot.providerSettings));
     setVideoBridgeHealth(null);
     setIsVideoBridgeBusy(false);
+    setFacePreviewSegmentId("");
+    setFacePreviewError("");
     setIsGenerationPolling(false);
     setSegments((snapshot.segments || []).map(stripTransientSegmentFields));
     setScriptRevisions(snapshot.scriptRevisions || []);
@@ -271,6 +292,8 @@ export default function App() {
     setProviderSettings(defaultProviderSettings);
     setVideoBridgeHealth(null);
     setIsVideoBridgeBusy(false);
+    setFacePreviewSegmentId("");
+    setFacePreviewError("");
     setIsGenerationPolling(false);
     setSegments([]);
     setScriptRevisions([]);
@@ -280,7 +303,7 @@ export default function App() {
     setFinalVideoRuns([]);
     setComposeStatus("idle");
     setNotice("已创建空工程。");
-    setPage("input");
+    navigatePage("input");
   }
 
   function handleVideoFile(file?: File) {
@@ -308,7 +331,7 @@ export default function App() {
       setScriptSuggestions({});
       setReportSection("basic");
       setIsAnalyzing(false);
-      setPage("report");
+      navigatePage("report");
     }, 900);
   }
 
@@ -318,7 +341,7 @@ export default function App() {
     setSegments(createSegmentsFromAnalysis(result, options, sourceVideo));
     setScriptSuggestions({});
     setNotice(analysisResult ? "已从分析报告提取五段脚本。" : "当前没有分析报告，已创建一组默认五段脚本。");
-    setPage(targetPage);
+    navigatePage(targetPage);
   }
 
   function updateOptions(patch: Partial<GenerationOptions>) {
@@ -455,7 +478,8 @@ export default function App() {
       return next;
     });
     setComposeTimeline(null);
-    setNotice(enabled ? `已为「${target.title || "该段落"}」开启人脸打码。` : `已取消「${target.title || "该段落"}」的人脸打码。`);
+    setFacePreviewError("");
+    setNotice(enabled ? `已为「${target.title || "该段落"}」标记生成前人脸打码。可点击“运行人脸预览”立即查看效果。` : `已取消「${target.title || "该段落"}」的人脸打码。`);
   }
 
   function toggleAllSegmentFaceMosaic() {
@@ -467,13 +491,51 @@ export default function App() {
     setSegments((items) => items.map((item) => setSegmentFaceMosaic(item, shouldEnable)));
     setScriptSuggestions({});
     setComposeTimeline(null);
+    setFacePreviewError("");
     setNotice(shouldEnable ? "已为全部脚本段开启人脸打码。" : "已取消全部脚本段的人脸打码。");
+  }
+
+  async function previewSegmentFaceMosaic(segmentId: string) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要预览人脸打码的脚本段。");
+      return;
+    }
+    if (!sourceVideo) {
+      setNotice("人脸打码预览需要先上传原素材视频。");
+      return;
+    }
+    if (facePreviewSegmentId) return;
+    setFacePreviewSegmentId(segmentId);
+    setFacePreviewError("");
+    setNotice(`正在为「${target.title || "该段落"}」运行人脸打码预览...`);
+    try {
+      const result = await preprocessFaceMosaicBridge({
+        bridgeUrl: providerSettings.seedance.bridgeUrl,
+        projectId,
+        segmentId: target.id,
+        sourceRange: target.role,
+        preview: true,
+        video: sourceVideo
+      });
+      setSegments((items) =>
+        items.map((item) => (item.id === segmentId ? applyPreprocessTraces(item, [result.trace]) : item))
+      );
+      setComposeTimeline(null);
+      setNotice(`人脸打码预览完成：${result.trace.summary?.frameCount ?? 0}帧，耗时 ${result.trace.summary?.elapsedSec ?? "-"} 秒。`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "未知错误";
+      setFacePreviewError(message);
+      setNotice(`人脸打码预览失败：${message}`);
+    } finally {
+      setFacePreviewSegmentId("");
+    }
   }
 
   function updateSegmentBrandMasks(segmentId: string, brandMasks: BrandMaskTrack[]) {
     const target = segments.find((item) => item.id === segmentId);
     if (!target) {
-      setNotice("未找到要设置品牌打码的脚本段。");
+      setNotice("未找到要设置物体追踪打码的脚本段。");
       return;
     }
     setSegments((items) =>
@@ -486,7 +548,7 @@ export default function App() {
     });
     setComposeTimeline(null);
     const keyframeCount = brandMasks.reduce((total, track) => total + track.keyframes.length, 0);
-    setNotice(`已更新「${target.title || "该段落"}」品牌/文字打码：${brandMasks.length}个遮罩，${keyframeCount}个关键帧。`);
+    setNotice(`已更新「${target.title || "该段落"}」物体追踪打码：${brandMasks.length}个目标，${keyframeCount}个关键帧。`);
   }
 
   function deleteScriptSegment(id: string) {
@@ -965,7 +1027,7 @@ export default function App() {
       setReportSection("basic");
       setSegments(createSegmentsFromAnalysis(result, options, sourceVideo));
       setNotice("Gemini 返回结果已解析并写入当前工程。");
-      setPage("report");
+      navigatePage("report");
     } catch (error) {
       const message = error instanceof Error ? error.message : "解析失败。";
       setGeminiParseError(message);
@@ -1055,9 +1117,15 @@ export default function App() {
           <p className="eyebrow">Douyin Qianchuan Video Workflow</p>
           <h1>爆款视频分析与生成工作流</h1>
         </div>
-        <div className="topbar-stats">
-          <span>{analysisResult ? "已完成分析" : "等待分析"}</span>
-          <strong>{doneCount}/{segments.length || 5}</strong>
+        <div className="topbar-actions">
+          <a className="secondary-button topbar-test-button" href="#mask-test" onClick={() => setPage("mask-test")}>
+            <ShieldCheck size={16} />
+            打码测试台
+          </a>
+          <div className="topbar-stats">
+            <span>{analysisResult ? "已完成分析" : "等待分析"}</span>
+            <strong>{doneCount}/{segments.length || 5}</strong>
+          </div>
         </div>
       </header>
 
@@ -1080,7 +1148,7 @@ export default function App() {
           <button
             key={item.key}
             className={`step ${item.key === page ? "active" : ""}`}
-            onClick={() => setPage(item.key)}
+            onClick={() => navigatePage(item.key)}
           >
             <span className="step-index">{index + 1}</span>
             <span>
@@ -1127,7 +1195,7 @@ export default function App() {
           onCreateGeminiBridgeTask={createGeminiBridgeTask}
           onPrepareGeminiBridgeTask={prepareGeminiBridgeTask}
           onCaptureGeminiBridgeResult={captureGeminiBridgeResult}
-          onNext={() => setPage("report")}
+          onNext={() => navigatePage("report")}
         />
       )}
 
@@ -1136,7 +1204,7 @@ export default function App() {
           result={analysisResult}
           reportSection={reportSection}
           onSection={setReportSection}
-          onBack={() => setPage("input")}
+          onBack={() => navigatePage("input")}
           onExtract={() => extractScriptsFromReport("script")}
           onCreateMock={() => {
             const result = createMockAnalysis(videoDuration);
@@ -1155,6 +1223,8 @@ export default function App() {
           scriptRevisions={scriptRevisions}
           scriptSuggestions={scriptSuggestions}
           sourcePreviewUrl={sourcePreviewUrl}
+          facePreviewSegmentId={facePreviewSegmentId}
+          facePreviewError={facePreviewError}
           onSegment={updateSegment}
           onMove={moveSegment}
           onDuplicate={duplicateScriptSegment}
@@ -1166,11 +1236,16 @@ export default function App() {
           onApplySuggestion={applyScriptSuggestion}
           onToggleFaceMosaic={toggleSegmentFaceMosaic}
           onToggleAllFaceMosaic={toggleAllSegmentFaceMosaic}
+          onPreviewFaceMosaic={previewSegmentFaceMosaic}
           onUpdateBrandMasks={updateSegmentBrandMasks}
           onCreate={() => extractScriptsFromReport("script")}
-          onBack={() => setPage("report")}
-          onNext={() => setPage("generate")}
+          onBack={() => navigatePage("report")}
+          onNext={() => navigatePage("generate")}
         />
+      )}
+
+      {page === "mask-test" && (
+        <MaskTestPage bridgeUrl={providerSettings.seedance.bridgeUrl} />
       )}
 
       {page === "generate" && (
@@ -1198,8 +1273,8 @@ export default function App() {
           onAddCustomBucket={addCustomMaterialBucket}
           onRenameBucket={renameMaterialBucket}
           onDeleteBucket={deleteMaterialBucket}
-          onBack={() => setPage("script")}
-          onNext={() => setPage("compose")}
+          onBack={() => navigatePage("script")}
+          onNext={() => navigatePage("compose")}
         />
       )}
 
@@ -1220,7 +1295,7 @@ export default function App() {
           onAssetMaxUses={updateRemixAssetMaxUses}
           onAssetToggle={toggleRemixAsset}
           onAssetOperationState={updateRemixAssetOperationState}
-          onBack={() => setPage("generate")}
+          onBack={() => navigatePage("generate")}
           onCompose={runCompose}
           onExport={exportDraft}
           onRunFeedback={updateRunFeedback}
@@ -1239,4 +1314,14 @@ function delay(ms: number) {
 
 function readSavedPrompt() {
   return readPromptFromStorage(defaultAnalysisPrompt);
+}
+
+function readInitialPage(): StepKey {
+  if (typeof window === "undefined") return "input";
+  const hashPage = window.location.hash.replace(/^#/, "");
+  return isStepKey(hashPage) ? hashPage : "input";
+}
+
+function isStepKey(value: string): value is StepKey {
+  return value === "mask-test" || workflowPages.some((item) => item.key === value);
 }

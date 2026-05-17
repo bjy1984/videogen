@@ -45,6 +45,9 @@ class TrackSpec:
 class TrackState:
     rect: Rect
     previous_gray: np.ndarray | None = None
+    anchor_gray: np.ndarray | None = None
+    anchor_rect: Rect | None = None
+    tracker: Any | None = None
 
 
 @dataclass
@@ -132,23 +135,32 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
             frame_masked = False
 
             for track in tracks:
-                rect, confidence = resolve_track_rect(track, states.get(track.id), gray, processed_frames, frame_time)
+                previous_state = states.get(track.id)
+                rect, confidence = resolve_track_rect(track, previous_state, frame, gray, processed_frames, frame_time)
                 if rect is None:
                     continue
+                exact = exact_keyframe(track, processed_frames, frame_time)
                 if confidence is not None and confidence < track.confidence_threshold:
                     has_right_anchor = next_keyframe(track, processed_frames) is not None
+                    severity = issue_severity(confidence, track.confidence_threshold, has_right_anchor)
                     issues.append(
                         FrameIssue(
                             track_id=track.id,
                             frame_index=processed_frames,
                             time=round(frame_time, 3),
-                            severity="warning" if has_right_anchor else "error",
+                            severity=severity,
                             reason=f"{track.label} tracking confidence is low.",
                             confidence=round(confidence, 3),
                         )
                     )
                 apply_mask(output, expand_rect(rect, track.expand_ratio), track.effect, args.block, args.blur, solid_color)
-                states[track.id] = TrackState(rect=rect, previous_gray=gray)
+                states[track.id] = TrackState(
+                    rect=rect,
+                    previous_gray=gray,
+                    anchor_gray=gray if exact else previous_state.anchor_gray if previous_state else gray,
+                    anchor_rect=rect if exact else previous_state.anchor_rect if previous_state else rect,
+                    tracker=create_cv_tracker(frame, rect) if exact or not previous_state or previous_state.tracker is None else previous_state.tracker,
+                )
                 frame_masked = True
 
             if frame_masked:
@@ -202,7 +214,7 @@ def parse_tracks(spec: Any, fps: float) -> list[TrackSpec]:
                 effect=str(raw.get("effect") or ("solid" if raw.get("targetType") == "text" else "mosaic")),
                 track_mode=str(raw.get("trackMode") or "planar"),
                 expand_ratio=float(raw.get("expandRatio") if raw.get("expandRatio") is not None else 0.16),
-                confidence_threshold=float(raw.get("confidenceThreshold") if raw.get("confidenceThreshold") is not None else 0.62),
+                confidence_threshold=float(raw.get("confidenceThreshold") if raw.get("confidenceThreshold") is not None else 0.45),
                 keyframes=keyframes,
             )
         )
@@ -240,6 +252,7 @@ def parse_keyframes(raw_keyframes: Any, fps: float) -> list[Keyframe]:
 def resolve_track_rect(
     track: TrackSpec,
     state: TrackState | None,
+    frame: np.ndarray,
     gray: np.ndarray,
     frame_index: int,
     frame_time: float,
@@ -256,22 +269,37 @@ def resolve_track_rect(
 
     interpolated = interpolate_rect(track, frame_index)
     if track.track_mode == "interpolate":
-        return interpolated or nearest_track_rect(track, frame_index), 0.9 if interpolated else 0.55
+        return interpolated or nearest_track_rect(track, frame_index), 0.9
 
     if state and state.previous_gray is not None:
+        tracked, score = track_with_cv_tracker(state.tracker, frame, state.rect)
+        if tracked is not None:
+            return tracked, score
+        anchor_gray = state.anchor_gray if state.anchor_gray is not None else state.previous_gray
+        anchor_rect = state.anchor_rect if state.anchor_rect is not None else state.rect
         if track.track_mode == "planar":
-            tracked, score = track_with_features(state.previous_gray, gray, state.rect)
+            tracked, score = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
             if tracked is not None and score >= track.confidence_threshold * 0.75:
                 return tracked, score
             tracked, score = track_with_lk(state.previous_gray, gray, state.rect)
+            if tracked is None or score < track.confidence_threshold * 0.75:
+                tracked, score = track_with_features(state.previous_gray, gray, state.rect)
         else:
-            tracked, score = track_with_lk(state.previous_gray, gray, state.rect)
+            tracked, score = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
+            if tracked is None or score < track.confidence_threshold * 0.75:
+                tracked, score = track_with_lk(state.previous_gray, gray, state.rect)
             if tracked is None or score < track.confidence_threshold * 0.75:
                 tracked, score = track_with_features(state.previous_gray, gray, state.rect)
         if tracked is not None:
             return tracked, score
 
     return interpolated or nearest_track_rect(track, frame_index), 0.5 if interpolated else 0.35
+
+
+def issue_severity(confidence: float, threshold: float, has_right_anchor: bool) -> str:
+    if has_right_anchor:
+        return "warning"
+    return "warning" if confidence >= threshold * 0.72 else "error"
 
 
 def exact_keyframe(track: TrackSpec, frame_index: int, frame_time: float) -> Keyframe | None:
@@ -376,10 +404,101 @@ def track_with_lk(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tupl
     return validate_rect(next_rect, rect), score
 
 
+def create_cv_tracker(frame: np.ndarray, rect: Rect) -> Any | None:
+    if not hasattr(cv2, "TrackerMIL_create"):
+        return None
+    x, y, w, h = rect_to_pixels(rect, frame.shape[1], frame.shape[0])
+    tracker = cv2.TrackerMIL_create()
+    try:
+        tracker.init(frame, (x, y, w, h))
+        return tracker
+    except cv2.error:
+        return None
+
+
+def track_with_cv_tracker(tracker: Any | None, current: np.ndarray, previous_rect: Rect) -> tuple[Rect | None, float]:
+    if tracker is None:
+        return None, 0.0
+    try:
+        ok, bbox = tracker.update(current)
+    except cv2.error:
+        return None, 0.0
+    if not ok:
+        return None, 0.0
+    x, y, w, h = bbox
+    candidate = pixels_to_rect((int(round(x)), int(round(y)), int(round(w)), int(round(h))), current.shape[1], current.shape[0])
+    return validate_rect(candidate, previous_rect), 0.76
+
+
+def track_with_template(template_frame: np.ndarray, current: np.ndarray, template_rect: Rect, search_rect: Rect | None = None) -> tuple[Rect | None, float]:
+    search_rect = search_rect or template_rect
+    template_crop, template_offset = crop_from_rect(template_frame, template_rect, pad=0.08)
+    search_crop, search_offset = crop_from_rect(current, search_rect, pad=0.9)
+    if template_crop.size == 0 or search_crop.size == 0:
+        return None, 0.0
+    if template_crop.shape[0] < 10 or template_crop.shape[1] < 10:
+        return None, 0.0
+    if search_crop.shape[0] < template_crop.shape[0] or search_crop.shape[1] < template_crop.shape[1]:
+        return None, 0.0
+
+    template_signal = matching_signal(template_crop)
+    search_signal = matching_signal(search_crop)
+    if float(np.std(template_signal)) < 4.0:
+        return None, 0.0
+
+    work_scale = min(1.0, 420.0 / max(search_signal.shape[:2]))
+    if work_scale < 1.0:
+        template_signal = resize_for_matching(template_signal, work_scale)
+        search_signal = resize_for_matching(search_signal, work_scale)
+
+    x, y, w, h = rect_to_pixels(template_rect, template_frame.shape[1], template_frame.shape[0])
+    best_rect: Rect | None = None
+    best_score = 0.0
+    rect_offset_x = x - template_offset[0]
+    rect_offset_y = y - template_offset[1]
+    for scale in (0.94, 1.0, 1.06):
+        scaled_w = max(8, int(round(template_signal.shape[1] * scale)))
+        scaled_h = max(8, int(round(template_signal.shape[0] * scale)))
+        if scaled_w > search_signal.shape[1] or scaled_h > search_signal.shape[0]:
+            continue
+        scaled_template = cv2.resize(template_signal, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+        score_map = cv2.matchTemplate(search_signal, scaled_template, cv2.TM_CCOEFF_NORMED)
+        _, max_value, _, max_location = cv2.minMaxLoc(score_map)
+        original_match_x = max_location[0] / work_scale
+        original_match_y = max_location[1] / work_scale
+        candidate_pixels = (
+            int(round(search_offset[0] + original_match_x + rect_offset_x * scale)),
+            int(round(search_offset[1] + original_match_y + rect_offset_y * scale)),
+            max(1, int(round(w * scale))),
+            max(1, int(round(h * scale))),
+        )
+        candidate = validate_rect(pixels_to_rect(candidate_pixels, current.shape[1], current.shape[0]), search_rect)
+        if candidate is not None and max_value > best_score:
+            best_rect = candidate
+            best_score = float(max_value)
+
+    return best_rect, best_score
+
+
+def matching_signal(gray: np.ndarray) -> np.ndarray:
+    equalized = cv2.equalizeHist(gray)
+    edges = cv2.Canny(equalized, 50, 150)
+    edge_density = float(np.count_nonzero(edges)) / max(1, edges.size)
+    if edge_density > 0.015:
+        return edges
+    return equalized
+
+
+def resize_for_matching(gray: np.ndarray, scale: float) -> np.ndarray:
+    width = max(8, int(round(gray.shape[1] * scale)))
+    height = max(8, int(round(gray.shape[0] * scale)))
+    return cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
+
+
 def create_feature_detector():
     if hasattr(cv2, "SIFT_create"):
-        return cv2.SIFT_create(nfeatures=400), cv2.NORM_L2
-    return cv2.ORB_create(nfeatures=500), cv2.NORM_HAMMING
+        return cv2.SIFT_create(nfeatures=260), cv2.NORM_L2
+    return cv2.ORB_create(nfeatures=360), cv2.NORM_HAMMING
 
 
 def crop_from_rect(gray: np.ndarray, rect: Rect, pad: float) -> tuple[np.ndarray, tuple[int, int]]:

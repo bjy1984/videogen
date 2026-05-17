@@ -72,7 +72,8 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
     if (!req.file) {
       throw new BridgeError("请上传需要预处理的原素材视频。", 400);
     }
-    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand();
+    const preview = String(req.body.preview ?? "false") === "true";
+    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand(preview);
 
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const segmentId = safePathPart(String(req.body.segmentId || "segment"));
@@ -92,7 +93,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
       commandTemplate,
       inputPath: sourcePath,
       outputPath,
-      timeoutMs: Number(process.env.VIDEOGEN_FACE_MOSAIC_TIMEOUT_MS || 180_000),
+      timeoutMs: Number(process.env.VIDEOGEN_FACE_MOSAIC_TIMEOUT_MS || (preview ? 180_000 : 600_000)),
       placeholderError: "VIDEOGEN_FACE_MOSAIC_COMMAND 必须包含 {input} 和 {output} 占位符。",
       failurePrefix: "人脸打码预处理命令失败",
       timeoutMessage: "人脸打码预处理超时"
@@ -127,10 +128,11 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
 
 app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   try {
-    const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand();
+    const blockOnRed = String(req.body.blockOnRed ?? "true") !== "false";
+    const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
     const tracks = parseTracks(String(req.body.tracks || "[]"));
     if (!tracks.length) {
-      throw new BridgeError("品牌/文字打码至少需要一个用户标注遮罩。", 400);
+      throw new BridgeError("物体追踪打码至少需要一个用户标注遮罩。", 400);
     }
 
     const sourceLocalPath = String(req.body.sourceLocalPath || "").trim();
@@ -169,8 +171,8 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
       timeoutMs: Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000),
       placeholderError: "VIDEOGEN_BRAND_MASK_COMMAND 必须包含 {input}、{output} 和 {spec} 占位符。",
       requiredPlaceholders: ["{input}", "{output}", "{spec}"],
-      failurePrefix: "品牌/文字打码预处理命令失败",
-      timeoutMessage: "品牌/文字打码预处理超时"
+      failurePrefix: "物体追踪打码预处理命令失败",
+      timeoutMessage: "物体追踪打码预处理超时"
     });
     await stat(outputPath);
     const parsed = parseCommandSummary(commandResult.stdout);
@@ -568,23 +570,26 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function defaultFaceMosaicCommand() {
+function defaultFaceMosaicCommand(preview = false) {
   const pythonPath = process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
     (process.platform === "win32"
       ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
       : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
   const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
-  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --input {input} --output {output}`;
+  if (preview) {
+    return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector yunet --confidence 0.55 --detect-max-side 960 --crf 24 --input {input} --output {output}`;
+  }
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --det-size 640 --detect-max-side 1280 --input {input} --output {output}`;
 }
 
-function defaultBrandMaskCommand() {
+function defaultBrandMaskCommand(blockOnRed = true) {
   const pythonPath = process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
     process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
     (process.platform === "win32"
       ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
       : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
   const scriptPath = path.join(rootDir, "scripts", "brand_mask.py");
-  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec} --block-on-red`;
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
 }
 
 function parseCommandSummary(stdout: string) {
@@ -606,7 +611,7 @@ function parseTracks(value: string) {
     const parsed = JSON.parse(value) as unknown;
     return Array.isArray(parsed) ? parsed : [];
   } catch {
-    throw new BridgeError("品牌/文字打码 tracks JSON 解析失败。", 400);
+    throw new BridgeError("物体追踪打码 tracks JSON 解析失败。", 400);
   }
 }
 

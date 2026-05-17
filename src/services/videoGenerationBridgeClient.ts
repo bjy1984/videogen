@@ -78,18 +78,20 @@ export async function preprocessFaceMosaicBridge(input: {
   projectId: string;
   segmentId: string;
   sourceRange?: string;
+  preview?: boolean;
   video: File;
 }) {
   const formData = new FormData();
   formData.set("projectId", input.projectId);
   formData.set("segmentId", input.segmentId);
   if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
+  if (input.preview !== undefined) formData.set("preview", input.preview ? "true" : "false");
   formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
     input.bridgeUrl,
     "/privacy/face-mosaic",
     formData,
-    180_000
+    input.preview ? 180_000 : 600_000
   );
 }
 
@@ -101,6 +103,7 @@ export async function preprocessBrandMaskBridge(input: {
   video?: File;
   sourceLocalPath?: string;
   sourceVideoName?: string;
+  blockOnRed?: boolean;
   tracks: BrandMaskTrack[];
 }) {
   const formData = new FormData();
@@ -109,6 +112,7 @@ export async function preprocessBrandMaskBridge(input: {
   if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
   if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
   if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.blockOnRed !== undefined) formData.set("blockOnRed", input.blockOnRed ? "true" : "false");
   formData.set("tracks", JSON.stringify(input.tracks));
   if (input.video) formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(

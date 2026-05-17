@@ -203,7 +203,7 @@ async function prepareSourcePreprocess(input: {
     if (review.errorCount) {
       return {
         traces: [],
-        error: `品牌/文字打码还有 ${review.errorCount} 个红色阻塞项，需要补帧后才能生成。`
+        error: `物体追踪打码还有 ${review.errorCount} 个红色阻塞项，需要补帧后才能生成。`
       };
     }
   }

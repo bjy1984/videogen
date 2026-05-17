@@ -21,13 +21,13 @@ export function buildBrandMaskReview(tracks: BrandMaskTrack[]) {
         reason: `${track.label} 建议至少补打2个关键帧，便于校验传播是否漂移。`
       });
     }
-    if (track.effect === "blur" && track.targetType === "text") {
+    if (track.effect === "blur") {
       result.push({
         trackId: track.id,
         frameIndex: 0,
         time: 0,
         severity: "warning" as const,
-        reason: `${track.label} 是文字遮罩，单独模糊可能仍被识别。`
+        reason: `${track.label} 使用模糊遮挡，细节仍可能被识别。`
       });
     }
     return result;

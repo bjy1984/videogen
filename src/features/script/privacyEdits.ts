@@ -11,8 +11,7 @@ export function hasSegmentBrandMasks(segment: VideoSegment) {
   return Boolean(segment.privacyEdits?.brandMasks?.some((track) => track.keyframes.length > 0));
 }
 
-export function brandMaskDefaultEffect(targetType: BrandMaskTargetType): BrandMaskEffect {
-  if (targetType === "text") return "solid";
+export function brandMaskDefaultEffect(_targetType: BrandMaskTargetType): BrandMaskEffect {
   return "mosaic";
 }
 

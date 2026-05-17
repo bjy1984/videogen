@@ -104,6 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confidence", type=float, default=0.72)
     parser.add_argument("--nms", type=float, default=0.3)
     parser.add_argument("--top-k", type=int, default=5000)
+    parser.add_argument("--detect-max-side", type=int, default=0, help="Resize frames for detection when max side exceeds this value; 0 keeps original size.")
     parser.add_argument("--expand", type=float, default=0.38, help="Expand detected face boxes by this ratio.")
     parser.add_argument("--hold-frames", type=int, default=8, help="Keep recent tracks to cover missed frames.")
     parser.add_argument("--smooth", type=float, default=0.65, help="Temporal smoothing factor for boxes.")
@@ -182,7 +183,7 @@ def process_video(input_path: Path, output_path: Path, detector: FaceDetector, a
             ok, frame = capture.read()
             if not ok:
                 break
-            detections = detector.detect(frame)
+            detections = detect_with_scale(detector, frame, args.detect_max_side)
             boxes = [expand_box(det.bbox, width, height, args.expand) for det in detections]
             tracks = update_tracks(tracks, boxes, processed_frames, args.smooth, args.hold_frames)
             active_boxes = [track.bbox for track in tracks if processed_frames - track.last_seen <= args.hold_frames]
@@ -217,6 +218,33 @@ def process_video(input_path: Path, output_path: Path, detector: FaceDetector, a
         "elapsedSec": round(time.time() - started_at, 3),
         "output": str(output_path),
     }
+
+
+def detect_with_scale(detector: FaceDetector, frame: np.ndarray, max_side: int) -> list[Detection]:
+    if max_side <= 0:
+        return detector.detect(frame)
+    height, width = frame.shape[:2]
+    source_max_side = max(width, height)
+    if source_max_side <= max_side:
+        return detector.detect(frame)
+    scale = max_side / float(source_max_side)
+    resized = cv2.resize(frame, (max(1, int(round(width * scale))), max(1, int(round(height * scale)))), interpolation=cv2.INTER_AREA)
+    detections = detector.detect(resized)
+    if not detections:
+        return []
+    inverse = 1.0 / scale
+    return [
+        Detection(
+            (
+                detection.bbox[0] * inverse,
+                detection.bbox[1] * inverse,
+                detection.bbox[2] * inverse,
+                detection.bbox[3] * inverse,
+            ),
+            detection.score,
+        )
+        for detection in detections
+    ]
 
 
 def update_tracks(
