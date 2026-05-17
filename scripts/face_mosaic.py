@@ -31,6 +31,7 @@ YUNET_MODEL_URL = (
 class Detection:
     bbox: tuple[float, float, float, float]
     score: float
+    landmarks: np.ndarray | None = None
 
 
 @dataclass
@@ -93,14 +94,71 @@ class YuNetDetector(FaceDetector):
         return detections
 
 
+class MediaPipeFaceDetector(FaceDetector):
+    name = "mediapipe_face"
+
+    def __init__(
+        self,
+        confidence: float,
+        nms: float,
+        landmark_confidence: float,
+        landmark_expand: float,
+        max_faces: int,
+    ):
+        from qai_hub_models.models.mediapipe_face.app import MediaPipeFaceApp
+        from qai_hub_models.models.mediapipe_face.model import MediaPipeFace
+        from qai_hub_models.utils.asset_loaders import always_answer_prompts
+
+        with always_answer_prompts(True):
+            model = MediaPipeFace.from_pretrained(include_detector_postprocessing=False)
+        self.app = MediaPipeFaceApp(
+            model.face_detector,
+            model.face_landmark_detector,
+            model.face_detector.include_postprocessing,
+            model.face_detector.anchors,
+            model.face_detector.get_input_spec(),
+            model.face_landmark_detector.get_input_spec(),
+            min_detector_face_box_score=confidence,
+            nms_iou_threshold=nms,
+            min_landmark_score=landmark_confidence,
+        )
+        self.landmark_expand = max(0.0, landmark_expand)
+        self.max_faces = max(1, max_faces)
+
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        selected_boxes, _selected_keypoints, _roi, *landmarks_out = self.app.predict_landmarks_from_image(
+            rgb,
+            raw_output=True,
+        )
+        if not selected_boxes:
+            return []
+        boxes = tensor_to_numpy(selected_boxes[0])
+        landmarks = tensor_to_numpy(landmarks_out[0][0]) if landmarks_out and landmarks_out[0] else np.empty((0,))
+        detections: list[Detection] = []
+        for index, box in enumerate(boxes[: self.max_faces]):
+            bbox = xyxy_points_to_xywh(box)
+            landmark_points = None
+            if landmarks.ndim == 3 and index < landmarks.shape[0] and landmarks[index].size:
+                landmark_points = landmarks[index]
+                landmark_bbox = landmarks_to_xywh(landmarks[index])
+                if landmark_bbox is not None:
+                    bbox = expand_box(landmark_bbox, frame.shape[1], frame.shape[0], self.landmark_expand)
+            detections.append(Detection(bbox, 1.0, landmark_points))
+        return detections
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Detect faces frame-by-frame and anonymize them.")
     parser.add_argument("--input", required=True, help="Input video path.")
     parser.add_argument("--output", required=True, help="Output video path.")
-    parser.add_argument("--detector", choices=["auto", "scrfd", "yunet"], default="auto")
+    parser.add_argument("--detector", choices=["auto", "scrfd", "yunet", "mediapipe-face"], default="auto")
     parser.add_argument("--scrfd-model", default="buffalo_l", help="InsightFace model pack.")
     parser.add_argument("--det-size", type=int, default=960, help="Detector input size for SCRFD.")
     parser.add_argument("--yunet-model", default="models/face_detection_yunet_2023mar.onnx")
+    parser.add_argument("--mediapipe-landmark-confidence", type=float, default=0.5)
+    parser.add_argument("--mediapipe-landmark-expand", type=float, default=0.04)
+    parser.add_argument("--mediapipe-max-faces", type=int, default=8)
     parser.add_argument("--confidence", type=float, default=0.72)
     parser.add_argument("--nms", type=float, default=0.3)
     parser.add_argument("--top-k", type=int, default=5000)
@@ -108,7 +166,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expand", type=float, default=0.38, help="Expand detected face boxes by this ratio.")
     parser.add_argument("--hold-frames", type=int, default=8, help="Keep recent tracks to cover missed frames.")
     parser.add_argument("--smooth", type=float, default=0.65, help="Temporal smoothing factor for boxes.")
-    parser.add_argument("--mode", choices=["mosaic", "blur", "mosaic-blur"], default="mosaic-blur")
+    parser.add_argument("--mode", choices=["mosaic", "blur", "solid", "mosaic-blur"], default="mosaic")
+    parser.add_argument("--solid-color", default="0,0,0", help="BGR solid fill color.")
+    parser.add_argument("--solid-alpha", type=float, default=1.0, help="Solid fill opacity from 0.0 to 1.0.")
+    parser.add_argument("--mask-shape", choices=["rect", "ellipse", "landmark-hull"], default="ellipse")
     parser.add_argument("--block", type=int, default=14, help="Mosaic block size.")
     parser.add_argument("--blur", type=int, default=45, help="Gaussian blur kernel size.")
     parser.add_argument("--codec", default="mp4v", help="OpenCV temp video codec.")
@@ -134,6 +195,20 @@ def main() -> int:
 
 def build_detector(args: argparse.Namespace) -> FaceDetector:
     errors: list[str] = []
+    if args.detector in ("auto", "mediapipe-face"):
+        try:
+            return MediaPipeFaceDetector(
+                args.confidence,
+                args.nms,
+                args.mediapipe_landmark_confidence,
+                args.mediapipe_landmark_expand,
+                args.mediapipe_max_faces,
+            )
+        except Exception as exc:
+            errors.append(f"MediaPipe Face unavailable: {exc}")
+            if args.detector == "mediapipe-face":
+                raise SystemExit(errors[-1]) from exc
+
     if args.detector in ("auto", "scrfd"):
         try:
             return InsightFaceDetector(args.scrfd_model, args.det_size, args.confidence)
@@ -173,6 +248,7 @@ def process_video(input_path: Path, output_path: Path, detector: FaceDetector, a
         raise SystemExit("Could not create temporary video writer.")
 
     tracks: list[Track] = []
+    landmark_masks: dict[int, np.ndarray] = {}
     total_faces = 0
     frames_with_faces = 0
     processed_frames = 0
@@ -186,13 +262,24 @@ def process_video(input_path: Path, output_path: Path, detector: FaceDetector, a
             detections = detect_with_scale(detector, frame, args.detect_max_side)
             boxes = [expand_box(det.bbox, width, height, args.expand) for det in detections]
             tracks = update_tracks(tracks, boxes, processed_frames, args.smooth, args.hold_frames)
+            landmark_masks = match_landmark_masks_to_tracks(tracks, detections, processed_frames, width, height, args)
             active_boxes = [track.bbox for track in tracks if processed_frames - track.last_seen <= args.hold_frames]
             if active_boxes:
                 frames_with_faces += 1
                 total_faces += len(boxes)
             output = frame.copy()
-            for box in active_boxes:
-                anonymize_box(output, box, args.mode, args.block, args.blur)
+            for index, box in enumerate(active_boxes):
+                anonymize_face(
+                    output,
+                    box,
+                    landmark_masks.get(index),
+                    args.mode,
+                    args.mask_shape,
+                    args.block,
+                    args.blur,
+                    parse_solid_color(args.solid_color),
+                    args.solid_alpha,
+                )
             writer.write(output)
             processed_frames += 1
     finally:
@@ -215,6 +302,11 @@ def process_video(input_path: Path, output_path: Path, detector: FaceDetector, a
         "height": height,
         "fps": fps,
         "durationSec": round(processed_frames / fps, 3) if fps else None,
+        "effect": args.mode,
+        "maskShape": args.mask_shape,
+        "block": int(args.block),
+        "blur": int(args.blur),
+        "solidAlpha": round(clamp_float(args.solid_alpha, 0.0, 1.0), 3),
         "elapsedSec": round(time.time() - started_at, 3),
         "output": str(output_path),
     }
@@ -242,6 +334,7 @@ def detect_with_scale(detector: FaceDetector, frame: np.ndarray, max_side: int) 
                 detection.bbox[3] * inverse,
             ),
             detection.score,
+            scale_landmarks(detection.landmarks, inverse),
         )
         for detection in detections
     ]
@@ -293,12 +386,82 @@ def expand_box(
     return x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)
 
 
-def anonymize_box(
+def tensor_to_numpy(value: object) -> np.ndarray:
+    if hasattr(value, "detach"):
+        return value.detach().cpu().numpy()  # type: ignore[no-any-return]
+    return np.asarray(value)
+
+
+def xyxy_points_to_xywh(points: np.ndarray) -> tuple[float, float, float, float]:
+    array = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    x1 = float(np.nanmin(array[:, 0]))
+    y1 = float(np.nanmin(array[:, 1]))
+    x2 = float(np.nanmax(array[:, 0]))
+    y2 = float(np.nanmax(array[:, 1]))
+    return x1, y1, max(1.0, x2 - x1), max(1.0, y2 - y1)
+
+
+def landmarks_to_xywh(landmarks: np.ndarray) -> tuple[float, float, float, float] | None:
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2:
+        return None
+    finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    if points.shape[1] >= 3:
+        finite &= np.isfinite(points[:, 2])
+    if int(np.count_nonzero(finite)) < 8:
+        return None
+    return xyxy_points_to_xywh(points[finite, :2])
+
+
+def match_landmark_masks_to_tracks(
+    tracks: list[Track],
+    detections: list[Detection],
+    frame_index: int,
+    width: int,
+    height: int,
+    args: argparse.Namespace,
+) -> dict[int, np.ndarray]:
+    if args.mask_shape != "landmark-hull":
+        return {}
+    masks: dict[int, np.ndarray] = {}
+    active_tracks = [track for track in tracks if frame_index - track.last_seen <= args.hold_frames]
+    for track_index, track in enumerate(active_tracks):
+        best_detection = None
+        best_iou = 0.0
+        for detection in detections:
+            if detection.landmarks is None:
+                continue
+            score = iou_xywh(track.bbox, expand_box(detection.bbox, width, height, args.expand))
+            if score > best_iou:
+                best_iou = score
+                best_detection = detection
+        if best_detection is None or best_iou < 0.12:
+            continue
+        mask = landmark_hull_mask(best_detection.landmarks, width, height, args.expand)
+        if mask is not None:
+            masks[track_index] = mask
+    return masks
+
+
+def scale_landmarks(landmarks: np.ndarray | None, scale: float) -> np.ndarray | None:
+    if landmarks is None:
+        return None
+    scaled = np.array(landmarks, dtype=np.float32, copy=True)
+    if scaled.ndim == 2 and scaled.shape[1] >= 2:
+        scaled[:, :2] *= scale
+    return scaled
+
+
+def anonymize_face(
     frame: np.ndarray,
     bbox: tuple[float, float, float, float],
+    landmark_mask: np.ndarray | None,
     mode: str,
+    mask_shape: str,
     block_size: int,
     blur_size: int,
+    solid_color: tuple[int, int, int],
+    solid_alpha: float,
 ) -> None:
     x, y, w, h = [int(round(value)) for value in bbox]
     x2 = min(frame.shape[1], x + max(1, w))
@@ -307,13 +470,89 @@ def anonymize_box(
     y = max(0, y)
     if x >= x2 or y >= y2:
         return
+    mask = face_mask(frame.shape[:2], (x, y, x2, y2), landmark_mask, mask_shape)
+    anonymize_mask(frame, mask, mode, block_size, blur_size, solid_color, solid_alpha)
+
+
+def face_mask(
+    frame_shape: tuple[int, int],
+    box: tuple[int, int, int, int],
+    landmark_mask: np.ndarray | None,
+    mask_shape: str,
+) -> np.ndarray:
+    height, width = frame_shape
+    x1, y1, x2, y2 = box
+    if mask_shape == "landmark-hull" and landmark_mask is not None and np.any(landmark_mask):
+        return landmark_mask
+    mask = np.zeros((height, width), dtype=np.uint8)
+    if mask_shape == "rect":
+        mask[y1:y2, x1:x2] = 255
+        return mask
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    axes = (max(1, (x2 - x1) // 2), max(1, (y2 - y1) // 2))
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+    return mask
+
+
+def landmark_hull_mask(landmarks: np.ndarray | None, width: int, height: int, expand: float) -> np.ndarray | None:
+    if landmarks is None:
+        return None
+    points = np.asarray(landmarks, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] < 2:
+        return None
+    finite = np.isfinite(points[:, 0]) & np.isfinite(points[:, 1])
+    points = points[finite, :2]
+    if len(points) < 8:
+        return None
+    hull = cv2.convexHull(points.astype(np.float32)).reshape(-1, 2)
+    if expand > 0:
+        center = hull.mean(axis=0, keepdims=True)
+        hull = center + (hull - center) * (1.0 + expand)
+    hull[:, 0] = np.clip(hull[:, 0], 0, width - 1)
+    hull[:, 1] = np.clip(hull[:, 1], 0, height - 1)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull.astype(np.int32), 255)
+    return mask
+
+
+def anonymize_mask(
+    frame: np.ndarray,
+    mask: np.ndarray,
+    mode: str,
+    block_size: int,
+    blur_size: int,
+    solid_color: tuple[int, int, int],
+    solid_alpha: float = 1.0,
+) -> None:
+    if not np.any(mask):
+        return
+    ys, xs = np.where(mask > 0)
+    x, x2 = int(xs.min()), int(xs.max()) + 1
+    y, y2 = int(ys.min()), int(ys.max()) + 1
     roi = frame[y:y2, x:x2]
-    if mode in ("mosaic", "mosaic-blur"):
+    if mode == "solid":
+        alpha = clamp_float(solid_alpha, 0.0, 1.0)
+        solid = np.full_like(roi, solid_color)
+        roi = solid if alpha >= 1.0 else cv2.addWeighted(roi, 1.0 - alpha, solid, alpha, 0)
+    elif mode in ("mosaic", "mosaic-blur"):
         roi = mosaic(roi, block_size)
     if mode in ("blur", "mosaic-blur"):
         kernel = max(3, blur_size | 1)
         roi = cv2.GaussianBlur(roi, (kernel, kernel), 0)
-    frame[y:y2, x:x2] = roi
+    local_mask = mask[y:y2, x:x2] > 0
+    target = frame[y:y2, x:x2]
+    target[local_mask] = roi[local_mask]
+
+
+def clamp_float(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, float(value)))
+
+
+def parse_solid_color(value: str) -> tuple[int, int, int]:
+    parts = [int(part.strip()) for part in value.split(",")[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(max(0, min(255, part)) for part in parts[:3])  # type: ignore[return-value]
 
 
 def mosaic(roi: np.ndarray, block_size: int) -> np.ndarray:

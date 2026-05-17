@@ -13,7 +13,7 @@ import type {
   SeedanceTaskResponse
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
-import type { BrandMaskTrack, VideoPreprocessTrace } from "../types";
+import type { BrandMaskTrack, BrandMaskTrackingEngine, FaceMosaicEffect, VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
   ok: boolean;
@@ -79,6 +79,8 @@ export async function preprocessFaceMosaicBridge(input: {
   segmentId: string;
   sourceRange?: string;
   preview?: boolean;
+  effect?: FaceMosaicEffect;
+  strength?: number;
   video: File;
 }) {
   const formData = new FormData();
@@ -86,6 +88,8 @@ export async function preprocessFaceMosaicBridge(input: {
   formData.set("segmentId", input.segmentId);
   if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
   if (input.preview !== undefined) formData.set("preview", input.preview ? "true" : "false");
+  if (input.effect) formData.set("effect", input.effect);
+  if (input.strength !== undefined) formData.set("strength", String(input.strength));
   formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
     input.bridgeUrl,
@@ -104,6 +108,7 @@ export async function preprocessBrandMaskBridge(input: {
   sourceLocalPath?: string;
   sourceVideoName?: string;
   blockOnRed?: boolean;
+  trackingEngine?: BrandMaskTrackingEngine;
   tracks: BrandMaskTrack[];
 }) {
   const formData = new FormData();
@@ -113,14 +118,25 @@ export async function preprocessBrandMaskBridge(input: {
   if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
   if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
   if (input.blockOnRed !== undefined) formData.set("blockOnRed", input.blockOnRed ? "true" : "false");
+  if (input.trackingEngine) formData.set("trackingEngine", input.trackingEngine);
   formData.set("tracks", JSON.stringify(input.tracks));
   if (input.video) formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
+  const timeoutMs = brandMaskTimeoutMs(input.trackingEngine);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
     input.bridgeUrl,
     "/privacy/brand-mask",
     formData,
-    240_000
+    timeoutMs
   );
+}
+
+function brandMaskTimeoutMs(engine?: BrandMaskTrackingEngine) {
+  if (engine === "mask-tracking") return 1_200_000;
+  if (engine === "track-anything" || engine === "mixformer") return 900_000;
+  if (engine === "ddrnet") return 900_000;
+  if (engine === "vittrack") return 600_000;
+  if (engine === "homography") return 360_000;
+  return 240_000;
 }
 
 export async function getSeedanceBridgeTask(input: {
@@ -213,7 +229,7 @@ async function requestBridge<T>(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL, path: s
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   const { timeoutMs: _timeoutMs, signal, ...fetchInit } = init;
   try {
-    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+    const response = await fetch(`${normalizeVideoGenerationBridgeUrl(bridgeUrl)}${path}`, {
       ...fetchInit,
       signal: signal ?? controller.signal,
       headers: {
@@ -248,7 +264,7 @@ async function requestBridgeForm<T>(
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+    const response = await fetch(`${normalizeVideoGenerationBridgeUrl(bridgeUrl)}${path}`, {
       method: "POST",
       body,
       signal: controller.signal
@@ -273,4 +289,12 @@ async function requestBridgeForm<T>(
 
 function stripTrailingSlash(value: string) {
   return value.replace(/\/+$/, "");
+}
+
+export function normalizeVideoGenerationBridgeUrl(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL) {
+  const trimmed = bridgeUrl.trim();
+  if (!trimmed || trimmed === "http://localhost:8788" || trimmed === "http://127.0.0.1:8788") {
+    return stripTrailingSlash(DEFAULT_SEEDANCE_BRIDGE_URL);
+  }
+  return stripTrailingSlash(trimmed);
 }

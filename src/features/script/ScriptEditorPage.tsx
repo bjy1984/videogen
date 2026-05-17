@@ -2,7 +2,7 @@ import { AlertTriangle, ArrowDown, ArrowUp, Check, ClipboardList, Copy, FileText
 import { useState } from "react";
 import { InfoItem } from "../../components/common/InfoItem";
 import { segmentStatusLabel } from "../../domain/labels";
-import type { AnalysisResult, BrandMaskTrack, SegmentBucketRole, SegmentContentStatus, VideoSegment } from "../../types";
+import type { AnalysisResult, BrandMaskTrack, FaceMosaicEffect, SegmentBucketRole, SegmentContentStatus, VideoSegment } from "../../types";
 import { BrandMaskAnnotator } from "../privacy/BrandMaskAnnotator";
 import { buildBrandMaskReview } from "../privacy/brandMaskReview";
 import { hasSegmentBrandMasks, hasSegmentFaceMosaic } from "./privacyEdits";
@@ -27,6 +27,8 @@ export function ScriptEditorPage({
   onSuggestRewrite,
   onApplySuggestion,
   onToggleFaceMosaic,
+  onChangeFaceMosaicEffect,
+  onChangeFaceMosaicStrength,
   onToggleAllFaceMosaic,
   onPreviewFaceMosaic,
   onUpdateBrandMasks,
@@ -51,6 +53,8 @@ export function ScriptEditorPage({
   onSuggestRewrite: (segmentId: string) => void;
   onApplySuggestion: (segmentId: string, target: ScriptSuggestionApplyTarget) => void;
   onToggleFaceMosaic: (segmentId: string) => void;
+  onChangeFaceMosaicEffect: (segmentId: string, effect: FaceMosaicEffect) => void;
+  onChangeFaceMosaicStrength: (segmentId: string, strength: number) => void;
   onToggleAllFaceMosaic: () => void;
   onPreviewFaceMosaic: (segmentId: string) => void;
   onUpdateBrandMasks: (segmentId: string, brandMasks: BrandMaskTrack[]) => void;
@@ -279,6 +283,8 @@ export function ScriptEditorPage({
         facePreviewSegmentId={facePreviewSegmentId}
         facePreviewError={facePreviewError}
         onToggleFaceMosaic={() => onToggleFaceMosaic(brandMaskSegment.id)}
+        onChangeFaceMosaicEffect={(effect) => onChangeFaceMosaicEffect(brandMaskSegment.id, effect)}
+        onChangeFaceMosaicStrength={(strength) => onChangeFaceMosaicStrength(brandMaskSegment.id, strength)}
         onPreviewFaceMosaic={() => onPreviewFaceMosaic(brandMaskSegment.id)}
         onChange={(brandMasks) => onUpdateBrandMasks(brandMaskSegment.id, brandMasks)}
         onClose={() => setBrandMaskSegmentId("")}

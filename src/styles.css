@@ -2289,6 +2289,10 @@ label.secondary-button:focus-within {
   justify-content: center;
 }
 
+.privacy-tool-actions.stacked-actions {
+  grid-template-columns: 1fr;
+}
+
 .privacy-tool-progress {
   display: grid;
   gap: 8px;
@@ -2396,8 +2400,72 @@ label.secondary-button:focus-within {
   gap: 6px;
 }
 
+.mask-engine-select {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 4px;
+}
+
+.mask-engine-select span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.mask-engine-select select {
+  width: 100%;
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mask-strength-control {
+  display: grid;
+  gap: 6px;
+}
+
+.mask-strength-control span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.mask-strength-control input[type="range"] {
+  width: 100%;
+  min-height: 30px;
+  accent-color: var(--accent);
+}
+
 .mask-preview-actions .secondary-button {
   justify-content: center;
+}
+
+.mask-result-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mask-result-tabs button {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.mask-result-tabs button.active {
+  border-color: var(--accent);
+  background: #eef7f2;
+  color: var(--accent-dark);
 }
 
 .mask-preview-error {

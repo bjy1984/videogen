@@ -1,7 +1,10 @@
-import type { BrandMaskEffect, BrandMaskTargetType, VideoPreprocessTrace, VideoSegment } from "../../types";
+import type { BrandMaskEffect, BrandMaskTargetType, FaceMosaicEffect, VideoPreprocessTrace, VideoSegment } from "../../types";
 
 export const FACE_MOSAIC_PRIVACY_TAG = "face-mosaic";
 export const BRAND_MASK_PRIVACY_TAG = "brand-mask";
+export const DEFAULT_MASK_STRENGTH = 0.85;
+export const MIN_MASK_STRENGTH = 0.2;
+export const MAX_MASK_STRENGTH = 1;
 
 export function hasSegmentFaceMosaic(segment: VideoSegment) {
   return Boolean(segment.privacyEdits?.faceMosaic);
@@ -15,13 +18,53 @@ export function brandMaskDefaultEffect(_targetType: BrandMaskTargetType): BrandM
   return "mosaic";
 }
 
+export function brandMaskDefaultStrength() {
+  return DEFAULT_MASK_STRENGTH;
+}
+
+export function normalizeMaskStrength(value: number | string | null | undefined) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return DEFAULT_MASK_STRENGTH;
+  return Math.min(MAX_MASK_STRENGTH, Math.max(MIN_MASK_STRENGTH, numeric));
+}
+
 export function setSegmentFaceMosaic(segment: VideoSegment, enabled: boolean): VideoSegment {
   return {
     ...segment,
     privacyEdits: {
       ...segment.privacyEdits,
       faceMosaic: enabled,
+      faceMosaicEffect: enabled ? segment.privacyEdits?.faceMosaicEffect ?? "mosaic" : segment.privacyEdits?.faceMosaicEffect,
+      faceMosaicStrength: enabled
+        ? normalizeMaskStrength(segment.privacyEdits?.faceMosaicStrength)
+        : segment.privacyEdits?.faceMosaicStrength,
       faceMosaicPreprocess: enabled ? segment.privacyEdits?.faceMosaicPreprocess : undefined
+    }
+  };
+}
+
+export function setSegmentFaceMosaicEffect(segment: VideoSegment, effect: FaceMosaicEffect): VideoSegment {
+  return {
+    ...segment,
+    privacyEdits: {
+      ...segment.privacyEdits,
+      faceMosaic: true,
+      faceMosaicEffect: effect,
+      faceMosaicStrength: normalizeMaskStrength(segment.privacyEdits?.faceMosaicStrength),
+      faceMosaicPreprocess: undefined
+    }
+  };
+}
+
+export function setSegmentFaceMosaicStrength(segment: VideoSegment, strength: number): VideoSegment {
+  return {
+    ...segment,
+    privacyEdits: {
+      ...segment.privacyEdits,
+      faceMosaic: true,
+      faceMosaicEffect: segment.privacyEdits?.faceMosaicEffect ?? "mosaic",
+      faceMosaicStrength: normalizeMaskStrength(strength),
+      faceMosaicPreprocess: undefined
     }
   };
 }

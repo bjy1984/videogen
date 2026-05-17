@@ -264,6 +264,8 @@ async function prepareSourcePreprocess(input: {
         projectId: input.projectId || "default_project",
         segmentId: input.segment.id,
         sourceRange: input.segment.role,
+        effect: input.segment.privacyEdits?.faceMosaicEffect ?? "mosaic",
+        strength: input.segment.privacyEdits?.faceMosaicStrength ?? 0.85,
         video: input.sourceVideo
       });
       traces.push(result.trace);

@@ -1,7 +1,7 @@
 import type { GenerationJobStatus } from "../generationTypes";
 
 export const DEFAULT_COMFYUI_ENDPOINT = "http://127.0.0.1:8188";
-export const DEFAULT_COMFYUI_BRIDGE_URL = "http://localhost:8788";
+export const DEFAULT_COMFYUI_BRIDGE_URL = "http://127.0.0.1:8790";
 
 export interface ComfyUIProviderParams {
   bridgeUrl?: string;

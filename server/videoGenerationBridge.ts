@@ -33,7 +33,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const assetRootDir = process.env.VIDEOGEN_ASSET_ROOT || path.join(rootDir, ".videogen-assets");
 const uploadTempDir = path.join(assetRootDir, "_uploads");
-const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8788);
+const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8790);
 const app = express();
 const upload = multer({ dest: uploadTempDir });
 
@@ -73,7 +73,9 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
       throw new BridgeError("请上传需要预处理的原素材视频。", 400);
     }
     const preview = String(req.body.preview ?? "false") === "true";
-    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand(preview);
+    const effect = parseFaceMosaicEffect(String(req.body.effect || "mosaic"));
+    const strength = parseMaskStrength(req.body.strength, 0.85);
+    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand(preview, effect, strength);
 
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const segmentId = safePathPart(String(req.body.segmentId || "segment"));
@@ -100,6 +102,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
     });
     await stat(outputPath);
     const summary = parseCommandSummary(commandResult.stdout);
+    const traceSummary = summary && typeof summary === "object" ? { ...summary, effect, strength } : { effect, strength };
 
     const now = new Date().toISOString();
     res.json({
@@ -113,7 +116,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
         outputVideoUrl: assetUrl(req, relativeDir, `face_mosaic.${extension}`),
         localPath: outputPath,
         publicAssetRequired: true,
-        summary,
+        summary: traceSummary,
         createdAt: now,
         updatedAt: now
       }
@@ -129,7 +132,9 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
 app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   try {
     const blockOnRed = String(req.body.blockOnRed ?? "true") !== "false";
-    const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
+    const trackingEngine = parseTrackingEngine(String(req.body.trackingEngine || "opencv"));
+    const commandTemplate = brandMaskCommandForEngine(trackingEngine, blockOnRed);
+    const commandEnvName = brandMaskCommandEnvName(trackingEngine);
     const tracks = parseTracks(String(req.body.tracks || "[]"));
     if (!tracks.length) {
       throw new BridgeError("物体追踪打码至少需要一个用户标注遮罩。", 400);
@@ -142,7 +147,8 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
 
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const segmentId = safePathPart(String(req.body.segmentId || "segment"));
-    const preprocessId = safePathPart(`brand_mask_${Date.now()}`);
+    const preprocessPrefix = brandMaskOutputPrefix(trackingEngine);
+    const preprocessId = safePathPart(`${preprocessPrefix}_${Date.now()}`);
     const sourceName = req.file?.originalname || String(req.body.sourceVideoName || "source.mp4");
     const extension =
       extensionFromContentType(req.file?.mimetype || null) ||
@@ -154,7 +160,8 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
     await mkdir(outputDir, { recursive: true });
 
     const sourcePath = path.join(outputDir, `source.${extension}`);
-    const outputPath = path.join(outputDir, `brand_mask.${extension}`);
+    const outputName = `${preprocessPrefix}.${extension}`;
+    const outputPath = path.join(outputDir, outputName);
     const specPath = path.join(outputDir, "brand_mask_spec.json");
     if (req.file) {
       await copyFile(req.file.path, sourcePath);
@@ -168,17 +175,21 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
       inputPath: sourcePath,
       outputPath,
       specPath,
-      timeoutMs: Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000),
-      placeholderError: "VIDEOGEN_BRAND_MASK_COMMAND 必须包含 {input}、{output} 和 {spec} 占位符。",
+      timeoutMs: brandMaskTimeoutMs(trackingEngine),
+      placeholderError: `${commandEnvName} 必须包含 {input}、{output} 和 {spec} 占位符。`,
       requiredPlaceholders: ["{input}", "{output}", "{spec}"],
-      failurePrefix: "物体追踪打码预处理命令失败",
-      timeoutMessage: "物体追踪打码预处理超时"
+      failurePrefix: `${brandMaskEngineLabel(trackingEngine)}物体追踪打码预处理命令失败`,
+      timeoutMessage: `${brandMaskEngineLabel(trackingEngine)}物体追踪打码预处理超时`
     });
     await stat(outputPath);
     const parsed = parseCommandSummary(commandResult.stdout);
     const issues = Array.isArray(parsed?.issues) ? parsed.issues : undefined;
     const summary = parsed && typeof parsed === "object" ? { ...parsed } : undefined;
     if (summary && "issues" in summary) delete summary.issues;
+    const traceSummary = {
+      ...(summary || {}),
+      trackingEngine
+    };
 
     const now = new Date().toISOString();
     res.json({
@@ -189,10 +200,10 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
         status: "done",
         sourceVideoName: sourceName,
         sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
-        outputVideoUrl: assetUrl(req, relativeDir, `brand_mask.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, outputName),
         localPath: outputPath,
         publicAssetRequired: true,
-        summary,
+        summary: traceSummary,
         issues,
         createdAt: now,
         updatedAt: now
@@ -570,16 +581,47 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function defaultFaceMosaicCommand(preview = false) {
+function defaultFaceMosaicCommand(preview = false, effect = "mosaic", strength = 0.85) {
   const pythonPath = process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
     (process.platform === "win32"
       ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
       : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
   const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
+  const maskArgs = `--block ${maskBlockSizeForStrength(strength)} --blur ${blurKernelForStrength(strength)} --solid-alpha ${solidAlphaForStrength(strength).toFixed(2)}`;
   if (preview) {
-    return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector yunet --confidence 0.55 --detect-max-side 960 --crf 24 --input {input} --output {output}`;
+    return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector mediapipe-face --confidence 0.68 --mediapipe-landmark-confidence 0.5 --mediapipe-landmark-expand 0.03 --expand 0.08 --hold-frames 4 --smooth 0.35 --mode ${shellQuote(faceMosaicModeArg(effect))} --mask-shape ellipse ${maskArgs} --crf 24 --input {input} --output {output}`;
   }
-  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --det-size 640 --detect-max-side 1280 --input {input} --output {output}`;
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector mediapipe-face --confidence 0.72 --mediapipe-landmark-confidence 0.5 --mediapipe-landmark-expand 0.04 --expand 0.1 --hold-frames 5 --smooth 0.4 --mode ${shellQuote(faceMosaicModeArg(effect))} --mask-shape ellipse ${maskArgs} --input {input} --output {output}`;
+}
+
+function parseFaceMosaicEffect(value: string) {
+  if (value === "blur" || value === "solid") return value;
+  return "mosaic";
+}
+
+function faceMosaicModeArg(effect: string) {
+  if (effect === "blur") return "blur";
+  if (effect === "solid") return "solid";
+  return "mosaic";
+}
+
+function parseMaskStrength(value: unknown, fallback = 0.85) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(1, Math.max(0.2, numeric));
+}
+
+function maskBlockSizeForStrength(strength: number) {
+  return Math.round(6 + parseMaskStrength(strength) * 30);
+}
+
+function blurKernelForStrength(strength: number) {
+  const kernel = Math.round(9 + parseMaskStrength(strength) * 58);
+  return kernel % 2 === 0 ? kernel + 1 : kernel;
+}
+
+function solidAlphaForStrength(strength: number) {
+  return parseMaskStrength(strength);
 }
 
 function defaultBrandMaskCommand(blockOnRed = true) {
@@ -590,6 +632,147 @@ function defaultBrandMaskCommand(blockOnRed = true) {
       : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
   const scriptPath = path.join(rootDir, "scripts", "brand_mask.py");
   return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultHomographyMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_HOMOGRAPHY_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "homography_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultVitTrackMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_VITTRACK_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "vittrack_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultMixFormerMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_MIXFORMER_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "mixformer_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultDDRNetMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_DDRNET_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "ddrnet_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultTrackAnythingMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_TRACK_ANYTHING_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "track_anything_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultMaskTrackingCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_MASK_TRACKING_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "external_tracker_adapter.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --engine mask-tracking --display-name ${shellQuote("Mask Tracking")} --backend-env VIDEOGEN_MASK_TRACKING_BACKEND_COMMAND --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function parseTrackingEngine(value: string) {
+  if (
+    value === "homography" ||
+    value === "vittrack" ||
+    value === "mixformer" ||
+    value === "ddrnet" ||
+    value === "track-anything" ||
+    value === "mask-tracking"
+  ) return value;
+  return "opencv";
+}
+
+function brandMaskCommandForEngine(trackingEngine: string, blockOnRed = true) {
+  if (trackingEngine === "homography") {
+    return process.env.VIDEOGEN_HOMOGRAPHY_COMMAND?.trim() || defaultHomographyMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "vittrack") {
+    return process.env.VIDEOGEN_VITTRACK_COMMAND?.trim() || defaultVitTrackMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "mixformer") {
+    return process.env.VIDEOGEN_MIXFORMER_COMMAND?.trim() || defaultMixFormerMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "ddrnet") {
+    return process.env.VIDEOGEN_DDRNET_COMMAND?.trim() || defaultDDRNetMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "track-anything") {
+    const command = process.env.VIDEOGEN_TRACK_ANYTHING_COMMAND?.trim();
+    return command || defaultTrackAnythingMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "mask-tracking") {
+    return process.env.VIDEOGEN_MASK_TRACKING_COMMAND?.trim() || defaultMaskTrackingCommand(blockOnRed);
+  }
+  return process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
+}
+
+function brandMaskCommandEnvName(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "VIDEOGEN_MASK_TRACKING_COMMAND";
+  if (trackingEngine === "track-anything") return "VIDEOGEN_TRACK_ANYTHING_COMMAND";
+  if (trackingEngine === "mixformer") return "VIDEOGEN_MIXFORMER_COMMAND";
+  if (trackingEngine === "ddrnet") return "VIDEOGEN_DDRNET_COMMAND";
+  if (trackingEngine === "vittrack") return "VIDEOGEN_VITTRACK_COMMAND";
+  if (trackingEngine === "homography") return "VIDEOGEN_HOMOGRAPHY_COMMAND";
+  return "VIDEOGEN_BRAND_MASK_COMMAND";
+}
+
+function brandMaskTimeoutMs(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return Number(process.env.VIDEOGEN_MASK_TRACKING_TIMEOUT_MS || 1_200_000);
+  if (trackingEngine === "track-anything") return Number(process.env.VIDEOGEN_TRACK_ANYTHING_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "mixformer") return Number(process.env.VIDEOGEN_MIXFORMER_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "ddrnet") return Number(process.env.VIDEOGEN_DDRNET_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "vittrack") return Number(process.env.VIDEOGEN_VITTRACK_TIMEOUT_MS || 600_000);
+  if (trackingEngine === "homography") return Number(process.env.VIDEOGEN_HOMOGRAPHY_TIMEOUT_MS || 360_000);
+  return Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000);
+}
+
+function brandMaskOutputPrefix(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "mask_tracking";
+  if (trackingEngine === "track-anything") return "track_anything_mask";
+  if (trackingEngine === "mixformer") return "mixformer_mask";
+  if (trackingEngine === "ddrnet") return "ddrnet_mask";
+  if (trackingEngine === "vittrack") return "vittrack_mask";
+  if (trackingEngine === "homography") return "homography_mask";
+  return "brand_mask";
+}
+
+function brandMaskEngineLabel(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "Mask Tracking ";
+  if (trackingEngine === "track-anything") return "Track-Anything ";
+  if (trackingEngine === "mixformer") return "MixFormerV2-S ";
+  if (trackingEngine === "ddrnet") return "DDRNet ";
+  if (trackingEngine === "vittrack") return "ViTTrack ";
+  if (trackingEngine === "homography") return "Homography ";
+  return "";
 }
 
 function parseCommandSummary(stdout: string) {

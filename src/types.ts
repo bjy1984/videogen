@@ -7,7 +7,17 @@ export type SegmentBucketRole = "hook" | "pain" | "usp" | "trust" | "cta";
 export type SegmentContentStatus = "draft" | "needs-review" | "approved" | "blocked";
 export type BrandMaskTargetType = "logo" | "text" | "other";
 export type BrandMaskEffect = "mosaic" | "blur" | "solid";
+export type FaceMosaicEffect = BrandMaskEffect;
 export type BrandMaskTrackMode = "static" | "interpolate" | "planar" | "optical-flow" | "manual";
+export type BrandMaskScaleMode = "locked" | "slow-zoom" | "free";
+export type BrandMaskTrackingEngine =
+  | "opencv"
+  | "homography"
+  | "vittrack"
+  | "mixformer"
+  | "ddrnet"
+  | "track-anything"
+  | "mask-tracking";
 export type BrandMaskFrameSeverity = "warning" | "error";
 
 export interface BrandMaskRect {
@@ -40,7 +50,9 @@ export interface BrandMaskTrack {
   label: string;
   targetType: BrandMaskTargetType;
   effect: BrandMaskEffect;
+  strength?: number;
   trackMode: BrandMaskTrackMode;
+  scaleMode?: BrandMaskScaleMode;
   expandRatio: number;
   confidenceThreshold: number;
   keyframes: BrandMaskKeyframe[];
@@ -67,6 +79,15 @@ export interface VideoPreprocessTrace {
     correctedKeyframes?: number;
     skippedLowConfidenceFrames?: number;
     skippedScaleFrames?: number;
+    skippedTrackingFrames?: number;
+    recoveredFrames?: number;
+    trackingEngine?: BrandMaskTrackingEngine;
+    effect?: BrandMaskEffect;
+    strength?: number;
+    block?: number;
+    blur?: number;
+    solidAlpha?: number;
+    maskShape?: string;
     warningFrames?: number;
     blockedFrames?: number;
     elapsedSec?: number;
@@ -169,6 +190,8 @@ export interface VideoSegment {
   contentStatus?: SegmentContentStatus;
   privacyEdits?: {
     faceMosaic?: boolean;
+    faceMosaicEffect?: FaceMosaicEffect;
+    faceMosaicStrength?: number;
     faceMosaicPreprocess?: VideoPreprocessTrace;
     brandMasks?: BrandMaskTrack[];
     brandMaskPreprocess?: VideoPreprocessTrace;

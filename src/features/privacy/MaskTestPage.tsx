@@ -1,8 +1,8 @@
 import { CheckCircle2, FileVideo, Gauge, ShieldCheck, Upload } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { preprocessFaceMosaicBridge } from "../../services/videoGenerationBridgeClient";
-import type { BrandMaskTrack, VideoPreprocessTrace, VideoSegment } from "../../types";
-import { applyPreprocessTraces, setSegmentBrandMasks, setSegmentFaceMosaic } from "../script/privacyEdits";
+import { normalizeVideoGenerationBridgeUrl, preprocessFaceMosaicBridge } from "../../services/videoGenerationBridgeClient";
+import type { BrandMaskTrack, FaceMosaicEffect, VideoPreprocessTrace, VideoSegment } from "../../types";
+import { applyPreprocessTraces, setSegmentBrandMasks, setSegmentFaceMosaic, setSegmentFaceMosaicEffect, setSegmentFaceMosaicStrength } from "../script/privacyEdits";
 import { BrandMaskAnnotator } from "./BrandMaskAnnotator";
 import { buildBrandMaskReview } from "./brandMaskReview";
 
@@ -28,6 +28,7 @@ export function MaskTestPage({
   const review = useMemo(() => buildBrandMaskReview(segment.privacyEdits?.brandMasks ?? []), [segment.privacyEdits?.brandMasks]);
   const faceTrace = segment.privacyEdits?.faceMosaicPreprocess;
   const brandTrace = segment.privacyEdits?.brandMaskPreprocess;
+  const displayBridgeUrl = normalizeVideoGenerationBridgeUrl(bridgeUrl);
 
   function handleFile(file?: File) {
     if (!file) return;
@@ -79,6 +80,8 @@ export function MaskTestPage({
         segmentId: segment.id,
         sourceRange: segment.role,
         preview: true,
+        effect: segment.privacyEdits?.faceMosaicEffect ?? "mosaic",
+        strength: segment.privacyEdits?.faceMosaicStrength ?? 0.85,
         video: videoFile
       });
       setSegment((current) => applyPreprocessTraces(current, [result.trace]));
@@ -148,7 +151,7 @@ export function MaskTestPage({
             <InfoBlock label="当前文件" value={videoFile ? videoFile.name : "未选择"} />
             <InfoBlock label="文件大小" value={videoFile ? formatBytes(videoFile.size) : "-"} />
             <InfoBlock label="视频时长" value={segment.duration ? `${segment.duration}秒` : "-"} />
-            <InfoBlock label="Bridge" value={bridgeUrl || "http://localhost:8788"} />
+            <InfoBlock label="Bridge" value={displayBridgeUrl} />
           </div>
           <div className="mask-test-checklist">
             <CheckItem active={Boolean(faceTrace?.outputVideoUrl)} label="人脸预览结果" value={faceTrace?.outputVideoUrl ? "已生成" : "未生成"} />
@@ -171,17 +174,33 @@ export function MaskTestPage({
           facePreviewSegmentId={facePreviewSegmentId}
           facePreviewError={facePreviewError}
           onToggleFaceMosaic={toggleFaceMosaic}
+          onChangeFaceMosaicEffect={(effect: FaceMosaicEffect) => {
+            setSegment((current) => setSegmentFaceMosaicEffect(current, effect));
+            setFacePreviewError("");
+            setStatusText(`人脸遮挡效果已切换为${faceEffectLabel(effect)}，重新运行人脸预览后生效。`);
+          }}
+          onChangeFaceMosaicStrength={(strength) => {
+            setSegment((current) => setSegmentFaceMosaicStrength(current, strength));
+            setFacePreviewError("");
+            setStatusText(`人脸打码强度已调整为 ${Math.round(strength * 100)}%，重新运行人脸预览后生效。`);
+          }}
           onPreviewFaceMosaic={previewFaceMosaic}
           onChange={updateBrandMasks}
           onPreviewTrace={(trace) => {
             setSegment((current) => applyPreprocessTraces(current, [trace]));
-            setStatusText(`物体追踪预览完成：${trace.summary?.trackCount ?? 0}个目标，跳过低置信 ${trace.summary?.skippedLowConfidenceFrames ?? 0}帧，跳过尺度异常 ${trace.summary?.skippedScaleFrames ?? 0}帧，阻塞 ${trace.summary?.blockedFrames ?? 0}帧。`);
+            setStatusText(`物体追踪预览完成：${trace.summary?.trackCount ?? 0}个目标，找回 ${trace.summary?.recoveredFrames ?? 0}帧，跳过追踪异常 ${trace.summary?.skippedTrackingFrames ?? 0}帧，阻塞 ${trace.summary?.blockedFrames ?? 0}帧。`);
           }}
           onClose={() => setIsAnnotatorOpen(false)}
         />
       )}
     </>
   );
+}
+
+function faceEffectLabel(effect: FaceMosaicEffect) {
+  if (effect === "blur") return "高斯模糊";
+  if (effect === "solid") return "色块遮挡";
+  return "马赛克";
 }
 
 function createTestSegment(): VideoSegment {
@@ -198,6 +217,8 @@ function createTestSegment(): VideoSegment {
     status: "idle",
     privacyEdits: {
       faceMosaic: false,
+      faceMosaicEffect: "mosaic",
+      faceMosaicStrength: 0.85,
       brandMasks: []
     }
   };

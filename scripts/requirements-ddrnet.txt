@@ -1,0 +1,4 @@
+numpy>=1.26
+opencv-python>=4.10
+torch>=2.2
+qai-hub-models[ddrnet23-slim]>=0.53.1

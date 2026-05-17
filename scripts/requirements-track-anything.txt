@@ -1,0 +1,1 @@
+qai-hub-models[track-anything]==0.53.1

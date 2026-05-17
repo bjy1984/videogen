@@ -58,7 +58,9 @@ import {
   applyPreprocessTraces,
   hasSegmentFaceMosaic,
   setSegmentBrandMasks,
-  setSegmentFaceMosaic
+  setSegmentFaceMosaic,
+  setSegmentFaceMosaicEffect,
+  setSegmentFaceMosaicStrength
 } from "./features/script/privacyEdits";
 import { createSegmentsFromAnalysis } from "./features/script/segmentFactory";
 import { serializeSegments, stripTransientSegmentFields } from "./features/script/segmentSerialization";
@@ -90,7 +92,7 @@ import {
   saveProjectSnapshot,
   savePrompt as savePromptToStorage
 } from "./services/projectStorage";
-import type { AnalysisResult, BrandMaskTrack, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
+import type { AnalysisResult, BrandMaskTrack, FaceMosaicEffect, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
 
 export default function App() {
   const [page, setPage] = useState<StepKey>(() => readInitialPage());
@@ -495,6 +497,44 @@ export default function App() {
     setNotice(shouldEnable ? "已为全部脚本段开启人脸打码。" : "已取消全部脚本段的人脸打码。");
   }
 
+  function updateSegmentFaceMosaicEffect(segmentId: string, effect: FaceMosaicEffect) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要设置人脸遮挡效果的脚本段。");
+      return;
+    }
+    setSegments((items) =>
+      items.map((item) => (item.id === segmentId ? setSegmentFaceMosaicEffect(item, effect) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
+    });
+    setComposeTimeline(null);
+    setFacePreviewError("");
+    setNotice(`已将「${target.title || "该段落"}」人脸遮挡效果切换为${faceEffectLabel(effect)}。重新运行人脸预览后生效。`);
+  }
+
+  function updateSegmentFaceMosaicStrength(segmentId: string, strength: number) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要设置人脸打码强度的脚本段。");
+      return;
+    }
+    setSegments((items) =>
+      items.map((item) => (item.id === segmentId ? setSegmentFaceMosaicStrength(item, strength) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
+    });
+    setComposeTimeline(null);
+    setFacePreviewError("");
+    setNotice(`已将「${target.title || "该段落"}」人脸打码强度调整为 ${Math.round(strength * 100)}%。重新运行人脸预览后生效。`);
+  }
+
   async function previewSegmentFaceMosaic(segmentId: string) {
     const target = segments.find((item) => item.id === segmentId);
     if (!target) {
@@ -516,6 +556,8 @@ export default function App() {
         segmentId: target.id,
         sourceRange: target.role,
         preview: true,
+        effect: target.privacyEdits?.faceMosaicEffect ?? "mosaic",
+        strength: target.privacyEdits?.faceMosaicStrength ?? 0.85,
         video: sourceVideo
       });
       setSegments((items) =>
@@ -1235,6 +1277,8 @@ export default function App() {
           onSuggestRewrite={suggestScriptRewrite}
           onApplySuggestion={applyScriptSuggestion}
           onToggleFaceMosaic={toggleSegmentFaceMosaic}
+          onChangeFaceMosaicEffect={updateSegmentFaceMosaicEffect}
+          onChangeFaceMosaicStrength={updateSegmentFaceMosaicStrength}
           onToggleAllFaceMosaic={toggleAllSegmentFaceMosaic}
           onPreviewFaceMosaic={previewSegmentFaceMosaic}
           onUpdateBrandMasks={updateSegmentBrandMasks}
@@ -1310,6 +1354,12 @@ export default function App() {
 
 function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function faceEffectLabel(effect: FaceMosaicEffect) {
+  if (effect === "blur") return "高斯模糊";
+  if (effect === "solid") return "色块遮挡";
+  return "马赛克";
 }
 
 function readSavedPrompt() {

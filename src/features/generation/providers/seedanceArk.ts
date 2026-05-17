@@ -1,6 +1,6 @@
 import type { GenerationJobStatus } from "../generationTypes";
 
-export const DEFAULT_SEEDANCE_BRIDGE_URL = "http://localhost:8788";
+export const DEFAULT_SEEDANCE_BRIDGE_URL = "http://127.0.0.1:8790";
 export const DEFAULT_SEEDANCE_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
 export const DEFAULT_SEEDANCE_MODEL = "doubao-seedance-2-0-260128";
 
