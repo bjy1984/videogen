@@ -779,6 +779,7 @@ function preprocessSummaryText(summary?: VideoPreprocessTrace["summary"]) {
   const parts = [
     frameCount !== undefined ? `${frameCount}帧` : "",
     summary.durationSec !== undefined ? `${summary.durationSec.toFixed(2)}秒素材` : "",
+    summary.skippedLowConfidenceFrames !== undefined ? `跳过低置信${summary.skippedLowConfidenceFrames}帧` : "",
     summary.elapsedSec !== undefined ? `耗时${summary.elapsedSec.toFixed(2)}秒` : ""
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "暂无处理统计";

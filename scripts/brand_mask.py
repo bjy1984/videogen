@@ -121,6 +121,7 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
     issues: list[FrameIssue] = []
     processed_frames = 0
     masked_frames = 0
+    skipped_low_confidence_frames: set[int] = set()
     started_at = time.time()
     solid_color = parse_solid_color(args.solid_color)
 
@@ -141,18 +142,19 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
                     continue
                 exact = exact_keyframe(track, processed_frames, frame_time)
                 if confidence is not None and confidence < track.confidence_threshold:
-                    has_right_anchor = next_keyframe(track, processed_frames) is not None
-                    severity = issue_severity(confidence, track.confidence_threshold, has_right_anchor)
+                    skipped_low_confidence_frames.add(processed_frames)
                     issues.append(
                         FrameIssue(
                             track_id=track.id,
                             frame_index=processed_frames,
                             time=round(frame_time, 3),
-                            severity=severity,
-                            reason=f"{track.label} tracking confidence is low.",
+                            severity="error",
+                            reason=f"{track.label} tracking confidence is low; mask skipped.",
                             confidence=round(confidence, 3),
                         )
                     )
+                    if not exact:
+                        continue
                 apply_mask(output, expand_rect(rect, track.expand_ratio), track.effect, args.block, args.blur, solid_color)
                 states[track.id] = TrackState(
                     rect=rect,
@@ -180,6 +182,7 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
         "frameCount": processed_frames,
         "sourceFrameCount": frame_count,
         "maskedFrames": masked_frames,
+        "skippedLowConfidenceFrames": len(skipped_low_confidence_frames),
         "trackCount": len(tracks),
         "manualKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "manual"),
         "correctedKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "correction"),
@@ -294,13 +297,6 @@ def resolve_track_rect(
             return tracked, score
 
     return interpolated or nearest_track_rect(track, frame_index), 0.5 if interpolated else 0.35
-
-
-def issue_severity(confidence: float, threshold: float, has_right_anchor: bool) -> str:
-    if has_right_anchor:
-        return "warning"
-    return "warning" if confidence >= threshold * 0.72 else "error"
-
 
 def exact_keyframe(track: TrackSpec, frame_index: int, frame_time: float) -> Keyframe | None:
     for keyframe in track.keyframes:
