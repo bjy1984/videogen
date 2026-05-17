@@ -1,4 +1,4 @@
-import type { AnalysisResult, GenerationOptions, VideoSegment } from "./types";
+import type { AnalysisResult } from "../../types";
 
 export function createMockAnalysis(duration: number): AnalysisResult {
   const safeDuration = Number.isFinite(duration) && duration > 0 ? Math.round(duration) : 45;
@@ -125,68 +125,4 @@ export function createMockAnalysis(duration: number): AnalysisResult {
     summary:
       "这条视频最大的优势是首帧结果感强，最大的问题是信任和CTA没有完全闭环，最值得借鉴的是分级概念表达，优化后成为核心素材的概率预计从中提升至高。"
   };
-}
-
-export function createSegmentsFromAnalysis(
-  analysis: AnalysisResult,
-  options: GenerationOptions,
-  sourceFile?: File
-): VideoSegment[] {
-  return [
-    {
-      id: "hook",
-      title: "第1段：钩子",
-      role: "0-3秒",
-      duration: 3,
-      scriptText: "染烫后先看你是哪一级受损。",
-      generationPrompt: analysis.videoPrompts.hookPrompt,
-      provider: options.provider,
-      status: "idle",
-      sourceFile
-    },
-    {
-      id: "pain",
-      title: "第2段：痛点放大",
-      role: "3-10秒",
-      duration: 7,
-      scriptText: "不是你不会护发，是你没先判断受损等级。",
-      generationPrompt: analysis.videoPrompts.painPointPrompt,
-      provider: options.provider,
-      status: "idle",
-      sourceFile
-    },
-    {
-      id: "usp",
-      title: "第3段：解决方案/USP",
-      role: "10-20秒",
-      duration: 10,
-      scriptText: "不同受损等级，要用不同修护思路。",
-      generationPrompt: analysis.videoPrompts.uspPrompt,
-      provider: options.provider,
-      status: "idle",
-      sourceFile
-    },
-    {
-      id: "trust",
-      title: "第4段：信任证明",
-      role: "20-28秒",
-      duration: 8,
-      scriptText: "看发尾顺滑度和毛躁变化，比只听功效更直接。",
-      generationPrompt: analysis.videoPrompts.trustPrompt,
-      provider: options.provider,
-      status: "idle",
-      sourceFile
-    },
-    {
-      id: "cta",
-      title: "第5段：行动号召CTA",
-      role: "最后5秒",
-      duration: 5,
-      scriptText: "今晚前拍，先测发质等级再护理。",
-      generationPrompt: analysis.videoPrompts.ctaPrompt,
-      provider: options.provider,
-      status: "idle",
-      sourceFile
-    }
-  ];
 }

@@ -1,4 +1,4 @@
-import type { AnalysisResult } from "./types";
+import type { AnalysisResult } from "../../types";
 
 export interface GeminiPromptInput {
   basePrompt: string;

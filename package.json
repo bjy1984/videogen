@@ -6,9 +6,11 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "bridge": "tsx server/geminiBridge.ts",
-    "dev:all": "concurrently -k -n web,bridge -c green,blue \"vite --host 0.0.0.0 --port 5174\" \"npm run bridge\"",
+    "video:bridge": "tsx server/videoGenerationBridge.ts",
+    "dev:all": "concurrently -k -n web,bridge,video -c green,blue,magenta \"vite --host 0.0.0.0 --port 5174\" \"npm run bridge\" \"npm run video:bridge\"",
     "build": "tsc && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "tsx tests/remixWorkflow.test.ts"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^5.0.4",

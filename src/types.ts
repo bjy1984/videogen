@@ -1,8 +1,10 @@
 export type StepKey = "input" | "report" | "script" | "generate" | "compose";
 
-export type Provider = "seedance" | "veo" | "kling" | "runway" | "pika";
+export type Provider = "mock" | "comfyui" | "seedance" | "veo" | "kling" | "runway" | "pika";
 
 export type SegmentStatus = "idle" | "queued" | "generating" | "done" | "failed";
+export type SegmentBucketRole = "hook" | "pain" | "usp" | "trust" | "cta";
+export type SegmentContentStatus = "draft" | "needs-review" | "approved" | "blocked";
 
 export interface AnalysisResult {
   basicInfo: {
@@ -92,8 +94,12 @@ export interface VideoSegment {
   id: string;
   title: string;
   role: string;
+  bucketRole?: SegmentBucketRole;
+  contentStatus?: SegmentContentStatus;
   duration: number;
   scriptText: string;
+  subtitleText?: string;
+  overlayText?: string;
   generationPrompt: string;
   provider: Provider;
   status: SegmentStatus;
