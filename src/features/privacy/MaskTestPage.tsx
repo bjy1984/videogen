@@ -109,7 +109,7 @@ export function MaskTestPage({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Local Mask Test</p>
-              <h2>本地打码测试台</h2>
+              <h2>本地打码与片段编辑测试台</h2>
             </div>
             <button className="secondary-button" onClick={() => setIsAnnotatorOpen(true)} disabled={!sourcePreviewUrl}>
               <ShieldCheck size={16} />

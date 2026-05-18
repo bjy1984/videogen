@@ -28,6 +28,8 @@ export interface VideoGenerationBridgeHealth {
   comfyui?: {
     endpoint: string;
     reachable: boolean;
+    nagCfgGuiderAvailable?: boolean;
+    nagCfgGuiderError?: string;
     error?: string;
   };
 }
@@ -40,6 +42,36 @@ export class VideoGenerationBridgeError extends Error {
     super(message);
     this.name = "VideoGenerationBridgeError";
   }
+}
+
+export interface UploadedBridgeAsset {
+  projectId: string;
+  segmentId: string;
+  kind: string;
+  fileName: string;
+  localPath: string;
+  localAssetUrl: string;
+  savedAt: string;
+}
+
+export async function uploadVideoGenerationBridgeAsset(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  segmentId: string;
+  kind: string;
+  file: File;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("segmentId", input.segmentId);
+  formData.set("kind", input.kind);
+  formData.set("file", input.file, input.file.name || `${input.kind}.bin`);
+  return requestBridgeForm<{ asset: UploadedBridgeAsset }>(
+    input.bridgeUrl,
+    "/assets/upload",
+    formData,
+    180_000
+  );
 }
 
 export async function createSeedanceBridgeTask(input: {
@@ -60,7 +92,7 @@ export async function createComfyUIBridgeTask(input: {
   return requestBridge<ComfyUITaskResponse>(input.bridgeUrl || FALLBACK_COMFYUI_BRIDGE_URL, "/comfyui/tasks", {
     method: "POST",
     body: JSON.stringify(input.request),
-    timeoutMs: 45_000
+    timeoutMs: 240_000
   });
 }
 

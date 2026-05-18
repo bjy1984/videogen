@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ShieldCheck } from "lucide-react";
+import { ShieldCheck, Wand2 } from "lucide-react";
 import {
   initialGenerationOptions,
   workflowPages
@@ -36,6 +36,7 @@ import {
   mergeProviderSettings,
   type ProviderSettings
 } from "./features/generation/providers/providerConfig";
+import { ComfyUITestPage } from "./features/generation/ComfyUITestPage";
 import { VideoGeneratePage } from "./features/generation/VideoGeneratePage";
 import { buildOperationAnalytics } from "./features/lineage/operationAnalytics";
 import type { FinalVideoRun, OperationFeedback } from "./features/lineage/lineageTypes";
@@ -1160,9 +1161,27 @@ export default function App() {
           <h1>爆款视频分析与生成工作流</h1>
         </div>
         <div className="topbar-actions">
-          <a className="secondary-button topbar-test-button" href="#mask-test" onClick={() => setPage("mask-test")}>
+          <a
+            className="secondary-button topbar-test-button"
+            href="#mask-test"
+            onClick={(event) => {
+              event.preventDefault();
+              navigatePage("mask-test");
+            }}
+          >
             <ShieldCheck size={16} />
             打码测试台
+          </a>
+          <a
+            className="secondary-button topbar-test-button"
+            href="#comfyui-test"
+            onClick={(event) => {
+              event.preventDefault();
+              navigatePage("comfyui-test");
+            }}
+          >
+            <Wand2 size={16} />
+            ComfyUI 测试台
           </a>
           <div className="topbar-stats">
             <span>{analysisResult ? "已完成分析" : "等待分析"}</span>
@@ -1292,6 +1311,10 @@ export default function App() {
         <MaskTestPage bridgeUrl={providerSettings.seedance.bridgeUrl} />
       )}
 
+      {page === "comfyui-test" && (
+        <ComfyUITestPage bridgeUrl={providerSettings.comfyui.bridgeUrl} />
+      )}
+
       {page === "generate" && (
         <VideoGeneratePage
           options={options}
@@ -1373,5 +1396,5 @@ function readInitialPage(): StepKey {
 }
 
 function isStepKey(value: string): value is StepKey {
-  return value === "mask-test" || workflowPages.some((item) => item.key === value);
+  return value === "mask-test" || value === "comfyui-test" || workflowPages.some((item) => item.key === value);
 }

@@ -62,6 +62,8 @@ app.get("/health", async (req, res) => {
     comfyui: {
       endpoint: comfyEndpoint,
       reachable: comfyHealth.reachable,
+      nagCfgGuiderAvailable: comfyHealth.nagCfgGuiderAvailable,
+      nagCfgGuiderError: comfyHealth.nagCfgGuiderError,
       error: comfyHealth.error
     }
   });
@@ -217,6 +219,45 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   }
 });
 
+app.post("/assets/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      throw new BridgeError("请上传需要暂存的文件。", 400);
+    }
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const segmentId = safePathPart(String(req.body.segmentId || "segment"));
+    const kind = safePathPart(String(req.body.kind || "asset"));
+    const originalName = req.file.originalname || "asset";
+    const extension =
+      extensionFromContentType(req.file.mimetype) ||
+      extensionFromUrl(originalName) ||
+      "bin";
+    const baseName = safePathPart(path.basename(originalName, path.extname(originalName)) || kind);
+    const fileName = `${Date.now()}_${baseName}.${extension}`;
+    const relativeDir = path.join("uploads", projectId, segmentId, kind);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+    const outputPath = path.join(outputDir, fileName);
+    await copyFile(req.file.path, outputPath);
+    res.json({
+      asset: {
+        projectId,
+        segmentId,
+        kind,
+        fileName,
+        localPath: outputPath,
+        localAssetUrl: assetUrl(req, relativeDir, fileName),
+        savedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Asset upload failed."
+    });
+  }
+});
+
 app.post("/seedance/tasks", async (req, res) => {
   const request = req.body as SeedanceCreateTaskBridgeRequest;
   try {
@@ -301,7 +342,24 @@ app.get("/seedance/tasks/:id", async (req, res) => {
 app.post("/comfyui/tasks", async (req, res) => {
   const request = req.body as ComfyUICreateTaskBridgeRequest;
   try {
+    const endpoint = request.endpoint || DEFAULT_COMFYUI_ENDPOINT;
     const workflow = await resolveComfyUIWorkflow(request);
+    const sourceVideoInput = request.sourceVideoUrl
+      ? await uploadComfyUIInputFromUrl({
+          endpoint,
+          sourceUrl: request.sourceVideoUrl,
+          suggestedName: request.sourceVideoName || "source_video.mp4",
+          providerLabel: "ComfyUI source video"
+        })
+      : undefined;
+    const referenceImageInput = request.referenceImageUrl
+      ? await uploadComfyUIInputFromUrl({
+          endpoint,
+          sourceUrl: request.referenceImageUrl,
+          suggestedName: request.referenceImageName || "reference_image.png",
+          providerLabel: "ComfyUI reference image"
+        })
+      : undefined;
     const promptBody = buildComfyUIPromptBody({
       workflow,
       prompt: request.prompt,
@@ -309,10 +367,13 @@ app.post("/comfyui/tasks", async (req, res) => {
       seed: request.seed,
       steps: request.steps,
       cfgScale: request.cfgScale,
-      sourceVideoUrl: request.sourceVideoUrl,
+      ollamaModel: request.ollamaModel,
+      duration: request.duration,
+      sourceVideoUrl: sourceVideoInput || request.sourceVideoUrl,
+      referenceImageUrl: referenceImageInput || request.referenceImageUrl,
       clientId: request.clientId
     });
-    const upstreamUrl = buildComfyUIPromptUrl(request.endpoint || DEFAULT_COMFYUI_ENDPOINT);
+    const upstreamUrl = buildComfyUIPromptUrl(endpoint);
     const payload = await requestComfyUIJson(upstreamUrl, {
       method: "POST",
       body: JSON.stringify(promptBody)
@@ -436,6 +497,37 @@ async function requestComfyUIJson(url: string, init: TimedRequestInit = {}) {
   return payload;
 }
 
+async function uploadComfyUIInputFromUrl(input: {
+  endpoint: string;
+  sourceUrl: string;
+  suggestedName: string;
+  providerLabel: string;
+}) {
+  const downloaded = await downloadAsset(input.sourceUrl, input.providerLabel);
+  const fileName = safeComfyUIInputFileName(input.suggestedName, downloaded.extension);
+  const formData = new FormData();
+  formData.set("image", new Blob([new Uint8Array(downloaded.bytes)], { type: downloaded.contentType }), fileName);
+  formData.set("type", "input");
+  formData.set("overwrite", "true");
+  const response = await fetchWithTimeout(`${stripTrailingSlash(input.endpoint)}/upload/image`, {
+    method: "POST",
+    body: formData,
+    timeoutMs: 180_000
+  });
+  const payload = await readPayload(response);
+  if (!response.ok) {
+    throw new BridgeError(
+      extractUpstreamError(payload) || `ComfyUI input upload failed: ${response.status}`,
+      502
+    );
+  }
+  if (!payload || typeof payload !== "object") return fileName;
+  const result = payload as Record<string, unknown>;
+  const name = typeof result.name === "string" && result.name ? result.name : fileName;
+  const subfolder = typeof result.subfolder === "string" && result.subfolder ? result.subfolder : "";
+  return subfolder ? `${subfolder}/${name}` : name;
+}
+
 async function getComfyUITask(endpoint: string, promptId: string): Promise<ComfyUITaskResponse> {
   const historyPayload = await requestComfyUIJson(buildComfyUIHistoryUrl(endpoint, promptId), { method: "GET" });
   const historyTask = normalizeComfyUIHistoryResponse({
@@ -491,10 +583,20 @@ async function resolveComfyUIWorkflow(request: ComfyUICreateTaskBridgeRequest) {
 async function checkComfyUIHealth(endpoint: string) {
   try {
     await requestComfyUIJson(buildComfyUISystemStatsUrl(endpoint), { method: "GET" });
-    return { reachable: true };
+    const nagInfo = await requestComfyUIJson(buildComfyUIObjectInfoUrl(endpoint, "NAGCFGGuider"), { method: "GET" }).catch((error) => {
+      return {
+        error: error instanceof Error ? error.message : "NAGCFGGuider 检查失败。"
+      };
+    });
+    return {
+      reachable: true,
+      nagCfgGuiderAvailable: isRecord(nagInfo) && isRecord(nagInfo.NAGCFGGuider),
+      nagCfgGuiderError: isRecord(nagInfo) && typeof nagInfo.error === "string" ? nagInfo.error : undefined
+    };
   } catch (error) {
     return {
       reachable: false,
+      nagCfgGuiderAvailable: false,
       error: error instanceof Error ? error.message : "ComfyUI 不可达。"
     };
   }
@@ -506,9 +608,11 @@ async function downloadAsset(url: string, providerLabel = "Seedance") {
     throw new BridgeError(`下载 ${providerLabel} 产物失败：${response.status}`, 502);
   }
   const arrayBuffer = await response.arrayBuffer();
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
   return {
     bytes: Buffer.from(arrayBuffer),
-    extension: extensionFromContentType(response.headers.get("content-type")) || extensionFromUrl(url) || "mp4"
+    contentType,
+    extension: extensionFromContentType(contentType) || extensionFromUrl(url) || "mp4"
   };
 }
 
@@ -579,6 +683,20 @@ async function runPreprocessCommand(input: {
 
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function stripTrailingSlash(value: string) {
+  return value.replace(/[?#].*$/, "").replace(/\/+$/, "");
+}
+
+function buildComfyUIObjectInfoUrl(endpoint: string, nodeType: string) {
+  return `${stripTrailingSlash(endpoint)}/object_info/${encodeURIComponent(nodeType)}`;
+}
+
+function safeComfyUIInputFileName(suggestedName: string, fallbackExtension: string) {
+  const extension = extensionFromUrl(suggestedName) || fallbackExtension || "bin";
+  const baseName = safePathPart(path.basename(suggestedName, path.extname(suggestedName)) || "videogen_input");
+  return `${baseName}.${extension}`;
 }
 
 function defaultFaceMosaicCommand(preview = false, effect = "mosaic", strength = 0.85) {
@@ -924,6 +1042,9 @@ function extensionFromContentType(contentType: string | null) {
   if (contentType.includes("video/mp4")) return "mp4";
   if (contentType.includes("video/quicktime")) return "mov";
   if (contentType.includes("video/webm")) return "webm";
+  if (contentType.includes("image/png")) return "png";
+  if (contentType.includes("image/jpeg")) return "jpg";
+  if (contentType.includes("image/webp")) return "webp";
   return undefined;
 }
 

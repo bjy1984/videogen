@@ -49,7 +49,8 @@ export const defaultProviderSettings: ProviderSettings = {
     outputNodeId: "",
     seed: "-1",
     steps: 24,
-    cfgScale: 7
+    cfgScale: 7,
+    ollamaModel: ""
   },
   seedance: {
     bridgeUrl: DEFAULT_SEEDANCE_BRIDGE_URL,
