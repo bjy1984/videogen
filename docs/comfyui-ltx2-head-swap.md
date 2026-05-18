@@ -25,6 +25,16 @@ The test page uploads the source video and reference face image to the local bri
 - Default CFG: `1`
 - Default Ollama model override: `gemma4:e4b-it-q4_K_M`
 
+The standalone test page now follows the uploaded source video's browser metadata duration. If metadata cannot be read, it falls back to `5s`. The workflow output video uses the `TrimAudioDuration` node output, not the raw source audio, so audio length stays aligned with the generated frame window.
+
+For uploaded source videos, the bridge resets `VHS_LoadVideo.skip_first_frames` to `0` so a hand-tuned workflow cannot silently drop the first frames. The bundled workflow also uses ceiling frame quantization for LTX's `8n+1` frame requirement, which keeps generated duration closer to the requested source duration.
+
+When syncing a completed ComfyUI result, the bridge accepts `targetDuration` and retimes the local MP4 with ffmpeg if ComfyUI's frame constraints still leave a visible duration mismatch. The frontend test page passes the uploaded source video's duration automatically.
+
+For identity preservation, the bridge injects the UI prompt into the automatic `OllamaVideoDescriber` instructions. It also expands the reference-face reserved region from 256px to at least 320px and keeps face scale at the ComfyUI node's legal maximum of 100%, giving LTX2 more visible facial detail in the guide frames without failing workflow validation.
+
+The green reference-face/control comparison videos are debug-only. The bundled workflow disables saved outputs for those comparison nodes, and the bridge strictly syncs only the configured final output node (`341`) when `outputNodeId` is provided.
+
 ## Required ComfyUI Runtime
 
 Install or verify these custom nodes on the ComfyUI server:
@@ -90,6 +100,8 @@ The upstream `ComfyUI-NAG` node was not directly compatible with this LTX2 AV wo
 | `keywords must be strings` | Patch typo used a non-string key in `kwargs` or merged args | Ensure all `kwargs[...]` keys are quoted strings |
 | `_process_input() got multiple values for argument 'denoise_mask'` | `denoise_mask` passed positionally and again through `**kwargs` | `denoise_mask = kwargs.pop("denoise_mask", None)` before merging |
 | `tensor a (3) must match tensor b (2)` in `apply_cross_attention_adaln` | NAG appended a negative context row before AdaLN prompt timestep modulation | Apply AdaLN to main and NAG contexts separately, then concatenate |
+| Output duration does not match source | Test page used a fixed `5s`, and final video muxing used raw source audio | Use source metadata duration and feed `CreateVideo.audio` from `TrimAudioDuration` |
+| Reference identity drifts too much | Automatic prompt branch did not receive the UI identity-lock prompt, and the guide face panel was too small | Inject identity rules into `OllamaVideoDescriber`, strengthen negative identity terms, and enlarge the reference-face guide area |
 
 ## Frontend Test Flow
 

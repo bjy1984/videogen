@@ -16,7 +16,9 @@ import {
   buildComfyUIPromptBody,
   LTX2_HEAD_SWAP_COMFYUI_PRESET,
   mapComfyUITaskStatus,
-  normalizeComfyUIHistoryResponse
+  normalizeComfyUIHistoryResponse,
+  selectBestComfyUIOutputFile,
+  selectComfyUIOutputFileForNode
 } from "../src/features/generation/providers/comfyuiApi";
 import {
   DEFAULT_SEEDANCE_ARK_BASE_URL,
@@ -139,7 +141,8 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
       "12": {
         class_type: "LoadVideo",
         inputs: {
-          input_video: "old.mp4"
+          input_video: "old.mp4",
+          skip_first_frames: 28
         }
       },
       "13": {
@@ -148,11 +151,30 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
           image: "old.png"
         }
       },
+      "360": {
+        class_type: "ReservedRegionFrameComposer",
+        inputs: {
+          region_size_px: 256,
+          face_scale_pct: 100,
+          face_padding_px: 12
+        }
+      },
+      "395": {
+        class_type: "CLIPTextEncode",
+        _meta: {
+          title: "Negative Prompt"
+        },
+        inputs: {
+          text: "bad face",
+          clip: ["477", 0]
+        }
+      },
       "586": {
         class_type: "OllamaVideoDescriber",
         inputs: {
           model: "qwen3.5:9b (6.6GB)",
-          custom_model: ""
+          custom_model: "",
+          prompt: "Analyze this composite video."
         }
       }
     },
@@ -172,8 +194,14 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
   assert.equal(workflow["3"].inputs.steps, 24);
   assert.equal(workflow["3"].inputs.cfg, 7);
   assert.equal(workflow["12"].inputs.input_video, "https://assets.example/preprocessed-source.mp4");
+  assert.equal(workflow["12"].inputs.skip_first_frames, 0);
   assert.equal(workflow["13"].inputs.image, "https://assets.example/reference-face.png");
+  assert.equal(workflow["360"].inputs.region_size_px, 320);
+  assert.equal(workflow["360"].inputs.face_scale_pct, 100);
+  assert.equal(workflow["360"].inputs.face_padding_px, 8);
+  assert.match(String(workflow["395"].inputs.text), /different person/);
   assert.equal(workflow["586"].inputs.custom_model, "gemma4:e4b-it-q4_K_M");
+  assert.match(String(workflow["586"].inputs.prompt), /Additional identity preservation rules/);
 
   const history = normalizeComfyUIHistoryResponse({
     endpoint: "http://127.0.0.1:8188",
@@ -192,6 +220,26 @@ await run("injects ComfyUI workflow controls and parses output history", () => {
   assert.equal(history.status, "succeeded");
   assert.equal(history.outputFiles?.[0].nodeId, "save_video");
   assert.match(history.outputFiles?.[0].viewUrl || "", /\/view\?/);
+  assert.equal(
+    selectBestComfyUIOutputFile([
+      { nodeId: "365", kind: "gifs", filename: "comparison.mp4" },
+      { nodeId: "341", kind: "images", filename: "result.mp4" }
+    ], "missing")?.nodeId,
+    "365"
+  );
+  assert.equal(
+    selectComfyUIOutputFileForNode([
+      { nodeId: "365", kind: "gifs", filename: "comparison.mp4" },
+      { nodeId: "341", kind: "images", filename: "result.mp4" }
+    ], "341")?.nodeId,
+    "341"
+  );
+  assert.equal(
+    selectComfyUIOutputFileForNode([
+      { nodeId: "365", kind: "gifs", filename: "comparison.mp4" }
+    ], "341"),
+    undefined
+  );
   assert.equal(mapComfyUITaskStatus("succeeded"), "done");
   assert.equal(mapComfyUITaskStatus("queued"), "queued");
 });

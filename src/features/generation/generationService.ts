@@ -15,7 +15,7 @@ import {
   syncSeedanceBridgeAsset,
   uploadVideoGenerationBridgeAsset
 } from "../../services/videoGenerationBridgeClient";
-import { extractComfyUITaskError, mapComfyUITaskStatus, selectBestComfyUIOutputFile } from "./providers/comfyuiApi";
+import { extractComfyUITaskError, mapComfyUITaskStatus, selectComfyUIOutputFileForNode } from "./providers/comfyuiApi";
 import { extractSeedanceTaskError, mapSeedanceTaskStatus } from "./providers/seedanceArk";
 import { buildBrandMaskReview } from "../privacy/brandMaskReview";
 import { hasSegmentBrandMasks, hasSegmentFaceMosaic } from "../script/privacyEdits";
@@ -516,7 +516,7 @@ export async function refreshComfyUIMaterialBuckets(input: {
             if (jobStatus === "failed") failedCount += 1;
             const assetStatus: RemixAsset["status"] =
               jobStatus === "done" ? "ready" : jobStatus === "failed" ? "failed" : "generating";
-            const output = selectBestComfyUIOutputFile(task.outputFiles, input.providerSettings.comfyui.outputNodeId);
+            const output = selectComfyUIOutputFileForNode(task.outputFiles, input.providerSettings.comfyui.outputNodeId);
             const synced = assetStatus === "ready" && input.syncAssets !== false
               ? await syncReadyComfyUIAsset({
                   bridgeUrl: input.providerSettings.comfyui.bridgeUrl,
@@ -524,7 +524,8 @@ export async function refreshComfyUIMaterialBuckets(input: {
                   outputNodeId: input.providerSettings.comfyui.outputNodeId,
                   taskId: asset.providerTrace.remoteJobId,
                   projectId: input.projectId || "default_project",
-                  assetId: asset.id
+                  assetId: asset.id,
+                  targetDuration: asset.duration
                 })
               : null;
             return {
@@ -598,6 +599,7 @@ async function syncReadyComfyUIAsset(input: {
   taskId: string;
   projectId: string;
   assetId: string;
+  targetDuration?: number;
 }) {
   try {
     return await syncComfyUIBridgeAsset(input);

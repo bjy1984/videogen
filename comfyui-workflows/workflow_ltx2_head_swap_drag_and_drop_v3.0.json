@@ -47,7 +47,7 @@
         "352",
         1
       ],
-      "skip_first_frames": 28,
+      "skip_first_frames": 0,
       "select_every_nth": 1,
       "format": "AnimateDiff"
     },
@@ -58,7 +58,7 @@
   },
   "352": {
     "inputs": {
-      "expression": "((a * b) // 8) * 8 + 1",
+      "expression": "(((a * b + 7) // 8) * 8 + 1)",
       "variables.a": [
         "427",
         0
@@ -85,13 +85,13 @@
   "360": {
     "inputs": {
       "region_position": "left",
-      "region_size_px": 256,
+      "region_size_px": 320,
       "face_distribution": "all_faces_every_frame",
       "interval_frames": 12,
       "overflow_mode": "loop",
       "stack_direction": "auto",
       "face_scale_pct": 100,
-      "face_padding_px": 12,
+      "face_padding_px": 8,
       "face_gap_px": 12,
       "face_align_main": "center",
       "face_align_cross": "center",
@@ -161,7 +161,7 @@
       "save_metadata": true,
       "trim_to_audio": false,
       "pingpong": false,
-      "save_output": true,
+      "save_output": false,
       "images": [
         "360",
         0
@@ -301,7 +301,7 @@
   },
   "395": {
     "inputs": {
-      "text": "pc game, console game, video game, cartoon, childish, ugly, artifacts, low resolution, blurry, jagged edges, garbled text, corrupted lettering, fake subtitles, unreadable typography, distorted logo, fake logo, random letters, misspelled words, noisy text overlays, watermark artifacts",
+      "text": "pc game, console game, video game, cartoon, childish, ugly, artifacts, low resolution, blurry, jagged edges, garbled text, corrupted lettering, fake subtitles, unreadable typography, distorted logo, fake logo, random letters, misspelled words, noisy text overlays, watermark artifacts, different person, changed identity, altered facial structure, altered face shape, beautified face, age-shifted face, gender-shifted face, merged face identity, source-video face identity",
       "clip": [
         "477",
         0
@@ -373,8 +373,8 @@
         0
       ],
       "audio": [
-        "345",
-        2
+        "414",
+        0
       ]
     },
     "class_type": "CreateVideo",
@@ -700,7 +700,7 @@
       "save_metadata": true,
       "trim_to_audio": false,
       "pingpong": false,
-      "save_output": true,
+      "save_output": false,
       "images": [
         "560",
         0
@@ -791,7 +791,7 @@
       "frame_skip": 4,
       "max_frames": 20,
       "system_context": "You are a helpful AI assistant specialized in analyzing a sequence of video frames and generating a detailed and accurate textual description of the events. Describe the actions, people, objects, and how the scene evolves across the frames.",
-      "prompt": "Analyze this composite video.\n\nThe video contains:\n1. a side chroma-key panel with a reference face image\n2. a main performance video showing the body, clothing, movement, hand actions, objects, framing, and environment\n\nYour task is to extract:\n- the target face identity from the side panel\n- the performance/action from the main video\n\nCritical rules:\n- The side-panel face is the only valid source for identity traits and head-level accessories.\n- Ignore the visible face and head appearance in the main video completely.\n- Do not describe any face, hair, hairstyle, hair color, eye color, makeup, facial features, facial expression, attractiveness, headwear, hood, hat, or accessories from the main video.\n- In the ACTION section, describe the performer only as \"a person\" and focus only on body movement, clothing, hand actions, objects, framing, and environment.\n- Do not mention the chroma panel, green background, split layout, or editing structure.\n- Be factual and non-creative.\n- Do not guess uncertain details. If a detail is not clearly visible, omit it.\n\nReturn exactly in this format:\nhead_swap:\n\nFACE:\nA brief but detailed objective identity description from the side-panel face only. Include, when clearly visible: apparent gender, apparent ethnicity, skin tone or complexion, approximate age range, head shape, hair or baldness pattern, hair color, eye color, facial hair, visible skin details, headwear or head covering, visible facial accessories, and any especially distinctive facial trait. Prioritize the eyes when they are a strong defining feature.\n\nACTION:\nA concise performance description from the main video. Include only: visible clothing, body position, movement, hand actions, objects being shown or handled, camera-facing behavior, framing, and environment. Do not include any face or head appearance from the main video.\n\nGood example:\nFACE:\nFemale, fair skin, approximately 20-30 years old, oval head shape, long wavy vivid blue-violet hair, bright golden-amber eyes with dark defined pupils, no facial hair, smooth skin, and pink flower hair accessories as a distinctive head adornment.\n\nACTION:\nA person in a dark top faces the camera indoors, holds a package of false eyelashes close to the lens, peels one lash from the backing, brings it near the eye area, and examines it while making small hand movements.\n\nBad example:\nACTION:\nA person with long curly blonde braids holds a pair of false eyelashes...",
+      "prompt": "Analyze this composite video.\n\nThe video contains:\n1. a side chroma-key panel with a reference face image\n2. a main performance video showing the body, clothing, movement, hand actions, objects, framing, and environment\n\nYour task is to extract:\n- the target face identity from the side panel\n- the performance/action from the main video\n\nCritical rules:\n- The side-panel face is the only valid source for identity traits and head-level accessories.\n- Ignore the visible face and head appearance in the main video completely.\n- Do not describe any face, hair, hairstyle, hair color, eye color, makeup, facial features, facial expression, attractiveness, headwear, hood, hat, or accessories from the main video.\n- In the ACTION section, describe the performer only as \"a person\" and focus only on body movement, clothing, hand actions, objects, framing, and environment.\n- Do not mention the chroma panel, green background, split layout, or editing structure.\n- Be factual and non-creative.\n- Do not guess uncertain details. If a detail is not clearly visible, omit it.\n\nReturn exactly in this format:\nhead_swap:\n\nFACE:\nA brief but detailed objective identity description from the side-panel face only. Include, when clearly visible: apparent gender, apparent ethnicity, skin tone or complexion, approximate age range, head shape, hair or baldness pattern, hair color, eye color, facial hair, visible skin details, headwear or head covering, visible facial accessories, and any especially distinctive facial trait. Prioritize the eyes when they are a strong defining feature.\n\nACTION:\nA concise performance description from the main video. Include only: visible clothing, body position, movement, hand actions, objects being shown or handled, camera-facing behavior, framing, and environment. Do not include any face or head appearance from the main video.\n\nGood example:\nFACE:\nFemale, fair skin, approximately 20-30 years old, oval head shape, long wavy vivid blue-violet hair, bright golden-amber eyes with dark defined pupils, no facial hair, smooth skin, and pink flower hair accessories as a distinctive head adornment.\n\nACTION:\nA person in a dark top faces the camera indoors, holds a package of false eyelashes close to the lens, peels one lash from the backing, brings it near the eye area, and examines it while making small hand movements.\n\nBad example:\nACTION:\nA person with long curly blonde braids holds a pair of false eyelashes...\n\nAdditional identity preservation rules:\nUse the side-panel reference face as the only identity source. Preserve face shape, facial proportions, skin tone, age range, hairline or hairstyle, eye shape, nose, mouth, and distinctive facial traits. Do not beautify, age-shift, gender-shift, average, stylize, or merge with the source-video face. When writing FACE, describe only identity traits visible in the side-panel reference face. Do not borrow any identity trait from the main video.",
       "video_frames": [
         "360",
         0

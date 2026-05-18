@@ -176,6 +176,7 @@ export function prepareComfyUIWorkflow(input: {
   const workflow = structuredClone(toComfyUIApiWorkflow(input.workflow)) as Record<string, unknown>;
   injectPrompt(workflow, input.promptNodeId, input.prompt);
   injectSamplerControls(workflow, input.seed, input.steps, input.cfgScale);
+  injectHeadSwapIdentityControls(workflow, input.prompt);
   if (input.ollamaModel?.trim()) injectOllamaModelControls(workflow, input.ollamaModel);
   if (input.duration !== undefined) injectDurationControls(workflow, input.duration);
   if (input.sourceVideoUrl) injectSourceVideoControls(workflow, input.sourceVideoUrl);
@@ -248,6 +249,15 @@ export function extractComfyUITaskError(task: ComfyUITaskResponse) {
 export function selectBestComfyUIOutputFile(files: ComfyUIOutputFile[] = [], outputNodeId?: string) {
   const scoped = outputNodeId ? files.filter((file) => file.nodeId === outputNodeId) : files;
   const candidates = scoped.length ? scoped : files;
+  return selectBestComfyUIOutputCandidate(candidates);
+}
+
+export function selectComfyUIOutputFileForNode(files: ComfyUIOutputFile[] = [], outputNodeId?: string) {
+  if (!outputNodeId) return selectBestComfyUIOutputCandidate(files);
+  return selectBestComfyUIOutputCandidate(files.filter((file) => file.nodeId === outputNodeId));
+}
+
+function selectBestComfyUIOutputCandidate(candidates: ComfyUIOutputFile[] = []) {
   return (
     candidates.find((file) => isVideoFile(file.filename)) ||
     candidates.find((file) => file.kind === "videos" || file.kind === "gifs") ||
@@ -545,6 +555,42 @@ function injectOllamaModelControls(workflow: Record<string, unknown>, model: str
   }
 }
 
+function injectHeadSwapIdentityControls(workflow: Record<string, unknown>, identityPrompt: string) {
+  const normalizedPrompt = identityPrompt.trim();
+  for (const node of Object.values(workflow)) {
+    if (!isRecord(node)) continue;
+    const inputs = isRecord(node.inputs) ? node.inputs : undefined;
+    if (!inputs) continue;
+    const classType = stringifyOptional(node.class_type) || "";
+    const title = stringifyOptional(isRecord(node._meta) ? node._meta.title : undefined) || "";
+
+    if (classType === "OllamaVideoDescriber" && normalizedPrompt && typeof inputs.prompt === "string") {
+      inputs.prompt = appendOnce(
+        inputs.prompt,
+        [
+          "",
+          "Additional identity preservation rules:",
+          normalizedPrompt,
+          "When writing FACE, describe only identity traits visible in the side-panel reference face. Do not invent, simplify, beautify, average, age-shift, gender-shift, or borrow any identity trait from the main video."
+        ].join("\n")
+      );
+    }
+
+    if (classType === "CLIPTextEncode" && typeof inputs.text === "string" && /negative/i.test(title)) {
+      inputs.text = appendCommaTerms(
+        inputs.text,
+        "different person, changed identity, altered facial structure, altered face shape, beautified face, age-shifted face, gender-shifted face, merged face identity, source-video face identity"
+      );
+    }
+
+    if (classType === "ReservedRegionFrameComposer") {
+      if (typeof inputs.region_size_px === "number") inputs.region_size_px = Math.max(inputs.region_size_px, 320);
+      if (typeof inputs.face_scale_pct === "number") inputs.face_scale_pct = Math.min(100, Math.max(inputs.face_scale_pct, 100));
+      if (typeof inputs.face_padding_px === "number") inputs.face_padding_px = Math.min(inputs.face_padding_px, 8);
+    }
+  }
+}
+
 function injectDurationControls(workflow: Record<string, unknown>, duration: number) {
   const normalizedDuration = Math.max(0.5, Math.min(60, duration));
   for (const node of Object.values(workflow)) {
@@ -561,6 +607,15 @@ function injectDurationControls(workflow: Record<string, unknown>, duration: num
   }
 }
 
+function appendOnce(value: string, suffix: string) {
+  return value.includes(suffix.trim()) ? value : `${value.trimEnd()}\n${suffix}`;
+}
+
+function appendCommaTerms(value: string, terms: string) {
+  const existing = value.trim();
+  return existing.includes(terms) ? existing : `${existing}, ${terms}`;
+}
+
 function injectSourceVideoControls(workflow: Record<string, unknown>, sourceVideoUrl: string) {
   const sourceKeys = ["video_url", "source_video", "sourceVideo", "input_video", "inputVideo"];
   for (const node of Object.values(workflow)) {
@@ -568,8 +623,10 @@ function injectSourceVideoControls(workflow: Record<string, unknown>, sourceVide
     const inputs = isRecord(node.inputs) ? node.inputs : undefined;
     if (!inputs) continue;
     const classType = stringifyOptional(node.class_type) || "";
-    if (/load.*video|video.*load|VHS_LoadVideo/i.test(classType) && typeof inputs.video === "string") {
-      inputs.video = sourceVideoUrl;
+    const isVideoLoader = /load.*video|video.*load|VHS_LoadVideo/i.test(classType);
+    if (isVideoLoader) {
+      if (typeof inputs.video === "string") inputs.video = sourceVideoUrl;
+      if (typeof inputs.skip_first_frames === "number") inputs.skip_first_frames = 0;
     }
     for (const key of sourceKeys) {
       if (key in inputs) inputs[key] = sourceVideoUrl;

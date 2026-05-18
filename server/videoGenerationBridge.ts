@@ -2,7 +2,7 @@ import cors from "cors";
 import express from "express";
 import multer from "multer";
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -16,6 +16,7 @@ import {
   normalizeComfyUIHistoryResponse,
   normalizeComfyUISubmitResponse,
   selectBestComfyUIOutputFile,
+  selectComfyUIOutputFileForNode,
   type ComfyUICreateTaskBridgeRequest,
   type ComfyUISyncAssetResponse,
   type ComfyUITaskResponse
@@ -414,9 +415,11 @@ app.post("/comfyui/tasks/:id/sync", async (req, res) => {
     if (task.status !== "succeeded") {
       throw new BridgeError(`ComfyUI 任务尚未成功，当前状态：${task.status || "unknown"}`, 409);
     }
-    const output = selectBestComfyUIOutputFile(task.outputFiles, outputNodeId);
+    const output = outputNodeId
+      ? selectComfyUIOutputFileForNode(task.outputFiles, outputNodeId)
+      : selectBestComfyUIOutputFile(task.outputFiles);
     if (!output) {
-      throw new BridgeError("ComfyUI 任务没有可转存的输出文件。", 409);
+      throw new BridgeError(outputNodeId ? `ComfyUI 任务没有节点 ${outputNodeId} 的可转存输出文件。` : "ComfyUI 任务没有可转存的输出文件。", 409);
     }
 
     const sourceUrl = output.viewUrl || buildComfyUIViewUrl(endpoint, output);
@@ -428,6 +431,10 @@ app.post("/comfyui/tasks/:id/sync", async (req, res) => {
     await mkdir(outputDir, { recursive: true });
     const outputPath = path.join(outputDir, fileName);
     await writeFile(outputPath, downloaded.bytes);
+    const targetDuration = positiveNumberOptional(req.body.targetDuration);
+    if (targetDuration && isVideoExtension(extension)) {
+      await normalizeVideoDuration(outputPath, targetDuration);
+    }
 
     const asset = {
       projectId,
@@ -614,6 +621,110 @@ async function downloadAsset(url: string, providerLabel = "Seedance") {
     contentType,
     extension: extensionFromContentType(contentType) || extensionFromUrl(url) || "mp4"
   };
+}
+
+async function normalizeVideoDuration(filePath: string, targetDuration: number) {
+  const currentDuration = await probeMediaDuration(filePath);
+  if (!currentDuration || Math.abs(currentDuration - targetDuration) < 0.05) return;
+  const hasAudio = await probeHasAudioStream(filePath);
+  const tempPath = `${filePath}.retime-${Date.now()}.mp4`;
+  const setPtsFactor = targetDuration / currentDuration;
+  const atempoFactor = currentDuration / targetDuration;
+  const args = [
+    "-y",
+    "-i",
+    filePath,
+    "-map",
+    "0:v:0",
+    "-vf",
+    `setpts=${formatFfmpegNumber(setPtsFactor)}*PTS`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart"
+  ];
+  if (hasAudio) {
+    args.push("-map", "0:a:0", "-af", buildAtempoFilter(atempoFactor), "-c:a", "aac");
+  } else {
+    args.push("-an");
+  }
+  args.push(tempPath);
+  try {
+    await runProcess("ffmpeg", args, 180_000);
+    await rename(tempPath, filePath);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function probeMediaDuration(filePath: string) {
+  const result = await runProcess(
+    "ffprobe",
+    ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", filePath],
+    30_000
+  );
+  return positiveNumberOptional(Number(result.stdout.trim()));
+}
+
+async function probeHasAudioStream(filePath: string) {
+  const result = await runProcess(
+    "ffprobe",
+    ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", filePath],
+    30_000
+  );
+  return result.stdout.trim().length > 0;
+}
+
+async function runProcess(command: string, args: string[], timeoutMs: number) {
+  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new BridgeError(`${command} 执行超时：${Math.round(timeoutMs / 1000)}秒未完成。`, 504));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeoutId);
+      const output = {
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8")
+      };
+      if (code === 0) {
+        resolve(output);
+        return;
+      }
+      reject(new BridgeError(`${command} 执行失败：${code}${output.stderr.trim() ? `，${output.stderr.trim()}` : ""}`, 500));
+    });
+  });
+}
+
+function buildAtempoFilter(factor: number) {
+  const parts: number[] = [];
+  let remaining = factor;
+  while (remaining > 2) {
+    parts.push(2);
+    remaining /= 2;
+  }
+  while (remaining < 0.5) {
+    parts.push(0.5);
+    remaining /= 0.5;
+  }
+  parts.push(remaining);
+  return parts.map((part) => `atempo=${formatFfmpegNumber(part)}`).join(",");
+}
+
+function formatFfmpegNumber(value: number) {
+  return Number(value.toFixed(8)).toString();
 }
 
 async function fetchWithTimeout(url: string, init: TimedRequestInit = {}) {
@@ -1048,6 +1159,10 @@ function extensionFromContentType(contentType: string | null) {
   return undefined;
 }
 
+function isVideoExtension(extension: string) {
+  return ["mp4", "mov", "webm", "mkv", "avi"].includes(extension.toLowerCase());
+}
+
 function extractUpstreamError(payload: unknown) {
   if (!isRecord(payload)) return undefined;
   if (typeof payload.message === "string") return payload.message;
@@ -1062,6 +1177,11 @@ function stringifyOptional(value: unknown) {
 
 function numberOptional(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveNumberOptional(value: unknown) {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

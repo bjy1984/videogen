@@ -13,7 +13,7 @@ import {
   buildComfyUICreateTaskRequest,
   LTX2_HEAD_SWAP_COMFYUI_PRESET,
   mapComfyUITaskStatus,
-  selectBestComfyUIOutputFile,
+  selectComfyUIOutputFileForNode,
   type ComfyUITaskResponse
 } from "./providers/comfyuiApi";
 
@@ -23,7 +23,8 @@ const HEAD_SWAP_PROJECT_ID = "comfyui_head_swap_test";
 const HEAD_SWAP_SEGMENT_ID = "head_swap_source";
 const HEAD_SWAP_OUTPUT_NODE_ID = LTX2_HEAD_SWAP_COMFYUI_PRESET.outputNodeId;
 const POLL_INTERVAL_MS = 8000;
-const HEAD_SWAP_WORKFLOW_DURATION_SECONDS = 5;
+const HEAD_SWAP_FALLBACK_DURATION_SECONDS = 5;
+const HEAD_SWAP_MAX_DURATION_SECONDS = 60;
 const HEAD_SWAP_WORKFLOW_STEPS = 8;
 const HEAD_SWAP_WORKFLOW_CFG_SCALE = 1;
 const HEAD_SWAP_OLLAMA_MODEL_OPTIONS = [
@@ -31,7 +32,7 @@ const HEAD_SWAP_OLLAMA_MODEL_OPTIONS = [
   "gemma4:e2b-it-q4_K_M",
   "gemma3:12b"
 ];
-const DEFAULT_HEAD_SWAP_PROMPT = "Keep the original body motion, camera framing, clothing silhouette, background, readable text, logos, and product details. Replace only the head identity with the uploaded face reference. Match source aspect ratio and lighting.";
+const DEFAULT_HEAD_SWAP_PROMPT = "Identity lock: use the uploaded reference face as the only identity source. Preserve the reference face shape, facial proportions, skin tone, age range, hairline or hairstyle, eye shape, nose, mouth, and distinctive facial traits. Do not beautify, age-shift, gender-shift, average, stylize, or merge with the source-video face. Keep the original body motion, camera framing, clothing silhouette, background, readable text, logos, product details, source aspect ratio, and lighting.";
 
 export function ComfyUITestPage({
   bridgeUrl
@@ -66,6 +67,7 @@ export function ComfyUITestPage({
   const isPolling = Boolean(taskId && (status === "queued" || status === "running"));
   const taskStatusLabel = headSwapStatusLabel(status);
   const taskEndpointDisplay = taskEndpoint || endpoint;
+  const effectiveDurationSeconds = normalizeHeadSwapDuration(videoDuration);
 
   const refreshComfyHeadSwapTask = useCallback(
     async (input: { manual?: boolean; taskId?: string } = {}) => {
@@ -94,7 +96,7 @@ export function ComfyUITestPage({
         if (jobStatus === "done") {
           setStatus("syncing");
           setStatusText("ComfyUI 已完成，正在回传生成结果。");
-          const output = selectBestComfyUIOutputFile(nextTask.outputFiles, HEAD_SWAP_OUTPUT_NODE_ID);
+          const output = selectComfyUIOutputFileForNode(nextTask.outputFiles, HEAD_SWAP_OUTPUT_NODE_ID);
           if (syncedTaskRef.current !== activeTaskId) {
             try {
               const synced = await syncComfyUIBridgeAsset({
@@ -103,7 +105,8 @@ export function ComfyUITestPage({
                 taskId: activeTaskId,
                 projectId: HEAD_SWAP_PROJECT_ID,
                 assetId: `head_swap_${Date.now()}`,
-                outputNodeId: HEAD_SWAP_OUTPUT_NODE_ID
+                outputNodeId: HEAD_SWAP_OUTPUT_NODE_ID,
+                targetDuration: effectiveDurationSeconds
               });
               setOutputUrl(synced.asset.localAssetUrl);
               syncedTaskRef.current = activeTaskId;
@@ -131,7 +134,7 @@ export function ComfyUITestPage({
         setIsRefreshing(false);
       }
     },
-    [bridgeUrl, endpoint, taskEndpoint, taskId]
+    [bridgeUrl, effectiveDurationSeconds, endpoint, taskEndpoint, taskId]
   );
 
   useEffect(() => {
@@ -256,7 +259,7 @@ export function ComfyUITestPage({
     if (isBusy) return;
 
     const activeEndpoint = endpoint.trim();
-    const durationSeconds = HEAD_SWAP_WORKFLOW_DURATION_SECONDS;
+    const durationSeconds = effectiveDurationSeconds;
     syncedTaskRef.current = "";
     setStatus("uploading");
     setError("");
@@ -413,7 +416,7 @@ export function ComfyUITestPage({
           <InfoBlock label="任务状态" value={taskStatusLabel} />
           <InfoBlock label="任务 ID" value={taskId ? taskId.slice(0, 12) : "-"} />
           <InfoBlock label="源视频时长" value={videoDuration ? `${videoDuration}秒` : "-"} />
-          <InfoBlock label="生成参数" value={`${HEAD_SWAP_WORKFLOW_DURATION_SECONDS}秒 / ${HEAD_SWAP_WORKFLOW_STEPS} steps / CFG ${HEAD_SWAP_WORKFLOW_CFG_SCALE}`} />
+          <InfoBlock label="生成参数" value={`${effectiveDurationSeconds}秒 / ${HEAD_SWAP_WORKFLOW_STEPS} steps / CFG ${HEAD_SWAP_WORKFLOW_CFG_SCALE}`} />
           <InfoBlock label="Ollama 模型" value={ollamaModel.trim() || "workflow 默认"} />
           <InfoBlock label="队列位置" value={task?.queuePosition !== undefined ? String(task.queuePosition) : "-"} />
           <InfoBlock label="轮询次数" value={String(pollCount)} />
@@ -494,4 +497,9 @@ function formatClock(value: Date) {
     minute: "2-digit",
     second: "2-digit"
   });
+}
+
+function normalizeHeadSwapDuration(duration: number) {
+  if (!Number.isFinite(duration) || duration <= 0) return HEAD_SWAP_FALLBACK_DURATION_SECONDS;
+  return Math.round(Math.min(duration, HEAD_SWAP_MAX_DURATION_SECONDS) * 100) / 100;
 }

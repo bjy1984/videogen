@@ -5,7 +5,7 @@ import {
   buildComfyUICreateTaskRequest,
   extractComfyUITaskError,
   mapComfyUITaskStatus,
-  selectBestComfyUIOutputFile,
+  selectComfyUIOutputFileForNode,
   type ComfyUIProviderParams
 } from "./comfyuiApi";
 import type { VideoGenerationProvider } from "./providerTypes";
@@ -32,7 +32,7 @@ export const comfyuiVideoProvider: VideoGenerationProvider = {
         bridgeUrl: params?.bridgeUrl,
         request
       });
-      const output = selectBestComfyUIOutputFile(task.outputFiles, request.outputNodeId);
+      const output = selectComfyUIOutputFileForNode(task.outputFiles, request.outputNodeId);
       const job: GenerationJob = {
         id: task.promptId || task.id || createId("job_comfyui"),
         remoteJobId: task.promptId || task.id,
@@ -78,7 +78,7 @@ export const comfyuiVideoProvider: VideoGenerationProvider = {
         endpoint: request.endpoint,
         taskId: current.remoteJobId
       });
-      const output = selectBestComfyUIOutputFile(task.outputFiles, request.outputNodeId);
+      const output = selectComfyUIOutputFileForNode(task.outputFiles, request.outputNodeId);
       const next: GenerationJob = {
         ...current,
         remoteStatus: task.status,

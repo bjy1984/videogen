@@ -234,6 +234,7 @@ export async function syncComfyUIBridgeAsset(input: {
   projectId: string;
   assetId: string;
   outputNodeId?: string;
+  targetDuration?: number;
 }) {
   return requestBridge<ComfyUISyncAssetResponse>(
     input.bridgeUrl || FALLBACK_COMFYUI_BRIDGE_URL,
@@ -244,7 +245,8 @@ export async function syncComfyUIBridgeAsset(input: {
         endpoint: input.endpoint,
         projectId: input.projectId,
         assetId: input.assetId,
-        outputNodeId: input.outputNodeId
+        outputNodeId: input.outputNodeId,
+        targetDuration: input.targetDuration
       }),
       timeoutMs: 120_000
     }
