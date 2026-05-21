@@ -1,9 +1,9 @@
-import { AlertTriangle, BadgeX, Check, Loader2, PanelTopClose, Plus, ScanFace, SquareDashedMousePointer, Trash2 } from "lucide-react";
+import { AlertTriangle, BadgeX, Check, ExternalLink, Loader2, PanelTopClose, Plus, ScanFace, SquareDashedMousePointer, Trash2 } from "lucide-react";
 import type { CSSProperties, MouseEvent, PointerEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { BrandMaskEffect, BrandMaskKeyframe, BrandMaskTargetType, BrandMaskTrack, BrandMaskTrackMode, VideoPreprocessTrace, VideoSegment } from "../../types";
+import type { BrandMaskEffect, BrandMaskKeyframe, BrandMaskScaleMode, BrandMaskTargetType, BrandMaskTrack, BrandMaskTrackMode, BrandMaskTrackingEngine, FaceMosaicEffect, VideoPreprocessTrace, VideoSegment } from "../../types";
 import { preprocessBrandMaskBridge } from "../../services/videoGenerationBridgeClient";
-import { brandMaskDefaultEffect } from "../script/privacyEdits";
+import { brandMaskDefaultEffect, brandMaskDefaultStrength, normalizeMaskStrength } from "../script/privacyEdits";
 import { buildBrandMaskReview } from "./brandMaskReview";
 
 interface BrandMaskAnnotatorProps {
@@ -13,6 +13,8 @@ interface BrandMaskAnnotatorProps {
   facePreviewSegmentId: string;
   facePreviewError?: string;
   onToggleFaceMosaic: () => void;
+  onChangeFaceMosaicEffect: (effect: FaceMosaicEffect) => void;
+  onChangeFaceMosaicStrength: (strength: number) => void;
   onPreviewFaceMosaic: () => void;
   onChange: (tracks: BrandMaskTrack[]) => void;
   onPreviewTrace?: (trace: VideoPreprocessTrace) => void;
@@ -26,6 +28,18 @@ interface DraftRect {
   height: number;
 }
 
+type TrackingPreviewMode = BrandMaskTrackingEngine | "compare";
+
+const COMPARISON_ENGINES: BrandMaskTrackingEngine[] = [
+  "opencv",
+  "homography",
+  "vittrack",
+  "mixformer",
+  "ddrnet",
+  "track-anything",
+  "mask-tracking"
+];
+
 export function BrandMaskAnnotator({
   segment,
   sourcePreviewUrl,
@@ -33,6 +47,8 @@ export function BrandMaskAnnotator({
   facePreviewSegmentId,
   facePreviewError,
   onToggleFaceMosaic,
+  onChangeFaceMosaicEffect,
+  onChangeFaceMosaicStrength,
   onPreviewFaceMosaic,
   onChange,
   onPreviewTrace,
@@ -53,24 +69,28 @@ export function BrandMaskAnnotator({
   const [trackingPreviewError, setTrackingPreviewError] = useState("");
   const [trackingPreviewElapsed, setTrackingPreviewElapsed] = useState(0);
   const [trackingPreviewTrace, setTrackingPreviewTrace] = useState<VideoPreprocessTrace>();
+  const [trackingPreviewResults, setTrackingPreviewResults] = useState<VideoPreprocessTrace[]>([]);
+  const [trackingPreviewMode, setTrackingPreviewMode] = useState<TrackingPreviewMode>("opencv");
   const [showTrackingPreview, setShowTrackingPreview] = useState(false);
   const [showFacePreview, setShowFacePreview] = useState(false);
   const [facePreviewElapsed, setFacePreviewElapsed] = useState(0);
 
   const faceMosaicEnabled = Boolean(segment.privacyEdits?.faceMosaic);
+  const faceMosaicEffect = segment.privacyEdits?.faceMosaicEffect ?? "mosaic";
+  const faceMosaicStrength = normalizeMaskStrength(segment.privacyEdits?.faceMosaicStrength);
   const faceTrace = segment.privacyEdits?.faceMosaicPreprocess;
+  const facePreviewUrl = faceTrace?.outputVideoUrl ?? "";
   const isFacePreviewRunning = facePreviewSegmentId === segment.id;
   const activeTrack = tracks.find((track) => track.id === activeTrackId) ?? tracks[0];
   const visibleMask = activeTrack ? previewMaskForTrack(activeTrack, playbackTime) : undefined;
   const review = useMemo(() => buildBrandMaskReview(tracks), [tracks]);
   const videoAspect = `${videoSize.width} / ${videoSize.height}`;
-  const facePreviewUrl = faceTrace?.outputVideoUrl ?? "";
-  const displayVideoUrl = showFacePreview && facePreviewUrl
-    ? facePreviewUrl
-    : showTrackingPreview && trackingPreviewUrl
-      ? trackingPreviewUrl
+  const displayVideoUrl = showTrackingPreview && trackingPreviewUrl
+    ? trackingPreviewUrl
+    : showFacePreview && facePreviewUrl
+      ? facePreviewUrl
       : sourcePreviewUrl;
-  const isPreviewMode = Boolean((showFacePreview && facePreviewUrl) || (showTrackingPreview && trackingPreviewUrl));
+  const isPreviewMode = Boolean((showTrackingPreview && trackingPreviewUrl) || (showFacePreview && facePreviewUrl));
   const facePreviewProgress = Math.min(92, 12 + facePreviewElapsed * 4);
   const trackingPreviewProgress = Math.min(92, 10 + trackingPreviewElapsed * 5);
 
@@ -107,12 +127,23 @@ export function BrandMaskAnnotator({
     return () => window.clearInterval(intervalId);
   }, [trackingPreviewState]);
 
+  useEffect(() => {
+    if (!faceMosaicEnabled || !facePreviewUrl) {
+      setShowFacePreview(false);
+      return;
+    }
+    setShowFacePreview(true);
+    setShowTrackingPreview(false);
+  }, [faceMosaicEnabled, facePreviewUrl]);
+
   function commitTracks(nextTracks: BrandMaskTrack[]) {
     setTrackingPreviewUrl("");
     setTrackingPreviewState("idle");
     setTrackingPreviewError("");
     setTrackingPreviewTrace(undefined);
+    setTrackingPreviewResults([]);
     setShowTrackingPreview(false);
+    setShowFacePreview(false);
     onChange(nextTracks);
     if (!nextTracks.some((track) => track.id === activeTrackId)) {
       setActiveTrackId(nextTracks[0]?.id ?? "");
@@ -125,7 +156,9 @@ export function BrandMaskAnnotator({
       label: `追踪目标 ${tracks.length + 1}`,
       targetType,
       effect: brandMaskDefaultEffect(targetType),
+      strength: brandMaskDefaultStrength(),
       trackMode: "planar",
+      scaleMode: "locked",
       expandRatio: 0.06,
       confidenceThreshold: 0.45,
       keyframes: []
@@ -140,6 +173,19 @@ export function BrandMaskAnnotator({
 
   function deleteTrack(trackId: string) {
     commitTracks(tracks.filter((track) => track.id !== trackId));
+  }
+
+  function activateTrackingPreviewTrace(trace: VideoPreprocessTrace) {
+    const issues = trace.issues ?? [];
+    onChange(tracks.map((track) => ({
+      ...track,
+      reviewIssues: issues.filter((issue) => issue.trackId === track.id)
+    })));
+    onPreviewTrace?.(trace);
+    setTrackingPreviewUrl(trace.outputVideoUrl || "");
+    setTrackingPreviewTrace(trace);
+    setShowFacePreview(false);
+    setShowTrackingPreview(Boolean(trace.outputVideoUrl));
   }
 
   function deleteKeyframe(trackId: string, keyframeId: string) {
@@ -168,7 +214,10 @@ export function BrandMaskAnnotator({
     const video = videoRef.current;
     if (!video) return;
     if (video.paused) {
-      void video.play();
+      void video.play().catch((error) => {
+        setIsPlaying(false);
+        setTrackingPreviewError(videoPlaybackErrorMessage(error, isPreviewMode));
+      });
     } else {
       video.pause();
     }
@@ -240,42 +289,57 @@ export function BrandMaskAnnotator({
 
   async function runTrackingPreview() {
     if (!sourcePreviewUrl || !tracks.length || review.errorCount || trackingPreviewState === "running") return;
+    const engines: BrandMaskTrackingEngine[] = trackingPreviewMode === "compare" ? COMPARISON_ENGINES : [trackingPreviewMode];
     setTrackingPreviewState("running");
     setTrackingPreviewError("");
     setTrackingPreviewTrace(undefined);
+    setTrackingPreviewResults([]);
     setShowTrackingPreview(false);
     try {
       const response = await fetch(sourcePreviewUrl);
       if (!response.ok) throw new Error("无法读取当前原素材预览视频。");
       const blob = await response.blob();
-      const video = new File([blob], `${segment.id || "source"}_brand_mask_source.mp4`, {
-        type: blob.type || "video/mp4"
-      });
-      const result = await preprocessBrandMaskBridge({
-        bridgeUrl,
-        projectId: "brand_mask_preview",
-        segmentId: segment.id,
-        sourceRange: segment.role,
-        video,
-        blockOnRed: false,
-        tracks
-      });
-      const issues = result.trace.issues ?? [];
-      if (issues.length) {
-        onChange(tracks.map((track) => ({
-          ...track,
-          reviewIssues: issues.filter((issue) => issue.trackId === track.id)
-        })));
+
+      const nextResults: VideoPreprocessTrace[] = [];
+      const errors: string[] = [];
+      for (const engine of engines) {
+        try {
+          const video = new File([blob], `${segment.id || "source"}_${engine}_mask_source.mp4`, {
+            type: blob.type || "video/mp4"
+          });
+          const result = await preprocessBrandMaskBridge({
+            bridgeUrl,
+            projectId: "brand_mask_preview",
+            segmentId: segment.id,
+            sourceRange: segment.role,
+            video,
+            blockOnRed: false,
+            trackingEngine: engine,
+            tracks
+          });
+          if (!result.trace.outputVideoUrl) throw new Error("预处理完成，但未返回输出视频地址。");
+          nextResults.push(result.trace);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "物体追踪预览失败。";
+          errors.push(`${trackingEngineLabel(engine)}：${message}`);
+          if (engines.length === 1) throw error;
+        }
       }
-      if (!result.trace.outputVideoUrl) throw new Error("预处理完成，但未返回输出视频地址。");
-      onPreviewTrace?.(result.trace);
-      setTrackingPreviewUrl(result.trace.outputVideoUrl);
-      setTrackingPreviewTrace(result.trace);
-      setShowTrackingPreview(true);
+
+      if (!nextResults.length) {
+        throw new Error(errors.length ? errors.join("；") : "物体追踪预览失败。");
+      }
+
+      const selectedTrace = selectPreferredPreviewTrace(nextResults, trackingPreviewMode);
+      setTrackingPreviewResults(nextResults);
+      activateTrackingPreviewTrace(selectedTrace);
       setTrackingPreviewState("done");
+      if (errors.length) {
+        setTrackingPreviewError(`部分对比失败：${errors.join("；")}`);
+      }
     } catch (error) {
       setTrackingPreviewState("failed");
-      setTrackingPreviewError(error instanceof Error ? error.message : "CV 跟踪预览失败。");
+      setTrackingPreviewError(error instanceof Error ? error.message : "物体追踪预览失败。");
     }
   }
 
@@ -326,6 +390,10 @@ export function BrandMaskAnnotator({
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onEnded={() => setIsPlaying(false)}
+                  onError={() => {
+                    setIsPlaying(false);
+                    setTrackingPreviewError(videoLoadErrorMessage(videoRef.current?.error ?? null, isPreviewMode));
+                  }}
                 />
               ) : (
                 <div className="brand-video-missing">
@@ -387,6 +455,31 @@ export function BrandMaskAnnotator({
                   ) : "运行人脸预览"}
                 </button>
               </div>
+              <label className="mask-engine-select">
+                <span>人脸遮挡</span>
+                <select
+                  value={faceMosaicEffect}
+                  onChange={(event) => onChangeFaceMosaicEffect(event.target.value as FaceMosaicEffect)}
+                  disabled={isFacePreviewRunning}
+                >
+                  <option value="mosaic">马赛克</option>
+                  <option value="blur">高斯模糊</option>
+                  <option value="solid">色块遮挡</option>
+                </select>
+              </label>
+              <label className="mask-strength-control">
+                <span>人脸强度 {formatPercent(faceMosaicStrength)}</span>
+                <input
+                  type="range"
+                  min={0.2}
+                  max={1}
+                  step={0.05}
+                  value={faceMosaicStrength}
+                  onChange={(event) => onChangeFaceMosaicStrength(normalizeMaskStrength(event.target.value))}
+                  disabled={isFacePreviewRunning}
+                  aria-label="调整人脸打码强度"
+                />
+              </label>
               {isFacePreviewRunning && (
                 <div className="privacy-tool-progress" role="status" aria-live="polite">
                   <div className="privacy-tool-progress-head">
@@ -413,16 +506,25 @@ export function BrandMaskAnnotator({
                   <span>{preprocessSummaryText(faceTrace.summary)}</span>
                 </div>
               )}
-              {facePreviewUrl && (
-                <button
-                  className="secondary-button compact full-width"
-                  onClick={() => {
-                    setShowTrackingPreview(false);
-                    setShowFacePreview((value) => !value);
-                  }}
-                >
-                  {showFacePreview ? "返回标注" : "查看人脸结果"}
-                </button>
+              {faceTrace?.outputVideoUrl && (
+                <div className="privacy-tool-actions stacked-actions">
+                  <button
+                    className="secondary-button compact full-width"
+                    onClick={() => {
+                      setShowFacePreview((value) => !value);
+                      setShowTrackingPreview(false);
+                    }}
+                  >
+                    {showFacePreview ? "返回原视频" : "覆盖预览人脸结果"}
+                  </button>
+                  <button
+                    className="secondary-button compact full-width"
+                    onClick={() => window.open(faceTrace.outputVideoUrl, "_blank", "noopener,noreferrer")}
+                  >
+                    <ExternalLink size={14} />
+                    新窗口查看
+                  </button>
+                </div>
               )}
             </div>
 
@@ -441,6 +543,23 @@ export function BrandMaskAnnotator({
             </div>
 
             <div className="mask-preview-actions">
+              <label className="mask-engine-select">
+                <span>预览引擎</span>
+                <select
+                  value={trackingPreviewMode}
+                  onChange={(event) => setTrackingPreviewMode(event.target.value as TrackingPreviewMode)}
+                  disabled={trackingPreviewState === "running"}
+                >
+                  <option value="opencv">OpenCV 本地</option>
+                  <option value="homography">Homography 平面目标</option>
+                  <option value="vittrack">OpenCV ViTTrack</option>
+                  <option value="mixformer">MixFormerV2-S</option>
+                  <option value="ddrnet">DDRNet语义分割</option>
+                  <option value="track-anything">Track-Anything</option>
+                  <option value="mask-tracking">Mask Tracking</option>
+                  <option value="compare">多引擎对比</option>
+                </select>
+              </label>
               <button
                 className="secondary-button compact"
                 onClick={runTrackingPreview}
@@ -449,12 +568,21 @@ export function BrandMaskAnnotator({
                 {trackingPreviewState === "running" ? (
                   <>
                     <Loader2 className="spin" size={14} />
-                    CV跟踪中
+                    处理中
                   </>
-                ) : "运行CV预览"}
+                ) : `运行${trackingEngineLabel(trackingPreviewMode)}预览`}
               </button>
               {trackingPreviewUrl && (
-                <button className="secondary-button compact" onClick={() => setShowTrackingPreview((value) => !value)}>
+                <button
+                  className="secondary-button compact"
+                  onClick={() => {
+                    setShowTrackingPreview((value) => {
+                      const next = !value;
+                      if (next) setShowFacePreview(false);
+                      return next;
+                    });
+                  }}
+                >
                   {showTrackingPreview ? "返回标注" : "查看结果"}
                 </button>
               )}
@@ -464,18 +592,31 @@ export function BrandMaskAnnotator({
                 <div className="privacy-tool-progress-head">
                   <Loader2 className="spin" size={15} />
                   <div>
-                    <strong>正在执行物体追踪 CV 预览</strong>
+                    <strong>正在执行{trackingEngineLabel(trackingPreviewMode)}预览</strong>
                     <span>已耗时 {trackingPreviewElapsed} 秒，正在跟踪关键帧、生成遮罩并导出预览视频。</span>
                   </div>
                 </div>
-                <div className="privacy-progress-bar" aria-label="物体追踪 CV 预览进度">
+                <div className="privacy-progress-bar" aria-label="物体追踪预览进度">
                   <span style={{ width: `${trackingPreviewProgress}%` }} />
                 </div>
               </div>
             )}
+            {trackingPreviewResults.length > 1 && (
+              <div className="mask-result-tabs" aria-label="选择物体追踪预览结果">
+                {trackingPreviewResults.map((trace) => (
+                  <button
+                    className={trace.id === trackingPreviewTrace?.id ? "active" : ""}
+                    onClick={() => activateTrackingPreviewTrace(trace)}
+                    key={trace.id}
+                  >
+                    {trackingEngineLabel(trace.summary?.trackingEngine)}
+                  </button>
+                ))}
+              </div>
+            )}
             {trackingPreviewTrace && trackingPreviewState === "done" && (
               <div className="privacy-tool-summary done">
-                <strong>CV 预览已完成</strong>
+                <strong>{trackingEngineLabel(trackingPreviewTrace.summary?.trackingEngine)}预览已完成</strong>
                 <span>{preprocessSummaryText(trackingPreviewTrace.summary)}</span>
               </div>
             )}
@@ -508,6 +649,18 @@ export function BrandMaskAnnotator({
                           <option value="blur">模糊</option>
                         </select>
                       </label>
+                      <label className="mask-control-wide">
+                        <span>强度 {formatPercent(normalizeMaskStrength(track.strength))}</span>
+                        <input
+                          type="range"
+                          min={0.2}
+                          max={1}
+                          step={0.05}
+                          value={normalizeMaskStrength(track.strength)}
+                          onChange={(event) => updateTrack(track.id, { strength: normalizeMaskStrength(event.target.value) })}
+                          aria-label={`${track.label} 打码强度`}
+                        />
+                      </label>
                       <label>
                         <span>跟踪</span>
                         <select value={track.trackMode} onChange={(event) => updateTrack(track.id, { trackMode: event.target.value as BrandMaskTrackMode })}>
@@ -516,6 +669,14 @@ export function BrandMaskAnnotator({
                           <option value="interpolate">关键帧插值</option>
                           <option value="static">静态遮罩</option>
                           <option value="manual">仅手动帧</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>尺寸</span>
+                        <select value={track.scaleMode ?? "locked"} onChange={(event) => updateTrack(track.id, { scaleMode: event.target.value as BrandMaskScaleMode })}>
+                          <option value="locked">锁定尺寸</option>
+                          <option value="slow-zoom">慢速变焦</option>
+                          <option value="free">自由缩放</option>
                         </select>
                       </label>
                       <label>
@@ -563,7 +724,7 @@ export function BrandMaskAnnotator({
 
             <div className="mask-usage-note">
               <strong>使用顺序</strong>
-              <span>1. 新增追踪目标  2. 在首帧框住要遮挡的物体  3. 拖到漂移处补关键帧  4. 运行 CV 预览确认。默认小边距，中心重、边缘轻。</span>
+              <span>1. 新增追踪目标  2. 在首帧框住要遮挡的物体  3. 拖到漂移处补关键帧  4. 运行预览确认。默认小边距，整块同强度打码。</span>
             </div>
 
             <div className="mask-review-list">
@@ -805,6 +966,30 @@ function formatPercent(value: number) {
   return `${Math.round(value * 100)}%`;
 }
 
+function selectPreferredPreviewTrace(results: VideoPreprocessTrace[], mode: TrackingPreviewMode) {
+  if (mode !== "compare") {
+    return results.find((trace) => trace.summary?.trackingEngine === mode) ?? results[0];
+  }
+  return results.find((trace) => trace.summary?.trackingEngine === "mask-tracking") ??
+    results.find((trace) => trace.summary?.trackingEngine === "ddrnet") ??
+    results.find((trace) => trace.summary?.trackingEngine === "homography") ??
+    results.find((trace) => trace.summary?.trackingEngine === "track-anything") ??
+    results.find((trace) => trace.summary?.trackingEngine === "mixformer") ??
+    results.find((trace) => trace.summary?.trackingEngine === "vittrack") ??
+    results[0];
+}
+
+function trackingEngineLabel(engine?: BrandMaskTrackingEngine | TrackingPreviewMode) {
+  if (engine === "mask-tracking") return "Mask Tracking";
+  if (engine === "track-anything") return "Track-Anything";
+  if (engine === "mixformer") return "MixFormerV2-S";
+  if (engine === "ddrnet") return "DDRNet语义分割";
+  if (engine === "vittrack") return "ViTTrack";
+  if (engine === "homography") return "Homography";
+  if (engine === "compare") return "多引擎对比";
+  return "OpenCV本地";
+}
+
 function preprocessStatusLabel(status: string) {
   if (status === "done") return "已完成";
   if (status === "running") return "处理中";
@@ -818,10 +1003,13 @@ function preprocessSummaryText(summary?: VideoPreprocessTrace["summary"]) {
   const extendedSummary = summary as VideoPreprocessTrace["summary"] & { frames?: number; sourceFrameCount?: number };
   const frameCount = summary.frameCount ?? extendedSummary.frames ?? extendedSummary.sourceFrameCount;
   const parts = [
+    summary.trackingEngine ? trackingEngineLabel(summary.trackingEngine) : "",
     frameCount !== undefined ? `${frameCount}帧` : "",
     summary.durationSec !== undefined ? `${summary.durationSec.toFixed(2)}秒素材` : "",
+    summary.recoveredFrames !== undefined ? `找回${summary.recoveredFrames}帧` : "",
     summary.skippedLowConfidenceFrames !== undefined ? `跳过低置信${summary.skippedLowConfidenceFrames}帧` : "",
     summary.skippedScaleFrames !== undefined ? `跳过尺度异常${summary.skippedScaleFrames}帧` : "",
+    summary.skippedTrackingFrames !== undefined ? `跳过追踪异常${summary.skippedTrackingFrames}帧` : "",
     summary.elapsedSec !== undefined ? `耗时${summary.elapsedSec.toFixed(2)}秒` : ""
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : "暂无处理统计";
@@ -829,4 +1017,25 @@ function preprocessSummaryText(summary?: VideoPreprocessTrace["summary"]) {
 
 function formatTime(value: number) {
   return `${value.toFixed(2)}s`;
+}
+
+function videoPlaybackErrorMessage(error: unknown, isPreviewMode: boolean) {
+  const target = isPreviewMode ? "预处理结果视频" : "原素材视频";
+  const detail = error instanceof Error && error.message ? `：${error.message}` : "。";
+  return `${target}无法播放${detail}`;
+}
+
+function videoLoadErrorMessage(error: MediaError | null, isPreviewMode: boolean) {
+  const target = isPreviewMode ? "预处理结果视频" : "原素材视频";
+  if (!error) {
+    return `${target}加载失败，请检查视频文件或重新运行预览。`;
+  }
+  const reasonByCode: Record<number, string> = {
+    [MediaError.MEDIA_ERR_ABORTED]: "加载被中断",
+    [MediaError.MEDIA_ERR_NETWORK]: "网络或本地服务不可达",
+    [MediaError.MEDIA_ERR_DECODE]: "视频解码失败",
+    [MediaError.MEDIA_ERR_SRC_NOT_SUPPORTED]: "视频地址不存在或格式不受浏览器支持"
+  };
+  const reason = reasonByCode[error.code] || "未知媒体错误";
+  return `${target}加载失败：${reason}。请检查 Bridge URL、输出文件是否存在，或重新运行预览。`;
 }

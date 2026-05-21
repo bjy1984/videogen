@@ -12,6 +12,7 @@ export interface GenerationJobInput {
   duration: number;
   aspectRatio: "9:16" | "16:9" | "1:1";
   referenceImageUrl?: string;
+  referenceImageFile?: File;
   sourceVideoUrl?: string;
   sourceVideoLocalPath?: string;
   sourceVideoName?: string;

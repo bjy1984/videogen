@@ -12,9 +12,10 @@ import {
   preprocessBrandMaskBridge,
   preprocessFaceMosaicBridge,
   syncComfyUIBridgeAsset,
-  syncSeedanceBridgeAsset
+  syncSeedanceBridgeAsset,
+  uploadVideoGenerationBridgeAsset
 } from "../../services/videoGenerationBridgeClient";
-import { extractComfyUITaskError, mapComfyUITaskStatus, selectBestComfyUIOutputFile } from "./providers/comfyuiApi";
+import { extractComfyUITaskError, mapComfyUITaskStatus, selectComfyUIOutputFileForNode } from "./providers/comfyuiApi";
 import { extractSeedanceTaskError, mapSeedanceTaskStatus } from "./providers/seedanceArk";
 import { buildBrandMaskReview } from "../privacy/brandMaskReview";
 import { hasSegmentBrandMasks, hasSegmentFaceMosaic } from "../script/privacyEdits";
@@ -48,6 +49,7 @@ export async function generateRemixBuckets(input: {
         duration: item.duration,
         aspectRatio: input.options.aspectRatio,
         referenceImageUrl: segment?.referenceImageUrl,
+        referenceImageFile: segment?.referenceImageFile,
         sourceVideoName: input.sourceVideo?.name,
         providerParams
       };
@@ -63,10 +65,18 @@ export async function generateRemixBuckets(input: {
         return createFailedPreprocessJob(jobInput, prepared.error, prepared.traces);
       }
       const finalTrace = prepared.traces[prepared.traces.length - 1];
+      const providerInput = await prepareProviderInputAssets({
+        jobInput,
+        providerId: input.options.provider,
+        providerSettings: input.providerSettings,
+        projectId: input.projectId,
+        sourceVideo: input.sourceVideo,
+        sourceVideoUrl: finalTrace?.outputVideoUrl,
+        sourceVideoLocalPath: finalTrace?.localPath
+      });
       return provider.createJob({
         ...jobInput,
-        sourceVideoUrl: finalTrace?.outputVideoUrl,
-        sourceVideoLocalPath: finalTrace?.localPath,
+        ...providerInput,
         preprocessingTrace: finalTrace,
         preprocessingTraces: prepared.traces
       });
@@ -118,6 +128,7 @@ export async function regenerateRemixAsset(input: {
     duration,
     aspectRatio: input.options.aspectRatio,
     referenceImageUrl: segment?.referenceImageUrl || asset.referenceImageUrl,
+    referenceImageFile: segment?.referenceImageFile,
     sourceVideoName: input.sourceVideo?.name,
     providerParams
   };
@@ -130,12 +141,22 @@ export async function regenerateRemixAsset(input: {
     sourcePreviewUrl: input.sourcePreviewUrl
   });
   const finalTrace = prepared.traces[prepared.traces.length - 1];
+  const providerInput = prepared.error
+    ? jobInput
+    : await prepareProviderInputAssets({
+        jobInput,
+        providerId: input.options.provider,
+        providerSettings: input.providerSettings,
+        projectId: input.projectId,
+        sourceVideo: input.sourceVideo,
+        sourceVideoUrl: finalTrace?.outputVideoUrl,
+        sourceVideoLocalPath: finalTrace?.localPath
+      });
   const job = prepared.error
     ? createFailedPreprocessJob(jobInput, prepared.error, prepared.traces)
     : await provider.createJob({
         ...jobInput,
-        sourceVideoUrl: finalTrace?.outputVideoUrl,
-        sourceVideoLocalPath: finalTrace?.localPath,
+        ...providerInput,
         preprocessingTrace: finalTrace,
         preprocessingTraces: prepared.traces
       });
@@ -264,6 +285,8 @@ async function prepareSourcePreprocess(input: {
         projectId: input.projectId || "default_project",
         segmentId: input.segment.id,
         sourceRange: input.segment.role,
+        effect: input.segment.privacyEdits?.faceMosaicEffect ?? "mosaic",
+        strength: input.segment.privacyEdits?.faceMosaicStrength ?? 0.85,
         video: input.sourceVideo
       });
       traces.push(result.trace);
@@ -295,6 +318,60 @@ function bridgeUrlForProvider(providerId: Provider, providerSettings: ProviderSe
   if (providerId === "comfyui") return providerSettings.comfyui.bridgeUrl;
   if (providerId === "seedance") return providerSettings.seedance.bridgeUrl;
   return undefined;
+}
+
+async function prepareProviderInputAssets(input: {
+  jobInput: GenerationJobInput;
+  providerId: Provider;
+  providerSettings: ProviderSettings;
+  projectId?: string;
+  sourceVideo?: File;
+  sourceVideoUrl?: string;
+  sourceVideoLocalPath?: string;
+}): Promise<Partial<GenerationJobInput>> {
+  if (input.providerId !== "comfyui") {
+    return {
+      sourceVideoUrl: input.sourceVideoUrl,
+      sourceVideoLocalPath: input.sourceVideoLocalPath
+    };
+  }
+
+  const bridgeUrl = input.providerSettings.comfyui.bridgeUrl;
+  const projectId = input.projectId || "default_project";
+  let sourceVideoUrl = input.sourceVideoUrl;
+  let sourceVideoLocalPath = input.sourceVideoLocalPath;
+  let referenceImageUrl = input.jobInput.referenceImageUrl;
+
+  if (!sourceVideoUrl && input.sourceVideo) {
+    const uploaded = await uploadVideoGenerationBridgeAsset({
+      bridgeUrl,
+      projectId,
+      segmentId: input.jobInput.segmentId,
+      kind: "source-video",
+      file: input.sourceVideo
+    });
+    sourceVideoUrl = uploaded.asset.localAssetUrl;
+    sourceVideoLocalPath = uploaded.asset.localPath;
+  }
+
+  if (input.jobInput.referenceImageFile) {
+    const uploaded = await uploadVideoGenerationBridgeAsset({
+      bridgeUrl,
+      projectId,
+      segmentId: input.jobInput.segmentId,
+      kind: "reference-image",
+      file: input.jobInput.referenceImageFile
+    });
+    referenceImageUrl = uploaded.asset.localAssetUrl;
+  } else if (referenceImageUrl?.startsWith("blob:")) {
+    referenceImageUrl = undefined;
+  }
+
+  return {
+    sourceVideoUrl,
+    sourceVideoLocalPath,
+    referenceImageUrl
+  };
 }
 
 function createFailedPreprocessJob(
@@ -439,7 +516,7 @@ export async function refreshComfyUIMaterialBuckets(input: {
             if (jobStatus === "failed") failedCount += 1;
             const assetStatus: RemixAsset["status"] =
               jobStatus === "done" ? "ready" : jobStatus === "failed" ? "failed" : "generating";
-            const output = selectBestComfyUIOutputFile(task.outputFiles, input.providerSettings.comfyui.outputNodeId);
+            const output = selectComfyUIOutputFileForNode(task.outputFiles, input.providerSettings.comfyui.outputNodeId);
             const synced = assetStatus === "ready" && input.syncAssets !== false
               ? await syncReadyComfyUIAsset({
                   bridgeUrl: input.providerSettings.comfyui.bridgeUrl,
@@ -447,7 +524,8 @@ export async function refreshComfyUIMaterialBuckets(input: {
                   outputNodeId: input.providerSettings.comfyui.outputNodeId,
                   taskId: asset.providerTrace.remoteJobId,
                   projectId: input.projectId || "default_project",
-                  assetId: asset.id
+                  assetId: asset.id,
+                  targetDuration: asset.duration
                 })
               : null;
             return {
@@ -521,6 +599,7 @@ async function syncReadyComfyUIAsset(input: {
   taskId: string;
   projectId: string;
   assetId: string;
+  targetDuration?: number;
 }) {
   try {
     return await syncComfyUIBridgeAsset(input);

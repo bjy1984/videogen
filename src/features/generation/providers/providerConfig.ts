@@ -49,7 +49,8 @@ export const defaultProviderSettings: ProviderSettings = {
     outputNodeId: "",
     seed: "-1",
     steps: 24,
-    cfgScale: 7
+    cfgScale: 7,
+    ollamaModel: ""
   },
   seedance: {
     bridgeUrl: DEFAULT_SEEDANCE_BRIDGE_URL,
@@ -66,11 +67,27 @@ export const defaultProviderSettings: ProviderSettings = {
 };
 
 export function mergeProviderSettings(settings?: Partial<ProviderSettings>): ProviderSettings {
+  const comfyui = { ...defaultProviderSettings.comfyui, ...settings?.comfyui };
+  const seedance = { ...defaultProviderSettings.seedance, ...settings?.seedance };
   return {
     mock: { ...defaultProviderSettings.mock, ...settings?.mock },
-    comfyui: { ...defaultProviderSettings.comfyui, ...settings?.comfyui },
-    seedance: { ...defaultProviderSettings.seedance, ...settings?.seedance }
+    comfyui: {
+      ...comfyui,
+      bridgeUrl: normalizeSavedBridgeUrl(comfyui.bridgeUrl, DEFAULT_COMFYUI_BRIDGE_URL)
+    },
+    seedance: {
+      ...seedance,
+      bridgeUrl: normalizeSavedBridgeUrl(seedance.bridgeUrl, DEFAULT_SEEDANCE_BRIDGE_URL)
+    }
   };
+}
+
+function normalizeSavedBridgeUrl(value: string, fallback: string) {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === "http://localhost:8788" || trimmed === "http://127.0.0.1:8788") {
+    return fallback;
+  }
+  return trimmed;
 }
 
 export function providerParamsFor(providerId: string, settings: ProviderSettings): Record<string, unknown> {

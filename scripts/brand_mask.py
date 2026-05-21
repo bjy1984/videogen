@@ -28,6 +28,10 @@ MIN_ANCHOR_AREA_RATIO = 0.28
 MAX_ANCHOR_AREA_RATIO = 2.35
 MAX_ASPECT_RATIO_CHANGE = 1.75
 MAX_CENTER_SHIFT = 0.22
+MIN_RECOVERY_SCORE = 0.5
+MAX_FRAME_SCALE_STEP = 0.08
+SIZE_SMOOTHING = 0.82
+CENTER_SMOOTHING = 0.35
 
 
 @dataclass
@@ -44,7 +48,9 @@ class TrackSpec:
     label: str
     target_type: str
     effect: str
+    strength: float
     track_mode: str
+    scale_mode: str
     expand_ratio: float
     confidence_threshold: float
     keyframes: list[Keyframe]
@@ -56,7 +62,11 @@ class TrackState:
     previous_gray: np.ndarray | None = None
     anchor_gray: np.ndarray | None = None
     anchor_rect: Rect | None = None
+    previous_hist: np.ndarray | None = None
+    anchor_hist: np.ndarray | None = None
     tracker: Any | None = None
+    lost_count: int = 0
+    last_source: str = "manual"
 
 
 @dataclass
@@ -69,6 +79,27 @@ class FrameIssue:
     confidence: float | None = None
 
 
+@dataclass
+class TrackingCandidate:
+    rect: Rect
+    confidence: float
+    source: str
+    raw_score: float
+    color_similarity: float
+    path_similarity: float = 0.0
+    consensus: float = 0.0
+    recovered: bool = False
+
+
+@dataclass
+class TrackingDecision:
+    rect: Rect | None
+    confidence: float | None = None
+    reject_reason: str | None = None
+    source: str = "none"
+    recovered: bool = False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Apply user-guided brand/logo/text masks frame-by-frame.")
     parser.add_argument("--input", required=True, help="Input video path.")
@@ -79,7 +110,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block", type=int, default=20, help="Mosaic block size.")
     parser.add_argument("--blur", type=int, default=51, help="Gaussian blur kernel size.")
     parser.add_argument("--solid-color", default="0,0,0", help="BGR solid fill color.")
-    parser.add_argument("--edge-strength", type=float, default=0.55, help="Mask opacity at the rectangle edge; center stays fully masked.")
+    parser.add_argument("--edge-strength", type=float, default=1.0, help="Deprecated; masks are applied at full strength.")
     parser.add_argument("--block-on-red", action="store_true", help="Exit non-zero if any red issue is produced.")
     parser.add_argument("--keep-temp", action="store_true")
     return parser.parse_args()
@@ -133,6 +164,8 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
     masked_frames = 0
     skipped_low_confidence_frames: set[int] = set()
     skipped_scale_frames: set[int] = set()
+    skipped_tracking_frames: set[int] = set()
+    recovered_frames: set[int] = set()
     started_at = time.time()
     solid_color = parse_solid_color(args.solid_color)
 
@@ -148,24 +181,29 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
 
             for track in tracks:
                 previous_state = states.get(track.id)
-                rect, confidence, reject_reason = resolve_track_rect(track, previous_state, frame, gray, processed_frames, frame_time)
-                if reject_reason:
-                    skipped_scale_frames.add(processed_frames)
+                decision = resolve_track_rect(track, previous_state, frame, gray, processed_frames, frame_time)
+                if decision.reject_reason:
+                    skipped_tracking_frames.add(processed_frames)
+                    if is_scale_rejection(decision.reject_reason):
+                        skipped_scale_frames.add(processed_frames)
                     issues.append(
                         FrameIssue(
                             track_id=track.id,
                             frame_index=processed_frames,
                             time=round(frame_time, 3),
                             severity="error",
-                            reason=f"{track.label} {reject_reason}，已跳过该帧。",
-                            confidence=round(confidence, 3) if confidence is not None else None,
+                            reason=f"{track.label} {decision.reject_reason}，已跳过该帧。",
+                            confidence=round(decision.confidence, 3) if decision.confidence is not None else None,
                         )
                     )
+                    mark_track_lost(states, track, previous_state)
                     continue
+                rect = decision.rect
                 if rect is None:
+                    mark_track_lost(states, track, previous_state)
                     continue
                 exact = exact_keyframe(track, processed_frames, frame_time)
-                if confidence is not None and confidence < track.confidence_threshold:
+                if decision.confidence is not None and decision.confidence < track.confidence_threshold:
                     skipped_low_confidence_frames.add(processed_frames)
                     issues.append(
                         FrameIssue(
@@ -174,18 +212,28 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
                             time=round(frame_time, 3),
                             severity="error",
                             reason=f"{track.label} 追踪置信度不足，已跳过该帧。",
-                            confidence=round(confidence, 3),
+                            confidence=round(decision.confidence, 3),
                         )
                     )
                     if not exact:
+                        mark_track_lost(states, track, previous_state)
                         continue
-                apply_mask(output, expand_rect(rect, track.expand_ratio), track.effect, args.block, args.blur, solid_color, args.edge_strength)
+                if previous_state and not exact:
+                    rect = stabilize_rect(rect, previous_state.rect, decision.confidence, track.scale_mode, previous_state.anchor_rect)
+                apply_track_mask(output, expand_rect(rect, track.expand_ratio), track, args.block, args.blur, solid_color)
+                if decision.recovered:
+                    recovered_frames.add(processed_frames)
+                current_hist = color_hist(frame, rect)
                 states[track.id] = TrackState(
                     rect=rect,
                     previous_gray=gray,
                     anchor_gray=gray if exact else previous_state.anchor_gray if previous_state else gray,
                     anchor_rect=rect if exact else previous_state.anchor_rect if previous_state else rect,
+                    previous_hist=current_hist,
+                    anchor_hist=current_hist if exact else previous_state.anchor_hist if previous_state and previous_state.anchor_hist is not None else current_hist,
                     tracker=create_cv_tracker(frame, rect) if exact or not previous_state or previous_state.tracker is None else previous_state.tracker,
+                    lost_count=0,
+                    last_source=decision.source,
                 )
                 frame_masked = True
 
@@ -208,6 +256,8 @@ def process_video(input_path: Path, output_path: Path, spec_path: Path, args: ar
         "maskedFrames": masked_frames,
         "skippedLowConfidenceFrames": len(skipped_low_confidence_frames),
         "skippedScaleFrames": len(skipped_scale_frames),
+        "skippedTrackingFrames": len(skipped_tracking_frames),
+        "recoveredFrames": len(recovered_frames),
         "trackCount": len(tracks),
         "manualKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "manual"),
         "correctedKeyframes": sum(1 for track in tracks for keyframe in track.keyframes if keyframe.source == "correction"),
@@ -240,7 +290,9 @@ def parse_tracks(spec: Any, fps: float) -> list[TrackSpec]:
                 label=str(raw.get("label") or f"Mask {len(tracks) + 1}"),
                 target_type=str(raw.get("targetType") or "logo"),
                 effect=str(raw.get("effect") or ("solid" if raw.get("targetType") == "text" else "mosaic")),
+                strength=normalize_mask_strength(raw.get("strength")),
                 track_mode=str(raw.get("trackMode") or "planar"),
+                scale_mode=parse_scale_mode(raw.get("scaleMode")),
                 expand_ratio=clamp_float(
                     float(raw.get("expandRatio") if raw.get("expandRatio") is not None else DEFAULT_EXPAND_RATIO),
                     0.0,
@@ -251,6 +303,20 @@ def parse_tracks(spec: Any, fps: float) -> list[TrackSpec]:
             )
         )
     return tracks
+
+
+def parse_scale_mode(value: Any) -> str:
+    if value in {"locked", "slow-zoom", "free"}:
+        return str(value)
+    return "locked"
+
+
+def normalize_mask_strength(value: Any, fallback: float = 0.85) -> float:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        numeric = fallback
+    return clamp_float(numeric, 0.2, 1.0)
 
 
 def parse_keyframes(raw_keyframes: Any, fps: float) -> list[Keyframe]:
@@ -288,69 +354,293 @@ def resolve_track_rect(
     gray: np.ndarray,
     frame_index: int,
     frame_time: float,
-) -> tuple[Rect | None, float | None, str | None]:
+) -> TrackingDecision:
     exact = exact_keyframe(track, frame_index, frame_time)
     if exact:
-        return exact.rect, 1.0, None
+        return TrackingDecision(rect=exact.rect, confidence=1.0, source="manual")
 
     if track.track_mode == "manual":
-        return None, None, None
+        return TrackingDecision(rect=None)
 
     if track.track_mode == "static":
-        return nearest_track_rect(track, frame_index), 1.0, None
+        return TrackingDecision(rect=nearest_track_rect(track, frame_index), confidence=1.0, source="static")
 
     interpolated = interpolate_rect(track, frame_index)
     if track.track_mode == "interpolate":
-        return interpolated or nearest_track_rect(track, frame_index), 0.9, None
+        return TrackingDecision(rect=interpolated or nearest_track_rect(track, frame_index), confidence=0.9, source="interpolate")
 
+    candidates: list[TrackingCandidate] = []
     reject_reason = None
     reject_score = 0.0
     if state and state.previous_gray is not None:
-        tracked, score, reason = track_with_cv_tracker(state.tracker, frame, state.rect)
-        if tracked is not None:
-            anchored, anchor_reason = validate_anchor_scale(tracked, state.anchor_rect)
-            if anchored is not None:
-                return anchored, score, None
-            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
-        else:
-            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
-
         anchor_gray = state.anchor_gray if state.anchor_gray is not None else state.previous_gray
         anchor_rect = state.anchor_rect if state.anchor_rect is not None else state.rect
-        if track.track_mode == "planar":
-            tracked, score, reason = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
-            if tracked is not None and score >= track.confidence_threshold * 0.75:
-                anchored, anchor_reason = validate_anchor_scale(tracked, anchor_rect)
-                if anchored is not None:
-                    return anchored, score, None
-                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
-            else:
-                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+        min_method_score = track.confidence_threshold * 0.55
 
+        tracked, score, reason = track_with_cv_tracker(state.tracker, frame, state.rect)
+        candidate, reject_reason, reject_score = build_candidate_or_reject(
+            "tracker",
+            tracked,
+            score,
+            reason,
+            frame,
+            state,
+            anchor_rect,
+            reject_reason,
+            reject_score,
+            interpolated,
+        )
+        if candidate:
+            candidates.append(candidate)
+
+        local_template = track_with_template(
+            anchor_gray,
+            gray,
+            anchor_rect,
+            state.rect,
+            search_pad=0.95,
+            scales=(0.86, 0.92, 1.0, 1.08, 1.16),
+        )
+        candidate, reject_reason, reject_score = build_candidate_or_reject(
+            "template",
+            *local_template,
+            frame,
+            state,
+            anchor_rect,
+            reject_reason,
+            reject_score,
+            interpolated,
+        )
+        if candidate:
+            candidates.append(candidate)
+
+        if track.track_mode == "planar":
             tracked, score, reason = track_with_lk(state.previous_gray, gray, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
+            candidate, reject_reason, reject_score = build_candidate_or_reject(
+                "lk",
+                tracked,
+                score,
+                reason,
+                frame,
+                state,
+                anchor_rect,
+                reject_reason,
+                reject_score,
+                interpolated,
+            )
+            if candidate:
+                candidates.append(candidate)
+            if tracked is None or score < min_method_score:
                 reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
                 tracked, score, reason = track_with_features(state.previous_gray, gray, state.rect)
+            candidate, reject_reason, reject_score = build_candidate_or_reject(
+                "features",
+                tracked,
+                score,
+                reason,
+                frame,
+                state,
+                anchor_rect,
+                reject_reason,
+                reject_score,
+                interpolated,
+            )
+            if candidate:
+                candidates.append(candidate)
         else:
-            tracked, score, reason = track_with_template(anchor_gray, gray, anchor_rect, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
-                reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
-                tracked, score, reason = track_with_lk(state.previous_gray, gray, state.rect)
-            if tracked is None or score < track.confidence_threshold * 0.75:
+            tracked, score, reason = track_with_lk(state.previous_gray, gray, state.rect)
+            candidate, reject_reason, reject_score = build_candidate_or_reject(
+                "lk",
+                tracked,
+                score,
+                reason,
+                frame,
+                state,
+                anchor_rect,
+                reject_reason,
+                reject_score,
+                interpolated,
+            )
+            if candidate:
+                candidates.append(candidate)
+            if tracked is None or score < min_method_score:
                 reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
                 tracked, score, reason = track_with_features(state.previous_gray, gray, state.rect)
-        if tracked is not None:
-            anchored, anchor_reason = validate_anchor_scale(tracked, anchor_rect)
-            if anchored is not None:
-                return anchored, score, None
-            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, anchor_reason, score)
-        else:
-            reject_reason, reject_score = remember_rejection(reject_reason, reject_score, reason, score)
+                candidate, reject_reason, reject_score = build_candidate_or_reject(
+                    "features",
+                    tracked,
+                    score,
+                    reason,
+                    frame,
+                    state,
+                    anchor_rect,
+                    reject_reason,
+                    reject_score,
+                    interpolated,
+                )
+                if candidate:
+                    candidates.append(candidate)
+
+        best = select_tracking_candidate(candidates)
+        if should_try_recovery(best, track, state):
+            recovery = recover_track_candidates(track, state, frame, gray, anchor_gray, anchor_rect, frame_index)
+            if recovery:
+                candidates.extend(recovery)
+                best = select_tracking_candidate(candidates)
+        if best:
+            return TrackingDecision(
+                rect=best.rect,
+                confidence=best.confidence,
+                source=best.source,
+                recovered=best.recovered or state.lost_count > 0,
+            )
 
     if reject_reason:
-        return None, reject_score, reject_reason
+        return TrackingDecision(rect=None, confidence=reject_score, reject_reason=reject_reason)
 
-    return interpolated or nearest_track_rect(track, frame_index), 0.5 if interpolated else 0.35, None
+    return TrackingDecision(
+        rect=interpolated or nearest_track_rect(track, frame_index),
+        confidence=0.5 if interpolated else 0.35,
+        source="fallback-interpolate" if interpolated else "fallback-nearest",
+    )
+
+
+def build_candidate_or_reject(
+    source: str,
+    rect: Rect | None,
+    raw_score: float,
+    reason: str | None,
+    frame: np.ndarray,
+    state: TrackState,
+    anchor_rect: Rect,
+    current_reject_reason: str | None,
+    current_reject_score: float,
+    expected_rect: Rect | None = None,
+    recovered: bool = False,
+) -> tuple[TrackingCandidate | None, str | None, float]:
+    if rect is None:
+        reject_reason, reject_score = remember_rejection(current_reject_reason, current_reject_score, reason, raw_score)
+        return None, reject_reason, reject_score
+    anchored, anchor_reason = validate_anchor_scale(rect, anchor_rect)
+    if anchored is None:
+        reject_reason, reject_score = remember_rejection(current_reject_reason, current_reject_score, anchor_reason, raw_score)
+        return None, reject_reason, reject_score
+    candidate = score_tracking_candidate(source, anchored, raw_score, frame, state, anchor_rect, expected_rect, recovered)
+    return candidate, current_reject_reason, current_reject_score
+
+
+def score_tracking_candidate(
+    source: str,
+    rect: Rect,
+    raw_score: float,
+    frame: np.ndarray,
+    state: TrackState,
+    anchor_rect: Rect,
+    expected_rect: Rect | None = None,
+    recovered: bool = False,
+) -> TrackingCandidate:
+    raw = clamp_float(raw_score, 0.0, 1.0)
+    color = color_similarity_for_rect(frame, rect, state)
+    motion = max(rect_iou(rect, state.rect), 1.0 - min(1.0, center_distance(rect, state.rect) / max(0.001, MAX_CENTER_SHIFT)))
+    area = max(area_similarity_score(rect, state.rect), area_similarity_score(rect, anchor_rect) * 0.9)
+    aspect = max(aspect_similarity_score(rect, state.rect), aspect_similarity_score(rect, anchor_rect) * 0.9)
+    path = rect_iou(rect, expected_rect) if expected_rect is not None else 0.72
+    source_bias = {
+        "template": 0.04,
+        "features": 0.03,
+        "lk": 0.01,
+        "tracker": -0.04,
+        "recover-local": 0.0,
+        "recover-anchor": -0.02,
+        "recover-interpolate": 0.0,
+    }.get(source, 0.0)
+    confidence = 0.32 * raw + 0.22 * color + 0.15 * motion + 0.13 * area + 0.09 * aspect + 0.09 * path + source_bias
+    if recovered:
+        confidence -= 0.03
+    return TrackingCandidate(
+        rect=rect,
+        confidence=clamp_float(confidence, 0.0, 1.0),
+        source=source,
+        raw_score=raw,
+        color_similarity=color,
+        path_similarity=path,
+        recovered=recovered,
+    )
+
+
+def select_tracking_candidate(candidates: list[TrackingCandidate]) -> TrackingCandidate | None:
+    if not candidates:
+        return None
+    for candidate in candidates:
+        candidate.consensus = candidate_consensus(candidate, candidates)
+        source_agreement = 1.0 if any(other.source != candidate.source and rect_iou(candidate.rect, other.rect) >= 0.45 for other in candidates) else 0.0
+        consensus_boost = 0.07 * candidate.consensus + 0.03 * source_agreement
+        isolated_penalty = 0.05 if len(candidates) > 1 and candidate.consensus < 0.18 and candidate.raw_score < 0.72 else 0.0
+        candidate.confidence = clamp_float(candidate.confidence + consensus_boost - isolated_penalty, 0.0, 1.0)
+    return max(candidates, key=lambda item: item.confidence)
+
+
+def candidate_consensus(candidate: TrackingCandidate, candidates: list[TrackingCandidate]) -> float:
+    peers = [other for other in candidates if other is not candidate]
+    if not peers:
+        return 0.0
+    return max(rect_iou(candidate.rect, other.rect) for other in peers)
+
+
+def should_try_recovery(candidate: TrackingCandidate | None, track: TrackSpec, state: TrackState) -> bool:
+    if state.lost_count > 0:
+        return True
+    if candidate is None:
+        return True
+    return candidate.confidence < max(MIN_RECOVERY_SCORE, track.confidence_threshold * 0.9)
+
+
+def recover_track_candidates(
+    track: TrackSpec,
+    state: TrackState,
+    frame: np.ndarray,
+    gray: np.ndarray,
+    anchor_gray: np.ndarray,
+    anchor_rect: Rect,
+    frame_index: int,
+) -> list[TrackingCandidate]:
+    candidates: list[TrackingCandidate] = []
+    search_rects = [state.rect, anchor_rect]
+    interpolated = interpolate_rect(track, frame_index)
+    if interpolated:
+        search_rects.append(interpolated)
+    seen = set()
+    for index, search_rect in enumerate(search_rects):
+        key = tuple(round(value, 4) for value in search_rect)
+        if key in seen:
+            continue
+        seen.add(key)
+        source = "recover-interpolate" if interpolated and search_rect == interpolated else "recover-anchor" if index == 1 else "recover-local"
+        search_pad = 1.45 + min(1.2, state.lost_count * 0.22)
+        rect, score, reason = track_with_template(
+            anchor_gray,
+            gray,
+            anchor_rect,
+            search_rect,
+            search_pad=search_pad,
+            scales=(0.72, 0.82, 0.92, 1.0, 1.1, 1.22, 1.36),
+        )
+        candidate, _, _ = build_candidate_or_reject(
+            source,
+            rect,
+            score,
+            reason,
+            frame,
+            state,
+            anchor_rect,
+            None,
+            0.0,
+            recovered=True,
+        )
+        if candidate and candidate.confidence >= MIN_RECOVERY_SCORE:
+            candidates.append(candidate)
+    return candidates
+
 
 def exact_keyframe(track: TrackSpec, frame_index: int, frame_time: float) -> Keyframe | None:
     for keyframe in track.keyframes:
@@ -441,8 +731,13 @@ def track_with_lk(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tupl
     next_points, status, _ = cv2.calcOpticalFlowPyrLK(previous, current, points, None)
     if next_points is None or status is None:
         return None, 0.0, None
-    good_prev = points[status.reshape(-1) == 1]
-    good_next = next_points[status.reshape(-1) == 1]
+    back_points, back_status, _ = cv2.calcOpticalFlowPyrLK(current, previous, next_points, None)
+    if back_points is None or back_status is None:
+        return None, 0.0, None
+    fb_error = np.linalg.norm(points.reshape(-1, 2) - back_points.reshape(-1, 2), axis=1)
+    valid = (status.reshape(-1) == 1) & (back_status.reshape(-1) == 1) & (fb_error <= 2.8)
+    good_prev = points[valid]
+    good_next = next_points[valid]
     if len(good_prev) < 4:
         return None, 0.0, None
     matrix, inliers = cv2.estimateAffinePartial2D(good_prev, good_next, method=cv2.RANSAC, ransacReprojThreshold=4.0)
@@ -451,7 +746,9 @@ def track_with_lk(previous: np.ndarray, current: np.ndarray, rect: Rect) -> tupl
     corners = np.float32([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]).reshape(-1, 1, 2)
     transformed = cv2.transform(corners, matrix).reshape(-1, 2)
     next_rect = pixels_to_rect(points_to_bbox(transformed), current.shape[1], current.shape[0])
-    score = float(np.count_nonzero(inliers)) / max(1, len(good_prev))
+    inlier_ratio = float(np.count_nonzero(inliers)) / max(1, len(good_prev))
+    fb_score = 1.0 - min(1.0, float(np.median(fb_error[valid])) / 2.8)
+    score = inlier_ratio * (0.72 + 0.28 * fb_score)
     validated, reason = validate_tracked_rect(next_rect, rect)
     return validated, score if validated is not None else 0.0, reason
 
@@ -483,10 +780,17 @@ def track_with_cv_tracker(tracker: Any | None, current: np.ndarray, previous_rec
     return validated, 0.76 if validated is not None else 0.0, reason
 
 
-def track_with_template(template_frame: np.ndarray, current: np.ndarray, template_rect: Rect, search_rect: Rect | None = None) -> tuple[Rect | None, float, str | None]:
+def track_with_template(
+    template_frame: np.ndarray,
+    current: np.ndarray,
+    template_rect: Rect,
+    search_rect: Rect | None = None,
+    search_pad: float = 0.9,
+    scales: tuple[float, ...] = (0.94, 1.0, 1.06),
+) -> tuple[Rect | None, float, str | None]:
     search_rect = search_rect or template_rect
     template_crop, template_offset = crop_from_rect(template_frame, template_rect, pad=0.08)
-    search_crop, search_offset = crop_from_rect(current, search_rect, pad=0.9)
+    search_crop, search_offset = crop_from_rect(current, search_rect, pad=search_pad)
     if template_crop.size == 0 or search_crop.size == 0:
         return None, 0.0, None
     if template_crop.shape[0] < 10 or template_crop.shape[1] < 10:
@@ -511,7 +815,7 @@ def track_with_template(template_frame: np.ndarray, current: np.ndarray, templat
     best_reject_score = 0.0
     rect_offset_x = x - template_offset[0]
     rect_offset_y = y - template_offset[1]
-    for scale in (0.94, 1.0, 1.06):
+    for scale in scales:
         scaled_w = max(8, int(round(template_signal.shape[1] * scale)))
         scaled_h = max(8, int(round(template_signal.shape[0] * scale)))
         if scaled_w > search_signal.shape[1] or scaled_h > search_signal.shape[0]:
@@ -539,12 +843,21 @@ def track_with_template(template_frame: np.ndarray, current: np.ndarray, templat
 
 
 def matching_signal(gray: np.ndarray) -> np.ndarray:
-    equalized = cv2.equalizeHist(gray)
-    edges = cv2.Canny(equalized, 50, 150)
+    enhanced = enhance_gray(gray)
+    edges = cv2.Canny(enhanced, 50, 150)
     edge_density = float(np.count_nonzero(edges)) / max(1, edges.size)
     if edge_density > 0.015:
         return edges
-    return equalized
+    return enhanced
+
+
+def enhance_gray(gray: np.ndarray) -> np.ndarray:
+    if gray.size == 0:
+        return gray
+    if min(gray.shape[:2]) >= 16:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+    return cv2.equalizeHist(gray)
 
 
 def resize_for_matching(gray: np.ndarray, scale: float) -> np.ndarray:
@@ -606,6 +919,40 @@ def validate_anchor_scale(candidate: Rect, anchor: Rect | None) -> tuple[Rect | 
     return candidate, None
 
 
+def stabilize_rect(candidate: Rect, previous: Rect, confidence: float | None, scale_mode: str = "locked", anchor: Rect | None = None) -> Rect:
+    _, _, pw, ph = previous
+    _, _, cw, ch = candidate
+    p_center_x, p_center_y = rect_center(previous)
+    c_center_x, c_center_y = rect_center(candidate)
+    confidence_value = clamp_float(confidence if confidence is not None else 0.5, 0.0, 1.0)
+    if scale_mode == "locked":
+        size_reference = anchor or previous
+        _, _, smooth_w, smooth_h = size_reference
+    else:
+        if scale_mode == "slow-zoom":
+            max_step = 0.025 + 0.025 * confidence_value
+            size_smoothing = 0.9 - 0.16 * confidence_value
+        else:
+            max_step = MAX_FRAME_SCALE_STEP + 0.05 * confidence_value
+            size_smoothing = SIZE_SMOOTHING - 0.22 * confidence_value
+        limited_w = limit_ratio(cw, pw, max_step)
+        limited_h = limit_ratio(ch, ph, max_step)
+        smooth_w = pw * size_smoothing + limited_w * (1.0 - size_smoothing)
+        smooth_h = ph * size_smoothing + limited_h * (1.0 - size_smoothing)
+    center_smoothing = CENTER_SMOOTHING - 0.18 * confidence_value
+    smooth_center_x = p_center_x * center_smoothing + c_center_x * (1.0 - center_smoothing)
+    smooth_center_y = p_center_y * center_smoothing + c_center_y * (1.0 - center_smoothing)
+    return clamp_rect((smooth_center_x - smooth_w / 2, smooth_center_y - smooth_h / 2, smooth_w, smooth_h))
+
+
+def limit_ratio(value: float, reference: float, max_step: float) -> float:
+    if reference <= 0:
+        return value
+    lower = reference * (1.0 - max_step)
+    upper = reference * (1.0 + max_step)
+    return clamp_float(value, lower, upper)
+
+
 def aspect_ratio_reason(candidate: Rect, reference: Rect) -> str | None:
     _, _, cw, ch = candidate
     _, _, rw, rh = reference
@@ -639,6 +986,84 @@ def remember_rejection(current_reason: str | None, current_score: float, reason:
     return current_reason, current_score
 
 
+def mark_track_lost(states: dict[str, TrackState], track: TrackSpec, state: TrackState | None) -> None:
+    if state is None:
+        return
+    states[track.id] = TrackState(
+        rect=state.rect,
+        previous_gray=state.previous_gray,
+        anchor_gray=state.anchor_gray,
+        anchor_rect=state.anchor_rect,
+        previous_hist=state.previous_hist,
+        anchor_hist=state.anchor_hist,
+        tracker=state.tracker,
+        lost_count=state.lost_count + 1,
+        last_source=state.last_source,
+    )
+
+
+def is_scale_rejection(reason: str) -> bool:
+    return any(token in reason for token in ("尺度", "宽高", "跳变", "过小", "放大", "缩小"))
+
+
+def rect_iou(left: Rect, right: Rect) -> float:
+    lx, ly, lw, lh = left
+    rx, ry, rw, rh = right
+    ix1 = max(lx, rx)
+    iy1 = max(ly, ry)
+    ix2 = min(lx + lw, rx + rw)
+    iy2 = min(ly + lh, ry + rh)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    union = rect_area(left) + rect_area(right) - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def area_similarity_score(candidate: Rect, reference: Rect) -> float:
+    ratio = rect_area(candidate) / max(0.000001, rect_area(reference))
+    if ratio <= 0:
+        return 0.0
+    return clamp_float(1.0 - abs(math.log(ratio)) / math.log(MAX_TRACKED_AREA_RATIO), 0.0, 1.0)
+
+
+def aspect_similarity_score(candidate: Rect, reference: Rect) -> float:
+    _, _, cw, ch = candidate
+    _, _, rw, rh = reference
+    ratio = (cw / max(0.000001, ch)) / max(0.000001, rw / max(0.000001, rh))
+    if ratio <= 0:
+        return 0.0
+    return clamp_float(1.0 - abs(math.log(ratio)) / math.log(MAX_ASPECT_RATIO_CHANGE), 0.0, 1.0)
+
+
+def color_similarity_for_rect(frame: np.ndarray, rect: Rect, state: TrackState) -> float:
+    hist = color_hist(frame, rect)
+    similarities = []
+    if state.previous_hist is not None:
+        similarities.append(compare_hist(hist, state.previous_hist))
+    if state.anchor_hist is not None:
+        similarities.append(compare_hist(hist, state.anchor_hist))
+    return max(similarities) if similarities else 0.72
+
+
+def color_hist(frame: np.ndarray, rect: Rect) -> np.ndarray:
+    x, y, w, h = rect_to_pixels(rect, frame.shape[1], frame.shape[0])
+    crop = frame[y : y + h, x : x + w]
+    if crop.size == 0:
+        return np.zeros((256, 1), dtype=np.float32)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [24, 24], [0, 180, 0, 256])
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist.astype(np.float32)
+
+
+def compare_hist(left: np.ndarray, right: np.ndarray) -> float:
+    if left.size == 0 or right.size == 0:
+        return 0.0
+    score = float(cv2.compareHist(left, right, cv2.HISTCMP_CORREL))
+    return clamp_float((score + 1.0) / 2.0, 0.0, 1.0)
+
+
 def apply_mask(
     frame: np.ndarray,
     rect: Rect,
@@ -646,35 +1071,59 @@ def apply_mask(
     block_size: int,
     blur_size: int,
     solid_color: tuple[int, int, int],
-    edge_strength: float,
+    solid_alpha: float = 1.0,
 ) -> None:
     x, y, w, h = rect_to_pixels(rect, frame.shape[1], frame.shape[0])
     if w <= 0 or h <= 0:
         return
     roi = frame[y : y + h, x : x + w]
     if effect == "solid":
-        masked = np.full_like(roi, solid_color)
+        alpha = clamp_float(solid_alpha, 0.0, 1.0)
+        solid = np.full_like(roi, solid_color)
+        masked = solid if alpha >= 1.0 else cv2.addWeighted(roi, 1.0 - alpha, solid, alpha, 0)
     elif effect == "blur":
         kernel = max(3, blur_size | 1)
         masked = cv2.GaussianBlur(roi, (kernel, kernel), 0)
     else:
         masked = mosaic(roi, block_size)
-    frame[y : y + h, x : x + w] = center_weighted_blend(roi, masked, edge_strength)
+    frame[y : y + h, x : x + w] = masked
 
 
-def center_weighted_blend(original: np.ndarray, masked: np.ndarray, edge_strength: float) -> np.ndarray:
-    edge = clamp_float(edge_strength, 0.0, 1.0)
-    if edge >= 0.995:
-        return masked
-    height, width = original.shape[:2]
-    yy, xx = np.ogrid[:height, :width]
-    cx = max(1.0, (width - 1) / 2.0)
-    cy = max(1.0, (height - 1) / 2.0)
-    distance = np.sqrt(((xx - cx) / cx) ** 2 + ((yy - cy) / cy) ** 2)
-    falloff = np.clip(distance, 0.0, 1.0) ** 1.35
-    alpha = (1.0 - (1.0 - edge) * falloff).astype(np.float32)[..., None]
-    blended = masked.astype(np.float32) * alpha + original.astype(np.float32) * (1.0 - alpha)
-    return np.clip(blended, 0, 255).astype(np.uint8)
+def apply_track_mask(
+    frame: np.ndarray,
+    rect: Rect,
+    track: TrackSpec,
+    block_size: int,
+    blur_size: int,
+    solid_color: tuple[int, int, int],
+) -> None:
+    strength = normalize_mask_strength(track.strength)
+    apply_mask(
+        frame,
+        rect,
+        track.effect,
+        block_size_for_strength(block_size, strength),
+        blur_size_for_strength(blur_size, strength),
+        solid_color,
+        solid_alpha_for_strength(strength),
+    )
+
+
+def block_size_for_strength(max_block_size: int, strength: float) -> int:
+    maximum = max(2, int(max_block_size))
+    minimum = min(maximum, 6)
+    return max(2, int(round(minimum + (maximum - minimum) * normalize_mask_strength(strength))))
+
+
+def blur_size_for_strength(max_blur_size: int, strength: float) -> int:
+    maximum = max(3, int(max_blur_size) | 1)
+    minimum = min(maximum, 9)
+    kernel = int(round(minimum + (maximum - minimum) * normalize_mask_strength(strength)))
+    return max(3, kernel | 1)
+
+
+def solid_alpha_for_strength(strength: float) -> float:
+    return normalize_mask_strength(strength)
 
 
 def mosaic(roi: np.ndarray, block_size: int) -> np.ndarray:

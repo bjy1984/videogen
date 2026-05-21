@@ -5,7 +5,6 @@ export const workflowPages: Array<{ key: StepKey; title: string; subtitle: strin
   { key: "report", title: "爆款分析报告", subtitle: "6层拆解" },
   { key: "script", title: "脚本拆分编辑", subtitle: "5段式脚本" },
   { key: "generate", title: "分段视频生成", subtitle: "模型 + 队列" },
-  { key: "depth", title: "深度视频工作台", subtitle: "标签 + 深度 + AI" },
   { key: "compose", title: "审核合成导出", subtitle: "剪映工程包" }
 ];
 

@@ -23,7 +23,9 @@ export interface DepthPreprocessRecord {
   sourceClipId: string;
   lineageId: string;
   status: "queued" | "processing" | "done" | "failed";
+  method?: "depth" | "grayscale";
   inputVideoUrl: string;
+  outputVideoUrl?: string;
   depthVideoUrl?: string;
   provider: "mock" | "local-bridge" | "local" | "remote_gpu" | "comfyui";
   params: {
@@ -68,7 +70,7 @@ export interface VideoAiJob {
   id: string;
   sourceClipId: string;
   lineageId: string;
-  inputAssetType: "original" | "depth_video" | "ai_output";
+  inputAssetType: "original" | "depth_video" | "grayscale_video" | "ai_output";
   inputVideoUrl: string;
   provider: DepthAiProvider;
   status: "queued" | "uploading" | "generating" | "capturing" | "done" | "failed";
@@ -87,7 +89,7 @@ export interface MaterialOutput {
   sourceClipId: string;
   lineageId: string;
   parentOutputId?: string;
-  type: "original" | "depth_video" | "ai_video";
+  type: "original" | "depth_video" | "grayscale_video" | "ai_video";
   provider: string;
   videoUrl: string;
   jobId?: string;
@@ -123,6 +125,9 @@ export interface MaterialClip {
   duration: number;
   originalVideoUrl: string;
   sourceFileName?: string;
+  sourceLocalPath?: string;
+  sourceMimeType?: string;
+  sourceSize?: number;
   sourceFile?: File;
   tags: MaterialTag[];
   customTags: string[];
@@ -143,6 +148,9 @@ export interface ImageMaterial {
   description: string;
   imageUrl: string;
   sourceFileName?: string;
+  sourceLocalPath?: string;
+  sourceMimeType?: string;
+  sourceSize?: number;
   category: ImageLibraryCategory;
   tags: MaterialTag[];
   customTags: string[];

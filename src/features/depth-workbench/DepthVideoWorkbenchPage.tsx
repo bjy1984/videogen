@@ -3,7 +3,7 @@ import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useMemo, useState } from "react";
 import type { VideoSegment } from "../../types";
 import { createId } from "../../services/id";
-import { preprocessDepthVideoBridge } from "../../services/videoGenerationBridgeClient";
+import { preprocessDepthVideoBridge, preprocessGrayscaleVideoBridge, uploadVideoGenerationBridgeAsset } from "../../services/videoGenerationBridgeClient";
 import type {
   AiGenerationCost,
   ComposeRecipeStep,
@@ -50,6 +50,7 @@ const providerOptions: Array<{ value: DepthAiProvider; label: string }> = [
 type DepthWorkbenchTab = "library" | "preprocess" | "ai" | "cost" | "compose";
 type MaterialLibraryMode = "video" | "image";
 type DepthQualityPreset = "fast" | "standard" | "portrait";
+type VideoPreprocessMethod = "depth" | "grayscale";
 
 const depthQualityDefaults: Record<DepthQualityPreset, {
   label: string;
@@ -65,7 +66,7 @@ const depthQualityDefaults: Record<DepthQualityPreset, {
 
 const workbenchTabs: Array<{ key: DepthWorkbenchTab; title: string; subtitle: string }> = [
   { key: "library", title: "素材片段库", subtitle: "导入 / 标签 / 选择" },
-  { key: "preprocess", title: "前置处理", subtitle: "原片转深度视频" },
+  { key: "preprocess", title: "前置处理", subtitle: "深度 / 黑白" },
   { key: "ai", title: "AI加工", subtitle: "多平台生成" },
   { key: "cost", title: "成本追踪", subtitle: "积分 / 时间 / 产物" },
   { key: "compose", title: "标签拼接", subtitle: "排序 / 抽取 / 预览" }
@@ -95,6 +96,8 @@ export function DepthVideoWorkbenchPage({
   segments,
   sourcePreviewUrl,
   sourceVideo,
+  sourceVideoLocalPath,
+  sourceVideoName,
   projectId,
   bridgeUrl,
   onClips,
@@ -112,6 +115,8 @@ export function DepthVideoWorkbenchPage({
   segments: VideoSegment[];
   sourcePreviewUrl: string;
   sourceVideo?: File;
+  sourceVideoLocalPath?: string;
+  sourceVideoName?: string;
   projectId: string;
   bridgeUrl: string;
   onClips: Dispatch<SetStateAction<MaterialClip[]>>;
@@ -133,6 +138,7 @@ export function DepthVideoWorkbenchPage({
   const [aiProvider, setAiProvider] = useState<DepthAiProvider>("seedance_api");
   const [prompt, setPrompt] = useState("保留原素材内容，增强镜头运动和产品质感，适合电商短视频投放。");
   const [activeTab, setActiveTab] = useState<DepthWorkbenchTab>("library");
+  const [preprocessMethod, setPreprocessMethod] = useState<VideoPreprocessMethod>("depth");
   const [depthQualityPreset, setDepthQualityPreset] = useState<DepthQualityPreset>("standard");
   const [depthInputSize, setDepthInputSize] = useState(518);
   const [depthLetterbox, setDepthLetterbox] = useState(true);
@@ -147,8 +153,8 @@ export function DepthVideoWorkbenchPage({
     [clips]
   );
   const depthUnfinishedIds = useMemo(
-    () => clips.filter((clip) => clip.preprocess?.status !== "done" && !isDepthBusy(clip)).map((clip) => clip.id),
-    [clips]
+    () => clips.filter((clip) => !isPreprocessDoneForMethod(clip, preprocessMethod) && !isDepthBusy(clip)).map((clip) => clip.id),
+    [clips, preprocessMethod]
   );
 
   useEffect(() => {
@@ -216,18 +222,17 @@ export function DepthVideoWorkbenchPage({
       const existingSegmentIds = new Set(current.map((clip) => clip.sourceSegmentId).filter(Boolean));
       const nextClips = segments
         .filter((segment) => !existingSegmentIds.has(segment.id))
-        .map((segment) => createClipFromSegment(segment, sourcePreviewUrl || segment.videoUrl || "", now, sourceVideo));
+        .map((segment) => createClipFromSegment(segment, sourcePreviewUrl || segment.videoUrl || "", now, sourceVideo, sourceVideoLocalPath, sourceVideoName));
       return [...current, ...nextClips];
     });
     onNotice("已把脚本分段写入深度视频素材片段库，并生成全流程 lineageId。");
   }
 
-  function importFiles(files?: FileList | null) {
+  async function importFiles(files?: FileList | null) {
     if (!files?.length) return;
     const now = new Date().toISOString();
-    const nextClips = Array.from(files)
-      .filter((file) => file.type.startsWith("video/"))
-      .map((file) => createClipFromFile(file, now));
+    const videoFiles = Array.from(files).filter((file) => file.type.startsWith("video/"));
+    const nextClips = await Promise.all(videoFiles.map((file) => createClipFromFile(file, now, projectId, bridgeUrl)));
     if (!nextClips.length) {
       onNotice("请选择视频文件。");
       return;
@@ -236,12 +241,11 @@ export function DepthVideoWorkbenchPage({
     onNotice(`已导入 ${nextClips.length} 个已切分视频片段。`);
   }
 
-  function importImageFiles(files?: FileList | null) {
+  async function importImageFiles(files?: FileList | null) {
     if (!files?.length) return;
     const now = new Date().toISOString();
-    const nextImages = Array.from(files)
-      .filter((file) => file.type.startsWith("image/"))
-      .map((file) => createImageMaterial(file, imageCategory, now));
+    const imageFiles = Array.from(files).filter((file) => file.type.startsWith("image/"));
+    const nextImages = await Promise.all(imageFiles.map((file) => createImageMaterial(file, imageCategory, now, projectId, bridgeUrl)));
     if (!nextImages.length) {
       onNotice("请选择图片文件。");
       return;
@@ -481,13 +485,14 @@ export function DepthVideoWorkbenchPage({
     onNotice(`已清除 ${selectedImageIds.length} 张图片的自定义标签，并保留默认分类标签。`);
   }
 
-  async function runDepthPreprocess(targetIds = selectedIds) {
+  async function runDepthPreprocess(targetIds = selectedIds, method: VideoPreprocessMethod = preprocessMethod) {
     const nextTargetIds = unique(targetIds).filter((id) => clips.some((clip) => clip.id === id && !isDepthBusy(clip)));
     if (!nextTargetIds.length) {
-      onNotice(targetIds.length ? "所选素材正在处理中，请等待当前任务完成后再重新处理。" : "请先选择要处理为深度视频的素材。");
+      onNotice(targetIds.length ? "所选素材正在处理中，请等待当前任务完成后再重新处理。" : "请先选择要前置处理的素材。");
       return;
     }
     const now = new Date().toISOString();
+    const methodLabel = preprocessMethodLabel(method);
     onClips((current) =>
       current.map((clip) => {
         if (!nextTargetIds.includes(clip.id)) return clip;
@@ -498,18 +503,19 @@ export function DepthVideoWorkbenchPage({
             sourceClipId: clip.id,
             lineageId: clip.lineageId,
             status: "queued",
+            method,
             inputVideoUrl: clip.originalVideoUrl,
             provider: "local-bridge",
             params: {
               resolution: "1080p",
               fps: 24,
-              depthModel: "depth-anything-dnn",
-              inputSize: depthInputSize,
-              letterbox: depthLetterbox,
-              edgeFilterStrength: depthEdgeFilterStrength,
-              edgeFilterDiameter: depthEdgeFilterDiameter
+              depthModel: method === "depth" ? "depth-anything-dnn" : "opencv-grayscale",
+              inputSize: method === "depth" ? depthInputSize : undefined,
+              letterbox: method === "depth" ? depthLetterbox : undefined,
+              edgeFilterStrength: method === "depth" ? depthEdgeFilterStrength : undefined,
+              edgeFilterDiameter: method === "depth" ? depthEdgeFilterDiameter : undefined
             },
-            cost: { elapsedSec: 0, gpuSec: 0, estimatedCash: 0 },
+            cost: { elapsedSec: 0, gpuSec: 0 },
             createdAt: now,
             startedAt: undefined,
             finishedAt: undefined,
@@ -519,7 +525,7 @@ export function DepthVideoWorkbenchPage({
         };
       })
     );
-    onNotice(`已提交 ${nextTargetIds.length} 个深度视频前置处理任务。`);
+    onNotice(`已提交 ${nextTargetIds.length} 个${methodLabel}前置处理任务。`);
     for (const clipId of nextTargetIds) {
       const clip = clips.find((item) => item.id === clipId);
       if (!clip) continue;
@@ -529,29 +535,46 @@ export function DepthVideoWorkbenchPage({
         : clip.sourceSegmentId && sourceVideo instanceof File
           ? sourceVideo
           : undefined;
-      if (!video) {
-        markDepthFailed(clipId, "该素材缺少本地视频文件，请重新上传素材或接入后端素材库后再生成深度视频。");
+      const sourceLocalPath = clip.sourceLocalPath || (clip.sourceSegmentId ? sourceVideoLocalPath : undefined);
+      const sourceVideoUrl = sourceLocalPath || video ? undefined : persistentVideoUrl(clip);
+      if (!video && !sourceLocalPath && !sourceVideoUrl) {
+        markDepthFailed(clipId, "该素材缺少可用的视频文件或本地资产链接，请重新上传素材后再执行前置处理。");
         continue;
       }
       try {
-        const result = await preprocessDepthVideoBridge({
-          bridgeUrl,
-          projectId,
-          clipId: clip.id,
-          video,
-          model: "depth-anything-dnn",
-          resolution: "1080p",
-          fps: 24,
-          colorMode: "grayscale",
-          invert: false,
-          inputSize: depthInputSize,
-          letterbox: depthLetterbox,
-          edgeFilterStrength: depthEdgeFilterStrength,
-          edgeFilterDiameter: depthEdgeFilterDiameter
-        });
-        markDepthDone(clipId, result.trace);
+        const result = method === "depth"
+          ? await preprocessDepthVideoBridge({
+              bridgeUrl,
+              projectId,
+              clipId: clip.id,
+              video,
+              sourceLocalPath,
+              sourceVideoUrl,
+              sourceVideoName: clip.sourceFileName || clip.title,
+              model: "depth-anything-dnn",
+              resolution: "1080p",
+              fps: 24,
+              colorMode: "grayscale",
+              invert: false,
+              inputSize: depthInputSize,
+              letterbox: depthLetterbox,
+              edgeFilterStrength: depthEdgeFilterStrength,
+              edgeFilterDiameter: depthEdgeFilterDiameter
+            })
+          : await preprocessGrayscaleVideoBridge({
+              bridgeUrl,
+              projectId,
+              clipId: clip.id,
+              video,
+              sourceLocalPath,
+              sourceVideoUrl,
+              sourceVideoName: clip.sourceFileName || clip.title,
+              resolution: "1080p",
+              fps: 24
+            });
+        markPreprocessDone(clipId, method, result.trace);
       } catch (error) {
-        markDepthFailed(clipId, error instanceof Error ? error.message : "深度视频生成失败。");
+        markDepthFailed(clipId, error instanceof Error ? error.message : `${methodLabel}生成失败。`);
       }
     }
   }
@@ -593,34 +616,45 @@ export function DepthVideoWorkbenchPage({
     onNotice(message);
   }
 
-  function markDepthDone(
+  function markPreprocessDone(
     clipId: string,
-    trace: Awaited<ReturnType<typeof preprocessDepthVideoBridge>>["trace"]
+    method: VideoPreprocessMethod,
+    trace: Awaited<ReturnType<typeof preprocessDepthVideoBridge>>["trace"] | Awaited<ReturnType<typeof preprocessGrayscaleVideoBridge>>["trace"]
   ) {
     const now = new Date().toISOString();
     onClips((current) =>
       current.map((clip) => {
         if (clip.id !== clipId || !clip.preprocess) return clip;
-        const elapsedSec = trace.summary?.elapsedSec ?? 0;
-        const depthVideoUrl = trace.outputVideoUrl;
+        const summary = trace.summary as {
+          elapsedSec?: number;
+          fps?: number;
+          model?: string;
+          inputSize?: number;
+          letterbox?: boolean;
+          edgeFilter?: { strength?: number; diameter?: number };
+        } | undefined;
+        const elapsedSec = summary?.elapsedSec ?? 0;
+        const outputVideoUrl = trace.outputVideoUrl;
         const parentOutput = getOriginalOutput(clip);
         return {
           ...clip,
           preprocess: {
             ...clip.preprocess,
             status: "done",
-            depthVideoUrl,
+            method,
+            outputVideoUrl,
+            depthVideoUrl: method === "depth" ? outputVideoUrl : clip.preprocess.depthVideoUrl,
             provider: "local-bridge",
             params: {
               resolution: "1080p",
-              fps: trace.summary?.fps ?? 24,
-              depthModel: trace.summary?.model || "depth-anything-dnn",
-              inputSize: trace.summary?.inputSize ?? clip.preprocess.params.inputSize,
-              letterbox: trace.summary?.letterbox ?? clip.preprocess.params.letterbox,
-              edgeFilterStrength: trace.summary?.edgeFilter?.strength ?? clip.preprocess.params.edgeFilterStrength,
-              edgeFilterDiameter: trace.summary?.edgeFilter?.diameter ?? clip.preprocess.params.edgeFilterDiameter
+              fps: summary?.fps ?? 24,
+              depthModel: method === "depth" ? summary?.model || "depth-anything-dnn" : "opencv-grayscale",
+              inputSize: method === "depth" ? summary?.inputSize ?? clip.preprocess.params.inputSize : undefined,
+              letterbox: method === "depth" ? summary?.letterbox ?? clip.preprocess.params.letterbox : undefined,
+              edgeFilterStrength: method === "depth" ? summary?.edgeFilter?.strength ?? clip.preprocess.params.edgeFilterStrength : undefined,
+              edgeFilterDiameter: method === "depth" ? summary?.edgeFilter?.diameter ?? clip.preprocess.params.edgeFilterDiameter : undefined
             },
-            cost: { elapsedSec, gpuSec: elapsedSec, estimatedCash: Number((elapsedSec * 0.012).toFixed(2)) },
+            cost: { elapsedSec, gpuSec: elapsedSec },
             finishedAt: now,
             updatedAt: now
           },
@@ -629,16 +663,16 @@ export function DepthVideoWorkbenchPage({
             sourceClipId: clip.id,
             lineageId: clip.lineageId,
             parentOutputId: parentOutput?.id,
-            type: "depth_video",
+            type: method === "depth" ? "depth_video" : "grayscale_video",
             provider: "local-bridge",
-            videoUrl: depthVideoUrl,
+            videoUrl: outputVideoUrl,
             createdAt: now
           }),
           updatedAt: now
         };
       })
     );
-    onNotice("深度视频生成完成，已写入真实 depth_video 产物。");
+    onNotice(`${preprocessMethodLabel(method)}生成完成，已写入真实产物。`);
   }
 
   function runAiGeneration() {
@@ -729,13 +763,13 @@ export function DepthVideoWorkbenchPage({
       <div className="depth-stats">
         <StatCard label="素材片段" value={clips.length} />
         <StatCard label="图片素材" value={images.length} />
-        <StatCard label="已深度化" value={stats.depthDone} />
+        <StatCard label="已前处理" value={stats.depthDone} />
         <StatCard label="AI产物" value={stats.aiDone} />
         <StatCard label="累计积分" value={stats.credits} />
-        <StatCard label="累计成本" value={`¥${stats.cash.toFixed(2)}`} />
+        <StatCard label="AI成本" value={`¥${stats.cash.toFixed(2)}`} />
       </div>
 
-      <nav className="depth-tabs" aria-label="深度视频工作台步骤">
+      <nav className="depth-tabs" aria-label="视频生成工作台步骤">
         {workbenchTabs.map((tab, index) => (
           <button
             className={`depth-tab ${activeTab === tab.key ? "active" : ""}`}
@@ -907,11 +941,27 @@ export function DepthVideoWorkbenchPage({
           <div className="panel-heading">
             <div>
               <p className="eyebrow">Preprocess</p>
-              <h2>深度视频前置处理</h2>
+              <h2>视频前置处理</h2>
             </div>
             <button className="secondary-button compact" onClick={() => setActiveTab("library")}>返回素材库</button>
           </div>
-          <div className="depth-quality-panel">
+          <div className="preprocess-method-row">
+            <button className={preprocessMethod === "depth" ? "active" : ""} onClick={() => setPreprocessMethod("depth")}>
+              <Film size={16} />
+              <span>
+                <strong>深度视频</strong>
+                <small>OpenCV DNN + Depth Anything，输出深度图视频。</small>
+              </span>
+            </button>
+            <button className={preprocessMethod === "grayscale" ? "active" : ""} onClick={() => setPreprocessMethod("grayscale")}>
+              <Film size={16} />
+              <span>
+                <strong>黑白视频</strong>
+                <small>OpenCV 灰度转换，输出保留音频的黑白视频。</small>
+              </span>
+            </button>
+          </div>
+          {preprocessMethod === "depth" && <div className="depth-quality-panel">
             <div className="quality-preset-row">
               {Object.entries(depthQualityDefaults).map(([key, item]) => (
                 <button
@@ -991,7 +1041,25 @@ export function DepthVideoWorkbenchPage({
                 <small>518 + Letterbox + 0.55 滤波，优先改善人物和发丝边界。</small>
               </div>
             </div>
-          </div>
+          </div>}
+          {preprocessMethod === "grayscale" && (
+            <div className="depth-quality-panel">
+              <div className="quality-help-grid">
+                <div>
+                  <strong>处理算法</strong>
+                  <small>逐帧使用 OpenCV `cv2.cvtColor(frame, COLOR_BGR2GRAY)` 转灰度，再转回 BGR 写入 MP4。</small>
+                </div>
+                <div>
+                  <strong>输出规格</strong>
+                  <small>默认 1080p 高度、24fps，保持 9:16 画面比例；音频通过 ffmpeg 合并回产物。</small>
+                </div>
+                <div>
+                  <strong>使用场景</strong>
+                  <small>适合做黑白风格素材、后续 AI 风格化输入，处理速度显著快于深度视频。</small>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="depth-action-card">
             <div>
               <strong>已选择 {selectedClips.length} 个素材</strong>
@@ -1038,9 +1106,9 @@ export function DepthVideoWorkbenchPage({
                   {clip.preprocess?.error && <em>{clip.preprocess.error}</em>}
                 </div>
                 <div className="depth-row-actions">
-                  {clip.preprocess?.depthVideoUrl && (
-                    <a className="secondary-button compact" href={clip.preprocess.depthVideoUrl} target="_blank" rel="noreferrer">
-                      查看深度视频
+                  {(clip.preprocess?.outputVideoUrl || clip.preprocess?.depthVideoUrl) && (
+                    <a className="secondary-button compact" href={clip.preprocess.outputVideoUrl || clip.preprocess.depthVideoUrl} target="_blank" rel="noreferrer">
+                      查看{preprocessMethodLabel(clip.preprocess.method || "depth")}
                     </a>
                   )}
                   <button className="secondary-button compact" onClick={() => runDepthPreprocess([clip.id])} disabled={isDepthBusy(clip)}>
@@ -1250,6 +1318,14 @@ function ClipGrid({
                   深度视频
                 </button>
               )}
+              {clip.outputs.some((item) => item.type === "grayscale_video") && (
+                <button
+                  className={currentPreviewType(clip, previewByClipId[clip.id]) === "grayscale_video" ? "active" : ""}
+                  onClick={() => setPreviewByClipId((items) => ({ ...items, [clip.id]: "grayscale_video" }))}
+                >
+                  黑白视频
+                </button>
+              )}
               {clip.outputs.some((item) => item.type === "ai_video") && (
                 <button
                   className={currentPreviewType(clip, previewByClipId[clip.id]) === "ai_video" ? "active" : ""}
@@ -1430,7 +1506,14 @@ function LineageOutputs({ outputs }: { outputs: MaterialOutput[] }) {
   );
 }
 
-function createClipFromSegment(segment: VideoSegment, videoUrl: string, now: string, sourceFile?: File): MaterialClip {
+function createClipFromSegment(
+  segment: VideoSegment,
+  videoUrl: string,
+  now: string,
+  sourceFile?: File,
+  sourceLocalPath?: string,
+  sourceFileName?: string
+): MaterialClip {
   const tag = roleToTag(segment.bucketRole || segment.role);
   const id = createId("clip");
   const lineageId = createId("lineage");
@@ -1444,6 +1527,8 @@ function createClipFromSegment(segment: VideoSegment, videoUrl: string, now: str
     duration: segment.duration,
     originalVideoUrl: videoUrl,
     sourceFile,
+    sourceFileName,
+    sourceLocalPath,
     tags: tag ? [{ ...tag, id: createId("tag"), source: "import", createdAt: now }] : [],
     customTags: [],
     aiJobs: [],
@@ -1454,11 +1539,12 @@ function createClipFromSegment(segment: VideoSegment, videoUrl: string, now: str
   };
 }
 
-function createClipFromFile(file: File, now: string): MaterialClip {
+async function createClipFromFile(file: File, now: string, projectId: string, bridgeUrl: string): Promise<MaterialClip> {
   const id = createId("clip");
   const lineageId = createId("lineage");
   const originalOutputId = createId("output");
-  const videoUrl = URL.createObjectURL(file);
+  const uploaded = await uploadWorkbenchAsset(file, "video", projectId, id, bridgeUrl);
+  const videoUrl = uploaded?.localAssetUrl || URL.createObjectURL(file);
   return {
     id,
     lineageId,
@@ -1467,6 +1553,9 @@ function createClipFromFile(file: File, now: string): MaterialClip {
     duration: 0,
     originalVideoUrl: videoUrl,
     sourceFileName: file.name,
+    sourceLocalPath: uploaded?.localPath,
+    sourceMimeType: file.type,
+    sourceSize: file.size,
     sourceFile: file,
     tags: [],
     customTags: [],
@@ -1478,10 +1567,11 @@ function createClipFromFile(file: File, now: string): MaterialClip {
   };
 }
 
-function createImageMaterial(file: File, category: ImageLibraryCategory, now: string): ImageMaterial {
+async function createImageMaterial(file: File, category: ImageLibraryCategory, now: string, projectId: string, bridgeUrl: string): Promise<ImageMaterial> {
   const id = createId("image");
   const lineageId = createId("lineage");
-  const imageUrl = URL.createObjectURL(file);
+  const uploaded = await uploadWorkbenchAsset(file, "image", projectId, id, bridgeUrl);
+  const imageUrl = uploaded?.localAssetUrl || URL.createObjectURL(file);
   return {
     id,
     lineageId,
@@ -1489,6 +1579,9 @@ function createImageMaterial(file: File, category: ImageLibraryCategory, now: st
     description: "",
     imageUrl,
     sourceFileName: file.name,
+    sourceLocalPath: uploaded?.localPath,
+    sourceMimeType: file.type,
+    sourceSize: file.size,
     category,
     tags: [createDefaultImageTag(category, now)],
     customTags: [],
@@ -1496,6 +1589,21 @@ function createImageMaterial(file: File, category: ImageLibraryCategory, now: st
     createdAt: now,
     updatedAt: now
   };
+}
+
+async function uploadWorkbenchAsset(file: File, kind: "video" | "image", projectId: string, segmentId: string, bridgeUrl: string) {
+  try {
+    const result = await uploadVideoGenerationBridgeAsset({
+      bridgeUrl,
+      projectId,
+      segmentId,
+      kind: `video_workbench_${kind}`,
+      file
+    });
+    return result.asset;
+  } catch {
+    return undefined;
+  }
 }
 
 function selectedClipVideoUrl(clip: MaterialClip, preferredType?: MaterialOutput["type"]) {
@@ -1506,9 +1614,11 @@ function selectedClipVideoUrl(clip: MaterialClip, preferredType?: MaterialOutput
 
 function currentPreviewType(clip: MaterialClip, preferredType?: MaterialOutput["type"]): MaterialOutput["type"] {
   if (preferredType === "depth_video" && clip.outputs.some((item) => item.type === "depth_video")) return "depth_video";
+  if (preferredType === "grayscale_video" && clip.outputs.some((item) => item.type === "grayscale_video")) return "grayscale_video";
   if (preferredType === "ai_video" && clip.outputs.some((item) => item.type === "ai_video")) return "ai_video";
   if (preferredType === "original") return "original";
   if (clip.outputs.some((item) => item.type === "depth_video")) return "depth_video";
+  if (clip.outputs.some((item) => item.type === "grayscale_video")) return "grayscale_video";
   if (clip.outputs.some((item) => item.type === "ai_video")) return "ai_video";
   return "original";
 }
@@ -1533,14 +1643,23 @@ function getOriginalOutput(clip: MaterialClip) {
   return clip.outputs.find((item) => item.type === "original");
 }
 
+function persistentVideoUrl(clip: MaterialClip) {
+  const originalUrl = getOriginalOutput(clip)?.videoUrl || clip.originalVideoUrl;
+  if (!originalUrl || originalUrl.startsWith("blob:")) return undefined;
+  return originalUrl;
+}
+
 function getBestParentOutputForAi(clip: MaterialClip) {
-  return clip.outputs.find((item) => item.type === "depth_video") || getOriginalOutput(clip);
+  return clip.outputs.find((item) => item.type === "depth_video")
+    || clip.outputs.find((item) => item.type === "grayscale_video")
+    || getOriginalOutput(clip);
 }
 
 function outputTypeLabel(type: MaterialOutput["type"]) {
   const labels: Record<MaterialOutput["type"], string> = {
     original: "原视频",
     depth_video: "深度视频",
+    grayscale_video: "黑白视频",
     ai_video: "AI产物"
   };
   return labels[type];
@@ -1576,12 +1695,13 @@ function upsertOutput(outputs: MaterialClip["outputs"], output: MaterialClip["ou
 
 function createAiJob(clip: MaterialClip, provider: DepthAiProvider, prompt: string, now: string) {
   const cost = estimateProviderCost(provider);
+  const inputOutput = getBestParentOutputForAi(clip);
   return {
     id: createId("aijob"),
     sourceClipId: clip.id,
     lineageId: clip.lineageId,
-    inputAssetType: clip.preprocess?.status === "done" ? "depth_video" as const : "original" as const,
-    inputVideoUrl: clip.preprocess?.depthVideoUrl || clip.originalVideoUrl,
+    inputAssetType: inputOutput?.type === "depth_video" || inputOutput?.type === "grayscale_video" ? inputOutput.type : "original" as const,
+    inputVideoUrl: inputOutput?.videoUrl || clip.originalVideoUrl,
     provider,
     status: "queued" as const,
     prompt,
@@ -1634,6 +1754,10 @@ function isDepthBusy(clip: MaterialClip) {
   return clip.preprocess?.status === "queued" || clip.preprocess?.status === "processing";
 }
 
+function isPreprocessDoneForMethod(clip: MaterialClip, method: VideoPreprocessMethod) {
+  return clip.preprocess?.status === "done" && (clip.preprocess.method || "depth") === method;
+}
+
 function elapsedSince(isoDate: string) {
   return Math.max(0, Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000));
 }
@@ -1645,12 +1769,15 @@ function elapsedBetween(startIso: string, endIso: string) {
 function depthMetaText(clip: MaterialClip) {
   const record = clip.preprocess;
   if (!record) return "等待处理，可单独选择或批量处理";
-  const quality = `${record.params.inputSize ?? 518}px · ${record.params.letterbox === false ? "拉伸" : "Letterbox"} · 滤波 ${record.params.edgeFilterStrength ?? 0}`;
-  const cost = `${quality} · 耗时 ${record.cost.elapsedSec}s · 估算 ¥${(record.cost.estimatedCash ?? 0).toFixed(2)}`;
+  const method = record.method || "depth";
+  const quality = method === "depth"
+    ? `${record.params.inputSize ?? 518}px · ${record.params.letterbox === false ? "拉伸" : "Letterbox"} · 滤波 ${record.params.edgeFilterStrength ?? 0}`
+    : "OpenCV 灰度转换";
+  const runtime = `${quality} · 耗时 ${record.cost.elapsedSec}s`;
   if (record.status === "queued") return `${record.params.depthModel} · 已进入队列`;
-  if (record.status === "processing") return `${record.params.depthModel} · 正在生成 · ${cost}`;
-  if (record.status === "done") return `${record.params.depthModel} · ${cost}`;
-  return `${record.params.depthModel} · 处理失败 · ${cost}`;
+  if (record.status === "processing") return `${record.params.depthModel} · 正在生成 · ${runtime}`;
+  if (record.status === "done") return `${record.params.depthModel} · ${runtime}`;
+  return `${record.params.depthModel} · 处理失败 · ${runtime}`;
 }
 
 function buildComposePlan(clips: MaterialClip[], recipe: ComposeRecipeStep[]): DepthComposePlanItem[] {
@@ -1688,12 +1815,12 @@ function buildComposePlan(clips: MaterialClip[], recipe: ComposeRecipeStep[]): D
 function getBestVideoUrl(clip: MaterialClip) {
   return clip.outputs.find((item) => item.type === "ai_video")?.videoUrl
     || clip.outputs.find((item) => item.type === "depth_video")?.videoUrl
+    || clip.outputs.find((item) => item.type === "grayscale_video")?.videoUrl
     || clip.originalVideoUrl;
 }
 
 function clipCost(clip: MaterialClip) {
-  const aiCost = clip.aiJobs.reduce((total, job) => total + job.cost.estimatedCash, 0);
-  return aiCost + (clip.preprocess?.cost.estimatedCash ?? 0);
+  return clip.aiJobs.reduce((total, job) => total + job.cost.estimatedCash, 0);
 }
 
 function providerLabel(provider: DepthAiProvider) {
@@ -1702,12 +1829,16 @@ function providerLabel(provider: DepthAiProvider) {
 
 function depthStatusLabel(status?: string) {
   const labels: Record<string, string> = {
-    queued: "深度排队中",
-    processing: "深度处理中",
-    done: "已深度化",
-    failed: "深度失败"
+    queued: "前处理排队中",
+    processing: "前处理中",
+    done: "已前处理",
+    failed: "前处理失败"
   };
-  return status ? labels[status] ?? status : "未深度化";
+  return status ? labels[status] ?? status : "未前处理";
+}
+
+function preprocessMethodLabel(method: VideoPreprocessMethod) {
+  return method === "depth" ? "深度视频" : "黑白视频";
 }
 
 function aiStatusLabel(status: string) {

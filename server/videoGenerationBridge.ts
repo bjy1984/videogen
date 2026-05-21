@@ -3,7 +3,7 @@ import express from "express";
 import multer from "multer";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -17,6 +17,7 @@ import {
   normalizeComfyUIHistoryResponse,
   normalizeComfyUISubmitResponse,
   selectBestComfyUIOutputFile,
+  selectComfyUIOutputFileForNode,
   type ComfyUICreateTaskBridgeRequest,
   type ComfyUISyncAssetResponse,
   type ComfyUITaskResponse
@@ -34,7 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
 const assetRootDir = process.env.VIDEOGEN_ASSET_ROOT || path.join(rootDir, ".videogen-assets");
 const uploadTempDir = path.join(assetRootDir, "_uploads");
-const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8788);
+const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8790);
 const defaultDepthAnythingOnnxPath = path.join(
   rootDir,
   "models",
@@ -68,6 +69,8 @@ app.get("/health", async (req, res) => {
     comfyui: {
       endpoint: comfyEndpoint,
       reachable: comfyHealth.reachable,
+      nagCfgGuiderAvailable: comfyHealth.nagCfgGuiderAvailable,
+      nagCfgGuiderError: comfyHealth.nagCfgGuiderError,
       error: comfyHealth.error
     },
     privacyPython: {
@@ -89,13 +92,13 @@ app.get("/health", async (req, res) => {
 
 app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
   try {
-    assertPrivacyPythonReady();
-    assertFfmpegReady();
     if (!req.file) {
       throw new BridgeError("请上传需要预处理的原素材视频。", 400);
     }
     const preview = String(req.body.preview ?? "false") === "true";
-    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand(preview);
+    const effect = parseFaceMosaicEffect(String(req.body.effect || "mosaic"));
+    const strength = parseMaskStrength(req.body.strength, 0.85);
+    const commandTemplate = process.env.VIDEOGEN_FACE_MOSAIC_COMMAND?.trim() || defaultFaceMosaicCommand(preview, effect, strength);
 
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const segmentId = safePathPart(String(req.body.segmentId || "segment"));
@@ -122,6 +125,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
     });
     await stat(outputPath);
     const summary = parseCommandSummary(commandResult.stdout);
+    const traceSummary = summary && typeof summary === "object" ? { ...summary, effect, strength } : { effect, strength };
 
     const now = new Date().toISOString();
     res.json({
@@ -135,7 +139,7 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
         outputVideoUrl: assetUrl(req, relativeDir, `face_mosaic.${extension}`),
         localPath: outputPath,
         publicAssetRequired: true,
-        summary,
+        summary: traceSummary,
         createdAt: now,
         updatedAt: now
       }
@@ -150,10 +154,10 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
 
 app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   try {
-    assertPrivacyPythonReady();
-    assertFfmpegReady();
     const blockOnRed = String(req.body.blockOnRed ?? "true") !== "false";
-    const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
+    const trackingEngine = parseTrackingEngine(String(req.body.trackingEngine || "opencv"));
+    const commandTemplate = brandMaskCommandForEngine(trackingEngine, blockOnRed);
+    const commandEnvName = brandMaskCommandEnvName(trackingEngine);
     const tracks = parseTracks(String(req.body.tracks || "[]"));
     if (!tracks.length) {
       throw new BridgeError("物体追踪打码至少需要一个用户标注遮罩。", 400);
@@ -166,7 +170,8 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
 
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const segmentId = safePathPart(String(req.body.segmentId || "segment"));
-    const preprocessId = safePathPart(`brand_mask_${Date.now()}`);
+    const preprocessPrefix = brandMaskOutputPrefix(trackingEngine);
+    const preprocessId = safePathPart(`${preprocessPrefix}_${Date.now()}`);
     const sourceName = req.file?.originalname || String(req.body.sourceVideoName || "source.mp4");
     const extension =
       extensionFromContentType(req.file?.mimetype || null) ||
@@ -178,7 +183,8 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
     await mkdir(outputDir, { recursive: true });
 
     const sourcePath = path.join(outputDir, `source.${extension}`);
-    const outputPath = path.join(outputDir, `brand_mask.${extension}`);
+    const outputName = `${preprocessPrefix}.${extension}`;
+    const outputPath = path.join(outputDir, outputName);
     const specPath = path.join(outputDir, "brand_mask_spec.json");
     if (req.file) {
       await copyFile(req.file.path, sourcePath);
@@ -192,17 +198,21 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
       inputPath: sourcePath,
       outputPath,
       specPath,
-      timeoutMs: Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000),
-      placeholderError: "VIDEOGEN_BRAND_MASK_COMMAND 必须包含 {input}、{output} 和 {spec} 占位符。",
+      timeoutMs: brandMaskTimeoutMs(trackingEngine),
+      placeholderError: `${commandEnvName} 必须包含 {input}、{output} 和 {spec} 占位符。`,
       requiredPlaceholders: ["{input}", "{output}", "{spec}"],
-      failurePrefix: "物体追踪打码预处理命令失败",
-      timeoutMessage: "物体追踪打码预处理超时"
+      failurePrefix: `${brandMaskEngineLabel(trackingEngine)}物体追踪打码预处理命令失败`,
+      timeoutMessage: `${brandMaskEngineLabel(trackingEngine)}物体追踪打码预处理超时`
     });
     await stat(outputPath);
     const parsed = parseCommandSummary(commandResult.stdout);
     const issues = Array.isArray(parsed?.issues) ? parsed.issues : undefined;
     const summary = parsed && typeof parsed === "object" ? { ...parsed } : undefined;
     if (summary && "issues" in summary) delete summary.issues;
+    const traceSummary = {
+      ...(summary || {}),
+      trackingEngine
+    };
 
     const now = new Date().toISOString();
     res.json({
@@ -213,10 +223,10 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
         status: "done",
         sourceVideoName: sourceName,
         sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
-        outputVideoUrl: assetUrl(req, relativeDir, `brand_mask.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, outputName),
         localPath: outputPath,
         publicAssetRequired: true,
-        summary,
+        summary: traceSummary,
         issues,
         createdAt: now,
         updatedAt: now
@@ -230,11 +240,52 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   }
 });
 
+app.post("/assets/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      throw new BridgeError("请上传需要暂存的文件。", 400);
+    }
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const segmentId = safePathPart(String(req.body.segmentId || "segment"));
+    const kind = safePathPart(String(req.body.kind || "asset"));
+    const originalName = req.file.originalname || "asset";
+    const extension =
+      extensionFromContentType(req.file.mimetype) ||
+      extensionFromUrl(originalName) ||
+      "bin";
+    const baseName = safePathPart(path.basename(originalName, path.extname(originalName)) || kind);
+    const fileName = `${Date.now()}_${baseName}.${extension}`;
+    const relativeDir = path.join("uploads", projectId, segmentId, kind);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+    const outputPath = path.join(outputDir, fileName);
+    await copyFile(req.file.path, outputPath);
+    res.json({
+      asset: {
+        projectId,
+        segmentId,
+        kind,
+        fileName,
+        localPath: outputPath,
+        localAssetUrl: assetUrl(req, relativeDir, fileName),
+        savedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Asset upload failed."
+    });
+  }
+});
+
 app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
   try {
     assertDepthPythonReady();
-    if (!req.file) {
-      throw new BridgeError("请上传需要生成深度视频的原素材。", 400);
+    const sourceLocalPath = String(req.body.sourceLocalPath || "").trim();
+    const sourceVideoUrl = String(req.body.sourceVideoUrl || "").trim();
+    if (!req.file && !sourceLocalPath && !sourceVideoUrl) {
+      throw new BridgeError("请上传需要生成深度视频的原素材，或传入本地素材路径/素材 URL。", 400);
     }
     const commandTemplate = process.env.VIDEOGEN_DEPTH_VIDEO_COMMAND?.trim() || defaultDepthVideoCommand();
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
@@ -252,8 +303,10 @@ app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
     const edgeFilterStrength = String(req.body.edgeFilterStrength || "0.35");
     const edgeFilterDiameter = String(req.body.edgeFilterDiameter || "7");
     const extension =
-      extensionFromContentType(req.file.mimetype) ||
-      extensionFromUrl(req.file.originalname) ||
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(req.file?.originalname || "") ||
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceVideoUrl) ||
       "mp4";
     const relativeDir = path.join("depth", projectId, clipId, preprocessId);
     const outputDir = path.join(assetRootDir, relativeDir);
@@ -261,7 +314,13 @@ app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
 
     const sourcePath = path.join(outputDir, `source.${extension}`);
     const outputPath = path.join(outputDir, "depth.mp4");
-    await copyFile(req.file.path, sourcePath);
+    await copyPreprocessSource({
+      uploadPath: req.file?.path,
+      sourceLocalPath,
+      sourceVideoUrl,
+      targetPath: sourcePath,
+      providerLabel: "深度视频源素材"
+    });
 
     const commandResult = await runPreprocessCommand({
       commandTemplate,
@@ -293,7 +352,7 @@ app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
         kind: "depth-video",
         provider: "local-bridge",
         status: "done",
-        sourceVideoName: req.file.originalname,
+        sourceVideoName: req.file?.originalname || String(req.body.sourceVideoName || "source.mp4"),
         sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
         outputVideoUrl: assetUrl(req, relativeDir, "depth.mp4"),
         localPath: outputPath,
@@ -306,6 +365,79 @@ app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
     const status = error instanceof BridgeError ? error.status : 500;
     res.status(status).json({
       error: error instanceof Error ? error.message : "Depth video preprocessing failed."
+    });
+  }
+});
+
+app.post("/video/preprocess/grayscale", upload.single("video"), async (req, res) => {
+  try {
+    assertDepthPythonReady();
+    const sourceLocalPath = String(req.body.sourceLocalPath || "").trim();
+    const sourceVideoUrl = String(req.body.sourceVideoUrl || "").trim();
+    if (!req.file && !sourceLocalPath && !sourceVideoUrl) {
+      throw new BridgeError("请上传需要生成黑白视频的原素材，或传入本地素材路径/素材 URL。", 400);
+    }
+    const commandTemplate = process.env.VIDEOGEN_GRAYSCALE_VIDEO_COMMAND?.trim() || defaultGrayscaleVideoCommand();
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const clipId = safePathPart(String(req.body.clipId || "clip"));
+    const preprocessId = safePathPart(`grayscale_${Date.now()}`);
+    const resolution = String(req.body.resolution || "1080p");
+    const fps = String(req.body.fps || "");
+    const extension =
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(req.file?.originalname || "") ||
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceVideoUrl) ||
+      "mp4";
+    const relativeDir = path.join("grayscale", projectId, clipId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    const outputPath = path.join(outputDir, "grayscale.mp4");
+    await copyPreprocessSource({
+      uploadPath: req.file?.path,
+      sourceLocalPath,
+      sourceVideoUrl,
+      targetPath: sourcePath,
+      providerLabel: "黑白视频源素材"
+    });
+
+    const commandResult = await runPreprocessCommand({
+      commandTemplate,
+      inputPath: sourcePath,
+      outputPath,
+      timeoutMs: Number(process.env.VIDEOGEN_GRAYSCALE_VIDEO_TIMEOUT_MS || 300_000),
+      placeholderError: "VIDEOGEN_GRAYSCALE_VIDEO_COMMAND 必须包含 {input} 和 {output} 占位符。",
+      failurePrefix: "黑白视频生成命令失败",
+      timeoutMessage: "黑白视频生成超时",
+      replacements: {
+        "{resolution}": shellQuote(resolution),
+        "{fps}": shellQuote(fps)
+      }
+    });
+    await stat(outputPath);
+    const summary = parseCommandSummary(commandResult.stdout);
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "grayscale-video",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: req.file?.originalname || String(req.body.sourceVideoName || "source.mp4"),
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, "grayscale.mp4"),
+        localPath: outputPath,
+        summary,
+        createdAt: now,
+        updatedAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Grayscale video preprocessing failed."
     });
   }
 });
@@ -394,7 +526,24 @@ app.get("/seedance/tasks/:id", async (req, res) => {
 app.post("/comfyui/tasks", async (req, res) => {
   const request = req.body as ComfyUICreateTaskBridgeRequest;
   try {
+    const endpoint = request.endpoint || DEFAULT_COMFYUI_ENDPOINT;
     const workflow = await resolveComfyUIWorkflow(request);
+    const sourceVideoInput = request.sourceVideoUrl
+      ? await uploadComfyUIInputFromUrl({
+          endpoint,
+          sourceUrl: request.sourceVideoUrl,
+          suggestedName: request.sourceVideoName || "source_video.mp4",
+          providerLabel: "ComfyUI source video"
+        })
+      : undefined;
+    const referenceImageInput = request.referenceImageUrl
+      ? await uploadComfyUIInputFromUrl({
+          endpoint,
+          sourceUrl: request.referenceImageUrl,
+          suggestedName: request.referenceImageName || "reference_image.png",
+          providerLabel: "ComfyUI reference image"
+        })
+      : undefined;
     const promptBody = buildComfyUIPromptBody({
       workflow,
       prompt: request.prompt,
@@ -402,10 +551,13 @@ app.post("/comfyui/tasks", async (req, res) => {
       seed: request.seed,
       steps: request.steps,
       cfgScale: request.cfgScale,
-      sourceVideoUrl: request.sourceVideoUrl,
+      ollamaModel: request.ollamaModel,
+      duration: request.duration,
+      sourceVideoUrl: sourceVideoInput || request.sourceVideoUrl,
+      referenceImageUrl: referenceImageInput || request.referenceImageUrl,
       clientId: request.clientId
     });
-    const upstreamUrl = buildComfyUIPromptUrl(request.endpoint || DEFAULT_COMFYUI_ENDPOINT);
+    const upstreamUrl = buildComfyUIPromptUrl(endpoint);
     const payload = await requestComfyUIJson(upstreamUrl, {
       method: "POST",
       body: JSON.stringify(promptBody)
@@ -446,9 +598,11 @@ app.post("/comfyui/tasks/:id/sync", async (req, res) => {
     if (task.status !== "succeeded") {
       throw new BridgeError(`ComfyUI 任务尚未成功，当前状态：${task.status || "unknown"}`, 409);
     }
-    const output = selectBestComfyUIOutputFile(task.outputFiles, outputNodeId);
+    const output = outputNodeId
+      ? selectComfyUIOutputFileForNode(task.outputFiles, outputNodeId)
+      : selectBestComfyUIOutputFile(task.outputFiles);
     if (!output) {
-      throw new BridgeError("ComfyUI 任务没有可转存的输出文件。", 409);
+      throw new BridgeError(outputNodeId ? `ComfyUI 任务没有节点 ${outputNodeId} 的可转存输出文件。` : "ComfyUI 任务没有可转存的输出文件。", 409);
     }
 
     const sourceUrl = output.viewUrl || buildComfyUIViewUrl(endpoint, output);
@@ -460,6 +614,10 @@ app.post("/comfyui/tasks/:id/sync", async (req, res) => {
     await mkdir(outputDir, { recursive: true });
     const outputPath = path.join(outputDir, fileName);
     await writeFile(outputPath, downloaded.bytes);
+    const targetDuration = positiveNumberOptional(req.body.targetDuration);
+    if (targetDuration && isVideoExtension(extension)) {
+      await normalizeVideoDuration(outputPath, targetDuration);
+    }
 
     const asset = {
       projectId,
@@ -529,6 +687,37 @@ async function requestComfyUIJson(url: string, init: TimedRequestInit = {}) {
   return payload;
 }
 
+async function uploadComfyUIInputFromUrl(input: {
+  endpoint: string;
+  sourceUrl: string;
+  suggestedName: string;
+  providerLabel: string;
+}) {
+  const downloaded = await downloadAsset(input.sourceUrl, input.providerLabel);
+  const fileName = safeComfyUIInputFileName(input.suggestedName, downloaded.extension);
+  const formData = new FormData();
+  formData.set("image", new Blob([new Uint8Array(downloaded.bytes)], { type: downloaded.contentType }), fileName);
+  formData.set("type", "input");
+  formData.set("overwrite", "true");
+  const response = await fetchWithTimeout(`${stripTrailingSlash(input.endpoint)}/upload/image`, {
+    method: "POST",
+    body: formData,
+    timeoutMs: 180_000
+  });
+  const payload = await readPayload(response);
+  if (!response.ok) {
+    throw new BridgeError(
+      extractUpstreamError(payload) || `ComfyUI input upload failed: ${response.status}`,
+      502
+    );
+  }
+  if (!payload || typeof payload !== "object") return fileName;
+  const result = payload as Record<string, unknown>;
+  const name = typeof result.name === "string" && result.name ? result.name : fileName;
+  const subfolder = typeof result.subfolder === "string" && result.subfolder ? result.subfolder : "";
+  return subfolder ? `${subfolder}/${name}` : name;
+}
+
 async function getComfyUITask(endpoint: string, promptId: string): Promise<ComfyUITaskResponse> {
   const historyPayload = await requestComfyUIJson(buildComfyUIHistoryUrl(endpoint, promptId), { method: "GET" });
   const historyTask = normalizeComfyUIHistoryResponse({
@@ -584,10 +773,20 @@ async function resolveComfyUIWorkflow(request: ComfyUICreateTaskBridgeRequest) {
 async function checkComfyUIHealth(endpoint: string) {
   try {
     await requestComfyUIJson(buildComfyUISystemStatsUrl(endpoint), { method: "GET" });
-    return { reachable: true };
+    const nagInfo = await requestComfyUIJson(buildComfyUIObjectInfoUrl(endpoint, "NAGCFGGuider"), { method: "GET" }).catch((error) => {
+      return {
+        error: error instanceof Error ? error.message : "NAGCFGGuider 检查失败。"
+      };
+    });
+    return {
+      reachable: true,
+      nagCfgGuiderAvailable: isRecord(nagInfo) && isRecord(nagInfo.NAGCFGGuider),
+      nagCfgGuiderError: isRecord(nagInfo) && typeof nagInfo.error === "string" ? nagInfo.error : undefined
+    };
   } catch (error) {
     return {
       reachable: false,
+      nagCfgGuiderAvailable: false,
       error: error instanceof Error ? error.message : "ComfyUI 不可达。"
     };
   }
@@ -599,10 +798,143 @@ async function downloadAsset(url: string, providerLabel = "Seedance") {
     throw new BridgeError(`下载 ${providerLabel} 产物失败：${response.status}`, 502);
   }
   const arrayBuffer = await response.arrayBuffer();
+  const contentType = response.headers.get("content-type") || "application/octet-stream";
   return {
     bytes: Buffer.from(arrayBuffer),
-    extension: extensionFromContentType(response.headers.get("content-type")) || extensionFromUrl(url) || "mp4"
+    contentType,
+    extension: extensionFromContentType(contentType) || extensionFromUrl(url) || "mp4"
   };
+}
+
+async function copyPreprocessSource(input: {
+  uploadPath?: string;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  targetPath: string;
+  providerLabel: string;
+}) {
+  if (input.uploadPath) {
+    await copyFile(input.uploadPath, input.targetPath);
+    return;
+  }
+  if (input.sourceLocalPath) {
+    await copyFile(resolveAssetLocalPath(input.sourceLocalPath), input.targetPath);
+    return;
+  }
+  if (!input.sourceVideoUrl) {
+    throw new BridgeError("缺少前处理源素材。", 400);
+  }
+  const localPath = resolveAssetUrlLocalPath(input.sourceVideoUrl);
+  if (localPath) {
+    await copyFile(localPath, input.targetPath);
+    return;
+  }
+  const downloaded = await downloadAsset(input.sourceVideoUrl, input.providerLabel);
+  await writeFile(input.targetPath, downloaded.bytes);
+}
+
+async function normalizeVideoDuration(filePath: string, targetDuration: number) {
+  const currentDuration = await probeMediaDuration(filePath);
+  if (!currentDuration || Math.abs(currentDuration - targetDuration) < 0.05) return;
+  const hasAudio = await probeHasAudioStream(filePath);
+  const tempPath = `${filePath}.retime-${Date.now()}.mp4`;
+  const setPtsFactor = targetDuration / currentDuration;
+  const atempoFactor = currentDuration / targetDuration;
+  const args = [
+    "-y",
+    "-i",
+    filePath,
+    "-map",
+    "0:v:0",
+    "-vf",
+    `setpts=${formatFfmpegNumber(setPtsFactor)}*PTS`,
+    "-c:v",
+    "libx264",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart"
+  ];
+  if (hasAudio) {
+    args.push("-map", "0:a:0", "-af", buildAtempoFilter(atempoFactor), "-c:a", "aac");
+  } else {
+    args.push("-an");
+  }
+  args.push(tempPath);
+  try {
+    await runProcess("ffmpeg", args, 180_000);
+    await rename(tempPath, filePath);
+  } catch (error) {
+    await unlink(tempPath).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function probeMediaDuration(filePath: string) {
+  const result = await runProcess(
+    "ffprobe",
+    ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", filePath],
+    30_000
+  );
+  return positiveNumberOptional(Number(result.stdout.trim()));
+}
+
+async function probeHasAudioStream(filePath: string) {
+  const result = await runProcess(
+    "ffprobe",
+    ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", filePath],
+    30_000
+  );
+  return result.stdout.trim().length > 0;
+}
+
+async function runProcess(command: string, args: string[], timeoutMs: number) {
+  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new BridgeError(`${command} 执行超时：${Math.round(timeoutMs / 1000)}秒未完成。`, 504));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeoutId);
+      const output = {
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8")
+      };
+      if (code === 0) {
+        resolve(output);
+        return;
+      }
+      reject(new BridgeError(`${command} 执行失败：${code}${output.stderr.trim() ? `，${output.stderr.trim()}` : ""}`, 500));
+    });
+  });
+}
+
+function buildAtempoFilter(factor: number) {
+  const parts: number[] = [];
+  let remaining = factor;
+  while (remaining > 2) {
+    parts.push(2);
+    remaining /= 2;
+  }
+  while (remaining < 0.5) {
+    parts.push(0.5);
+    remaining /= 0.5;
+  }
+  parts.push(remaining);
+  return parts.map((part) => `atempo=${formatFfmpegNumber(part)}`).join(",");
+}
+
+function formatFfmpegNumber(value: number) {
+  return Number(value.toFixed(8)).toString();
 }
 
 async function fetchWithTimeout(url: string, init: TimedRequestInit = {}) {
@@ -786,13 +1118,58 @@ function assertFfmpegReady() {
   throw new BridgeError(FFMPEG_SETUP_HINT, 500);
 }
 
-function defaultFaceMosaicCommand(preview = false) {
+function stripTrailingSlash(value: string) {
+  return value.replace(/[?#].*$/, "").replace(/\/+$/, "");
+}
+
+function buildComfyUIObjectInfoUrl(endpoint: string, nodeType: string) {
+  return `${stripTrailingSlash(endpoint)}/object_info/${encodeURIComponent(nodeType)}`;
+}
+
+function safeComfyUIInputFileName(suggestedName: string, fallbackExtension: string) {
+  const extension = extensionFromUrl(suggestedName) || fallbackExtension || "bin";
+  const baseName = safePathPart(path.basename(suggestedName, path.extname(suggestedName)) || "videogen_input");
+  return `${baseName}.${extension}`;
+}
+
+function defaultFaceMosaicCommand(preview = false, effect = "mosaic", strength = 0.85) {
   const pythonPath = resolvePrivacyPythonPath();
   const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
+  const maskArgs = `--block ${maskBlockSizeForStrength(strength)} --blur ${blurKernelForStrength(strength)} --solid-alpha ${solidAlphaForStrength(strength).toFixed(2)}`;
   if (preview) {
-    return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector yunet --confidence 0.55 --detect-max-side 960 --crf 24 --input {input} --output {output}`;
+    return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector mediapipe-face --confidence 0.68 --mediapipe-landmark-confidence 0.5 --mediapipe-landmark-expand 0.03 --expand 0.08 --hold-frames 4 --smooth 0.35 --mode ${shellQuote(faceMosaicModeArg(effect))} --mask-shape ellipse ${maskArgs} --crf 24 --input {input} --output {output}`;
   }
-  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector auto --det-size 640 --detect-max-side 1280 --input {input} --output {output}`;
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector mediapipe-face --confidence 0.72 --mediapipe-landmark-confidence 0.5 --mediapipe-landmark-expand 0.04 --expand 0.1 --hold-frames 5 --smooth 0.4 --mode ${shellQuote(faceMosaicModeArg(effect))} --mask-shape ellipse ${maskArgs} --input {input} --output {output}`;
+}
+
+function parseFaceMosaicEffect(value: string) {
+  if (value === "blur" || value === "solid") return value;
+  return "mosaic";
+}
+
+function faceMosaicModeArg(effect: string) {
+  if (effect === "blur") return "blur";
+  if (effect === "solid") return "solid";
+  return "mosaic";
+}
+
+function parseMaskStrength(value: unknown, fallback = 0.85) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.min(1, Math.max(0.2, numeric));
+}
+
+function maskBlockSizeForStrength(strength: number) {
+  return Math.round(6 + parseMaskStrength(strength) * 30);
+}
+
+function blurKernelForStrength(strength: number) {
+  const kernel = Math.round(9 + parseMaskStrength(strength) * 58);
+  return kernel % 2 === 0 ? kernel + 1 : kernel;
+}
+
+function solidAlphaForStrength(strength: number) {
+  return parseMaskStrength(strength);
 }
 
 function defaultBrandMaskCommand(blockOnRed = true) {
@@ -805,6 +1182,153 @@ function defaultDepthVideoCommand() {
   const pythonPath = resolveDepthVideoPythonPath();
   const scriptPath = path.join(rootDir, "scripts", "depth_video.py");
   return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --model {model} --model-path {modelPath} --resolution {resolution} --fps {fps} --color-mode {colorMode} --input-size {inputSize} {letterbox} --edge-filter-strength {edgeFilterStrength} --edge-filter-diameter {edgeFilterDiameter} {invert}`;
+}
+
+function defaultGrayscaleVideoCommand() {
+  const pythonPath = resolveDepthVideoPythonPath();
+  const scriptPath = path.join(rootDir, "scripts", "grayscale_video.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --resolution {resolution} --fps {fps}`;
+}
+
+function defaultHomographyMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_HOMOGRAPHY_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "homography_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultVitTrackMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_VITTRACK_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "vittrack_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultMixFormerMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_MIXFORMER_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "mixformer_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultDDRNetMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_DDRNET_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "ddrnet_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultTrackAnythingMaskCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_TRACK_ANYTHING_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "track_anything_mask.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultMaskTrackingCommand(blockOnRed = true) {
+  const pythonPath = process.env.VIDEOGEN_MASK_TRACKING_PYTHON ||
+    process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
+    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const scriptPath = path.join(rootDir, "scripts", "external_tracker_adapter.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --engine mask-tracking --display-name ${shellQuote("Mask Tracking")} --backend-env VIDEOGEN_MASK_TRACKING_BACKEND_COMMAND --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function parseTrackingEngine(value: string) {
+  if (
+    value === "homography" ||
+    value === "vittrack" ||
+    value === "mixformer" ||
+    value === "ddrnet" ||
+    value === "track-anything" ||
+    value === "mask-tracking"
+  ) return value;
+  return "opencv";
+}
+
+function brandMaskCommandForEngine(trackingEngine: string, blockOnRed = true) {
+  if (trackingEngine === "homography") {
+    return process.env.VIDEOGEN_HOMOGRAPHY_COMMAND?.trim() || defaultHomographyMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "vittrack") {
+    return process.env.VIDEOGEN_VITTRACK_COMMAND?.trim() || defaultVitTrackMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "mixformer") {
+    return process.env.VIDEOGEN_MIXFORMER_COMMAND?.trim() || defaultMixFormerMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "ddrnet") {
+    return process.env.VIDEOGEN_DDRNET_COMMAND?.trim() || defaultDDRNetMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "track-anything") {
+    const command = process.env.VIDEOGEN_TRACK_ANYTHING_COMMAND?.trim();
+    return command || defaultTrackAnythingMaskCommand(blockOnRed);
+  }
+  if (trackingEngine === "mask-tracking") {
+    return process.env.VIDEOGEN_MASK_TRACKING_COMMAND?.trim() || defaultMaskTrackingCommand(blockOnRed);
+  }
+  return process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
+}
+
+function brandMaskCommandEnvName(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "VIDEOGEN_MASK_TRACKING_COMMAND";
+  if (trackingEngine === "track-anything") return "VIDEOGEN_TRACK_ANYTHING_COMMAND";
+  if (trackingEngine === "mixformer") return "VIDEOGEN_MIXFORMER_COMMAND";
+  if (trackingEngine === "ddrnet") return "VIDEOGEN_DDRNET_COMMAND";
+  if (trackingEngine === "vittrack") return "VIDEOGEN_VITTRACK_COMMAND";
+  if (trackingEngine === "homography") return "VIDEOGEN_HOMOGRAPHY_COMMAND";
+  return "VIDEOGEN_BRAND_MASK_COMMAND";
+}
+
+function brandMaskTimeoutMs(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return Number(process.env.VIDEOGEN_MASK_TRACKING_TIMEOUT_MS || 1_200_000);
+  if (trackingEngine === "track-anything") return Number(process.env.VIDEOGEN_TRACK_ANYTHING_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "mixformer") return Number(process.env.VIDEOGEN_MIXFORMER_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "ddrnet") return Number(process.env.VIDEOGEN_DDRNET_TIMEOUT_MS || 900_000);
+  if (trackingEngine === "vittrack") return Number(process.env.VIDEOGEN_VITTRACK_TIMEOUT_MS || 600_000);
+  if (trackingEngine === "homography") return Number(process.env.VIDEOGEN_HOMOGRAPHY_TIMEOUT_MS || 360_000);
+  return Number(process.env.VIDEOGEN_BRAND_MASK_TIMEOUT_MS || 240_000);
+}
+
+function brandMaskOutputPrefix(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "mask_tracking";
+  if (trackingEngine === "track-anything") return "track_anything_mask";
+  if (trackingEngine === "mixformer") return "mixformer_mask";
+  if (trackingEngine === "ddrnet") return "ddrnet_mask";
+  if (trackingEngine === "vittrack") return "vittrack_mask";
+  if (trackingEngine === "homography") return "homography_mask";
+  return "brand_mask";
+}
+
+function brandMaskEngineLabel(trackingEngine: string) {
+  if (trackingEngine === "mask-tracking") return "Mask Tracking ";
+  if (trackingEngine === "track-anything") return "Track-Anything ";
+  if (trackingEngine === "mixformer") return "MixFormerV2-S ";
+  if (trackingEngine === "ddrnet") return "DDRNet ";
+  if (trackingEngine === "vittrack") return "ViTTrack ";
+  if (trackingEngine === "homography") return "Homography ";
+  return "";
 }
 
 function parseCommandSummary(stdout: string) {
@@ -837,6 +1361,25 @@ function resolveAssetLocalPath(value: string) {
     throw new BridgeError("sourceLocalPath 必须来自当前 Video Generation Bridge 的资产目录。", 400);
   }
   return resolved;
+}
+
+function resolveAssetUrlLocalPath(value: string) {
+  try {
+    const parsed = new URL(value);
+    const assetPrefix = "/assets/";
+    const assetIndex = parsed.pathname.indexOf(assetPrefix);
+    if (assetIndex < 0) return undefined;
+    const relativePath = decodeURIComponent(parsed.pathname.slice(assetIndex + assetPrefix.length));
+    const resolved = path.resolve(assetRootDir, relativePath);
+    const assetRoot = path.resolve(assetRootDir);
+    if (!resolved.startsWith(`${assetRoot}${path.sep}`)) {
+      throw new BridgeError("sourceVideoUrl 必须来自当前 Video Generation Bridge 的资产目录。", 400);
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    return undefined;
+  }
 }
 
 async function readPayload(response: Response) {
@@ -956,7 +1499,14 @@ function extensionFromContentType(contentType: string | null) {
   if (contentType.includes("video/mp4")) return "mp4";
   if (contentType.includes("video/quicktime")) return "mov";
   if (contentType.includes("video/webm")) return "webm";
+  if (contentType.includes("image/png")) return "png";
+  if (contentType.includes("image/jpeg")) return "jpg";
+  if (contentType.includes("image/webp")) return "webp";
   return undefined;
+}
+
+function isVideoExtension(extension: string) {
+  return ["mp4", "mov", "webm", "mkv", "avi"].includes(extension.toLowerCase());
 }
 
 function extractUpstreamError(payload: unknown) {
@@ -973,6 +1523,11 @@ function stringifyOptional(value: unknown) {
 
 function numberOptional(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveNumberOptional(value: unknown) {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

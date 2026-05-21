@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { ShieldCheck } from "lucide-react";
+import { ShieldCheck, Wand2 } from "lucide-react";
 import {
   initialGenerationOptions,
   workflowPages
@@ -41,6 +41,7 @@ import {
   mergeProviderSettings,
   type ProviderSettings
 } from "./features/generation/providers/providerConfig";
+import { ComfyUITestPage } from "./features/generation/ComfyUITestPage";
 import { VideoGeneratePage } from "./features/generation/VideoGeneratePage";
 import { buildOperationAnalytics } from "./features/lineage/operationAnalytics";
 import type { FinalVideoRun, OperationFeedback } from "./features/lineage/lineageTypes";
@@ -63,7 +64,9 @@ import {
   applyPreprocessTraces,
   hasSegmentFaceMosaic,
   setSegmentBrandMasks,
-  setSegmentFaceMosaic
+  setSegmentFaceMosaic,
+  setSegmentFaceMosaicEffect,
+  setSegmentFaceMosaicStrength
 } from "./features/script/privacyEdits";
 import { createSegmentsFromAnalysis } from "./features/script/segmentFactory";
 import { serializeSegments, stripTransientSegmentFields } from "./features/script/segmentSerialization";
@@ -87,6 +90,7 @@ import { createId } from "./services/id";
 import {
   checkVideoGenerationBridgeHealth,
   preprocessFaceMosaicBridge,
+  uploadVideoGenerationBridgeAsset,
   type VideoGenerationBridgeHealth
 } from "./services/videoGenerationBridgeClient";
 import {
@@ -95,12 +99,13 @@ import {
   saveProjectSnapshot,
   savePrompt as savePromptToStorage
 } from "./services/projectStorage";
-import type { AnalysisResult, BrandMaskTrack, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
+import type { AnalysisResult, BrandMaskTrack, FaceMosaicEffect, GenerationOptions, Provider, StepKey, VideoSegment } from "./types";
 
 export default function App() {
   const [page, setPage] = useState<StepKey>(() => readInitialPage());
+  const [workspaceMode, setWorkspaceMode] = useState<"analysis" | "generation">(() => readInitialWorkspaceMode());
   const [projectId, setProjectId] = useState(() => createId("project"));
-  const [projectName, setProjectName] = useState("未命名爆款视频工程");
+  const [projectName, setProjectName] = useState("未命名产品视频工程");
   const [lastSavedAt, setLastSavedAt] = useState("");
   const [prompt, setPrompt] = useState(() => readSavedPrompt());
   const [sourceVideo, setSourceVideo] = useState<File>();
@@ -137,17 +142,29 @@ export default function App() {
   const [finalVideoRuns, setFinalVideoRuns] = useState<FinalVideoRun[]>([]);
   const [composeStatus, setComposeStatus] = useState<"idle" | "running" | "done">("idle");
   const [notice, setNotice] = useState("");
+  const [hasLoadedInitialProject, setHasLoadedInitialProject] = useState(false);
 
   useEffect(() => {
     return () => {
-      if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
+      if (sourcePreviewUrl.startsWith("blob:")) URL.revokeObjectURL(sourcePreviewUrl);
     };
   }, [sourcePreviewUrl]);
 
   useEffect(() => {
-    const handleHashChange = () => setPage(readInitialPage());
+    const handleHashChange = () => {
+      setPage(readInitialPage());
+      setWorkspaceMode(readInitialWorkspaceMode());
+    };
     window.addEventListener("hashchange", handleHashChange);
     return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  useEffect(() => {
+    const snapshot = loadProjectSnapshot<ProjectSnapshot>();
+    if (snapshot) {
+      applySnapshot(snapshot);
+    }
+    setHasLoadedInitialProject(true);
   }, []);
 
   const doneCount = segments.filter((item) => item.status === "done").length;
@@ -160,9 +177,47 @@ export default function App() {
     [prompt, sourceVideoMeta, videoDuration]
   );
 
+  useEffect(() => {
+    if (!hasLoadedInitialProject) return;
+    const timer = window.setTimeout(() => {
+      try {
+        saveProjectSnapshot(buildSnapshot());
+      } catch {
+        // Manual save/export will surface storage errors.
+      }
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [
+    hasLoadedInitialProject,
+    projectId,
+    projectName,
+    prompt,
+    videoDuration,
+    sourceVideoMeta,
+    analysisResult,
+    analysisSource,
+    rawGeminiResult,
+    geminiBridgeUrl,
+    geminiBridgeTask,
+    reportSection,
+    options,
+    providerSettings,
+    segments,
+    scriptRevisions,
+    materialBuckets,
+    depthClips,
+    depthImages,
+    depthRecipe,
+    depthComposePlan,
+    composeTimeline,
+    finalVideoRuns,
+    composeStatus
+  ]);
+
   function navigatePage(nextPage: StepKey) {
     setPage(nextPage);
-    const nextHash = `#${nextPage}`;
+    setWorkspaceMode(nextPage === "depth" ? "generation" : "analysis");
+    const nextHash = nextPage === "depth" ? "#video-workbench" : `#${nextPage}`;
     if (window.location.hash !== nextHash) {
       window.location.hash = nextHash;
     }
@@ -201,13 +256,13 @@ export default function App() {
   }
 
   function applySnapshot(snapshot: ProjectSnapshot) {
-    if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
+    if (sourcePreviewUrl.startsWith("blob:")) URL.revokeObjectURL(sourcePreviewUrl);
     setProjectId(snapshot.id || createId("project"));
-    setProjectName(snapshot.name || "未命名爆款视频工程");
+    setProjectName(snapshot.name || "未命名产品视频工程");
     setLastSavedAt(snapshot.updatedAt || "");
     setPrompt(snapshot.prompt || defaultAnalysisPrompt);
     setSourceVideo(undefined);
-    setSourcePreviewUrl("");
+    setSourcePreviewUrl(snapshot.sourceVideoMeta?.localAssetUrl || "");
     setSourceVideoMeta(snapshot.sourceVideoMeta);
     setVideoDuration(snapshot.videoDuration || 0);
     setAnalysisResult(snapshot.analysisResult);
@@ -239,7 +294,7 @@ export default function App() {
     setComposeTimeline(snapshot.composeTimeline || null);
     setFinalVideoRuns(snapshot.finalVideoRuns || []);
     setComposeStatus(snapshot.composeStatus === "done" ? "done" : "idle");
-    setNotice("工程已加载。视频文件本体不会写入工程 JSON，如需预览或导出真实素材，请重新上传源视频或接入后端素材库。");
+    setNotice(snapshot.sourceVideoMeta?.localAssetUrl ? "工程已加载，源视频已从本地素材库恢复。" : "工程已加载。视频文件本体不会写入工程 JSON，如需预览或导出真实素材，请重新上传源视频。");
   }
 
   function saveProject() {
@@ -289,9 +344,9 @@ export default function App() {
 
   function newProject() {
     if (!window.confirm("确认新建空工程？当前未导出的编辑内容会被清空。")) return;
-    if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
+    if (sourcePreviewUrl.startsWith("blob:")) URL.revokeObjectURL(sourcePreviewUrl);
     setProjectId(createId("project"));
-    setProjectName("未命名爆款视频工程");
+    setProjectName("未命名产品视频工程");
     setLastSavedAt("");
     setPrompt(readSavedPrompt());
     setSourceVideo(undefined);
@@ -331,16 +386,31 @@ export default function App() {
     navigatePage("input");
   }
 
-  function handleVideoFile(file?: File) {
+  async function handleVideoFile(file?: File) {
     if (!file) return;
     if (!file.type.startsWith("video/")) {
       setNotice("请上传视频文件。");
       return;
     }
-    if (sourcePreviewUrl) URL.revokeObjectURL(sourcePreviewUrl);
+    if (sourcePreviewUrl.startsWith("blob:")) URL.revokeObjectURL(sourcePreviewUrl);
+    let localAssetUrl = "";
+    let localPath = "";
+    try {
+      const uploaded = await uploadVideoGenerationBridgeAsset({
+        bridgeUrl: providerSettings.seedance.bridgeUrl,
+        projectId,
+        segmentId: "source",
+        kind: "source_video",
+        file
+      });
+      localAssetUrl = uploaded.asset.localAssetUrl;
+      localPath = uploaded.asset.localPath;
+    } catch {
+      // Keep a transient preview if the local bridge is unavailable.
+    }
     setSourceVideo(file);
-    setSourceVideoMeta({ name: file.name, size: file.size, type: file.type });
-    setSourcePreviewUrl(URL.createObjectURL(file));
+    setSourceVideoMeta({ name: file.name, size: file.size, type: file.type, localAssetUrl, localPath });
+    setSourcePreviewUrl(localAssetUrl || URL.createObjectURL(file));
     setVideoDuration(0);
     setNotice("视频已挂载到当前工程。已生成的数据不会被自动清空。");
   }
@@ -520,6 +590,44 @@ export default function App() {
     setNotice(shouldEnable ? "已为全部脚本段开启人脸打码。" : "已取消全部脚本段的人脸打码。");
   }
 
+  function updateSegmentFaceMosaicEffect(segmentId: string, effect: FaceMosaicEffect) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要设置人脸遮挡效果的脚本段。");
+      return;
+    }
+    setSegments((items) =>
+      items.map((item) => (item.id === segmentId ? setSegmentFaceMosaicEffect(item, effect) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
+    });
+    setComposeTimeline(null);
+    setFacePreviewError("");
+    setNotice(`已将「${target.title || "该段落"}」人脸遮挡效果切换为${faceEffectLabel(effect)}。重新运行人脸预览后生效。`);
+  }
+
+  function updateSegmentFaceMosaicStrength(segmentId: string, strength: number) {
+    const target = segments.find((item) => item.id === segmentId);
+    if (!target) {
+      setNotice("未找到要设置人脸打码强度的脚本段。");
+      return;
+    }
+    setSegments((items) =>
+      items.map((item) => (item.id === segmentId ? setSegmentFaceMosaicStrength(item, strength) : item))
+    );
+    setScriptSuggestions((items) => {
+      const next = { ...items };
+      delete next[segmentId];
+      return next;
+    });
+    setComposeTimeline(null);
+    setFacePreviewError("");
+    setNotice(`已将「${target.title || "该段落"}」人脸打码强度调整为 ${Math.round(strength * 100)}%。重新运行人脸预览后生效。`);
+  }
+
   async function previewSegmentFaceMosaic(segmentId: string) {
     const target = segments.find((item) => item.id === segmentId);
     if (!target) {
@@ -541,6 +649,8 @@ export default function App() {
         segmentId: target.id,
         sourceRange: target.role,
         preview: true,
+        effect: target.privacyEdits?.faceMosaicEffect ?? "mosaic",
+        strength: target.privacyEdits?.faceMosaicStrength ?? 0.85,
         video: sourceVideo
       });
       setSegments((items) =>
@@ -1143,9 +1253,27 @@ export default function App() {
           <h1>爆款视频分析与生成工作流</h1>
         </div>
         <div className="topbar-actions">
-          <a className="secondary-button topbar-test-button" href="#mask-test" onClick={() => setPage("mask-test")}>
+          <a
+            className="secondary-button topbar-test-button"
+            href="#mask-test"
+            onClick={(event) => {
+              event.preventDefault();
+              navigatePage("mask-test");
+            }}
+          >
             <ShieldCheck size={16} />
             打码测试台
+          </a>
+          <a
+            className="secondary-button topbar-test-button"
+            href="#comfyui-test"
+            onClick={(event) => {
+              event.preventDefault();
+              navigatePage("comfyui-test");
+            }}
+          >
+            <Wand2 size={16} />
+            ComfyUI 测试台
           </a>
           <div className="topbar-stats">
             <span>{analysisResult ? "已完成分析" : "等待分析"}</span>
@@ -1168,25 +1296,44 @@ export default function App() {
         onImport={importProjectJson}
       />
 
-      <nav className="stepper workflow-stepper" aria-label="工作流页面">
-        {workflowPages.map((item, index) => (
-          <button
-            key={item.key}
-            className={`step ${item.key === page ? "active" : ""}`}
-            onClick={() => navigatePage(item.key)}
-          >
-            <span className="step-index">{index + 1}</span>
-            <span>
-              <strong>{item.title}</strong>
-              <small>{item.subtitle}</small>
-            </span>
-          </button>
-        ))}
+      <nav className="workspace-switcher" aria-label="工作台切换">
+        <button className={workspaceMode === "analysis" ? "active" : ""} onClick={() => navigatePage(page === "depth" ? "input" : page)}>
+          <Wand2 size={16} />
+          <span>
+            <strong>爆款视频分析与生成</strong>
+            <small>分析、脚本、分段生成、合成导出</small>
+          </span>
+        </button>
+        <button className={workspaceMode === "generation" ? "active" : ""} onClick={() => navigatePage("depth")}>
+          <ShieldCheck size={16} />
+          <span>
+            <strong>视频生成工作台</strong>
+            <small>素材库、深度视频、AI加工、标签拼接</small>
+          </span>
+        </button>
       </nav>
+
+      {workspaceMode === "analysis" && (
+        <nav className="stepper workflow-stepper" aria-label="工作流页面">
+          {workflowPages.map((item, index) => (
+            <button
+              key={item.key}
+              className={`step ${item.key === page ? "active" : ""}`}
+              onClick={() => navigatePage(item.key)}
+            >
+              <span className="step-index">{index + 1}</span>
+              <span>
+                <strong>{item.title}</strong>
+                <small>{item.subtitle}</small>
+              </span>
+            </button>
+          ))}
+        </nav>
+      )}
 
       {notice && <div className="notice">{notice}</div>}
 
-      {page === "input" && (
+      {workspaceMode === "analysis" && page === "input" && (
         <AnalyzeInputPage
           prompt={prompt}
           sourceVideo={sourceVideo}
@@ -1224,7 +1371,7 @@ export default function App() {
         />
       )}
 
-      {page === "report" && (
+      {workspaceMode === "analysis" && page === "report" && (
         <AnalysisReportPage
           result={analysisResult}
           reportSection={reportSection}
@@ -1241,7 +1388,7 @@ export default function App() {
         />
       )}
 
-      {page === "script" && (
+      {workspaceMode === "analysis" && page === "script" && (
         <ScriptEditorPage
           analysisResult={analysisResult}
           segments={segments}
@@ -1260,6 +1407,8 @@ export default function App() {
           onSuggestRewrite={suggestScriptRewrite}
           onApplySuggestion={applyScriptSuggestion}
           onToggleFaceMosaic={toggleSegmentFaceMosaic}
+          onChangeFaceMosaicEffect={updateSegmentFaceMosaicEffect}
+          onChangeFaceMosaicStrength={updateSegmentFaceMosaicStrength}
           onToggleAllFaceMosaic={toggleAllSegmentFaceMosaic}
           onPreviewFaceMosaic={previewSegmentFaceMosaic}
           onUpdateBrandMasks={updateSegmentBrandMasks}
@@ -1269,11 +1418,15 @@ export default function App() {
         />
       )}
 
-      {page === "mask-test" && (
+      {workspaceMode === "analysis" && page === "mask-test" && (
         <MaskTestPage bridgeUrl={providerSettings.seedance.bridgeUrl} />
       )}
 
-      {page === "generate" && (
+      {workspaceMode === "analysis" && page === "comfyui-test" && (
+        <ComfyUITestPage bridgeUrl={providerSettings.comfyui.bridgeUrl} />
+      )}
+
+      {workspaceMode === "analysis" && page === "generate" && (
         <VideoGeneratePage
           options={options}
           providerSettings={providerSettings}
@@ -1303,7 +1456,7 @@ export default function App() {
         />
       )}
 
-      {page === "depth" && (
+      {workspaceMode === "generation" && page === "depth" && (
         <DepthVideoWorkbenchPage
           clips={depthClips}
           images={depthImages}
@@ -1312,6 +1465,8 @@ export default function App() {
           segments={segments}
           sourcePreviewUrl={sourcePreviewUrl}
           sourceVideo={sourceVideo}
+          sourceVideoLocalPath={sourceVideoMeta?.localPath}
+          sourceVideoName={sourceVideoMeta?.name}
           projectId={projectId}
           bridgeUrl={providerSettings.seedance.bridgeUrl}
           onClips={setDepthClips}
@@ -1324,7 +1479,7 @@ export default function App() {
         />
       )}
 
-      {page === "compose" && (
+      {workspaceMode === "analysis" && page === "compose" && (
         <ComposeExportPage
           segments={segments}
           materialBuckets={materialBuckets}
@@ -1358,6 +1513,12 @@ function delay(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function faceEffectLabel(effect: FaceMosaicEffect) {
+  if (effect === "blur") return "高斯模糊";
+  if (effect === "solid") return "色块遮挡";
+  return "马赛克";
+}
+
 function readSavedPrompt() {
   return readPromptFromStorage(defaultAnalysisPrompt);
 }
@@ -1365,11 +1526,18 @@ function readSavedPrompt() {
 function readInitialPage(): StepKey {
   if (typeof window === "undefined") return "input";
   const hashPage = window.location.hash.replace(/^#/, "");
+  if (hashPage === "video-workbench") return "depth";
   return isStepKey(hashPage) ? hashPage : "input";
 }
 
+function readInitialWorkspaceMode(): "analysis" | "generation" {
+  if (typeof window === "undefined") return "analysis";
+  const hashPage = window.location.hash.replace(/^#/, "");
+  return hashPage === "video-workbench" || hashPage === "depth" ? "generation" : "analysis";
+}
+
 function isStepKey(value: string): value is StepKey {
-  return value === "mask-test" || workflowPages.some((item) => item.key === value);
+  return value === "depth" || value === "mask-test" || value === "comfyui-test" || workflowPages.some((item) => item.key === value);
 }
 
 function serializeDepthClips(clips: MaterialClip[]): MaterialClip[] {

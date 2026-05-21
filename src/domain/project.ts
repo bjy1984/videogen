@@ -19,6 +19,8 @@ export interface ProjectSnapshot {
     name: string;
     size: number;
     type: string;
+    localAssetUrl?: string;
+    localPath?: string;
   };
   analysisResult: AnalysisResult | null;
   analysisSource: AnalysisSource;

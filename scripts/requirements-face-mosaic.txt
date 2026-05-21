@@ -3,3 +3,4 @@ opencv-python>=4.10
 insightface>=0.7.3
 onnxruntime>=1.18
 imageio-ffmpeg>=0.5.1
+qai-hub-models[mediapipe-face]>=0.53.1

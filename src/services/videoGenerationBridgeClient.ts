@@ -13,7 +13,7 @@ import type {
   SeedanceTaskResponse
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
-import type { BrandMaskTrack, VideoPreprocessTrace } from "../types";
+import type { BrandMaskTrack, BrandMaskTrackingEngine, FaceMosaicEffect, VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
   ok: boolean;
@@ -28,7 +28,23 @@ export interface VideoGenerationBridgeHealth {
   comfyui?: {
     endpoint: string;
     reachable: boolean;
+    nagCfgGuiderAvailable?: boolean;
+    nagCfgGuiderError?: string;
     error?: string;
+  };
+  privacyPython?: {
+    path: string;
+    ready: boolean;
+  };
+  ffmpeg?: {
+    ready: boolean;
+  };
+  depthVideo?: {
+    path: string;
+    ready: boolean;
+    algorithm: string;
+    modelPath: string;
+    hasModel: boolean;
   };
 }
 
@@ -40,6 +56,36 @@ export class VideoGenerationBridgeError extends Error {
     super(message);
     this.name = "VideoGenerationBridgeError";
   }
+}
+
+export interface UploadedBridgeAsset {
+  projectId: string;
+  segmentId: string;
+  kind: string;
+  fileName: string;
+  localPath: string;
+  localAssetUrl: string;
+  savedAt: string;
+}
+
+export async function uploadVideoGenerationBridgeAsset(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  segmentId: string;
+  kind: string;
+  file: File;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("segmentId", input.segmentId);
+  formData.set("kind", input.kind);
+  formData.set("file", input.file, input.file.name || `${input.kind}.bin`);
+  return requestBridgeForm<{ asset: UploadedBridgeAsset }>(
+    input.bridgeUrl,
+    "/assets/upload",
+    formData,
+    180_000
+  );
 }
 
 export async function createSeedanceBridgeTask(input: {
@@ -60,7 +106,7 @@ export async function createComfyUIBridgeTask(input: {
   return requestBridge<ComfyUITaskResponse>(input.bridgeUrl || FALLBACK_COMFYUI_BRIDGE_URL, "/comfyui/tasks", {
     method: "POST",
     body: JSON.stringify(input.request),
-    timeoutMs: 45_000
+    timeoutMs: 240_000
   });
 }
 
@@ -79,6 +125,8 @@ export async function preprocessFaceMosaicBridge(input: {
   segmentId: string;
   sourceRange?: string;
   preview?: boolean;
+  effect?: FaceMosaicEffect;
+  strength?: number;
   video: File;
 }) {
   const formData = new FormData();
@@ -86,6 +134,8 @@ export async function preprocessFaceMosaicBridge(input: {
   formData.set("segmentId", input.segmentId);
   if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
   if (input.preview !== undefined) formData.set("preview", input.preview ? "true" : "false");
+  if (input.effect) formData.set("effect", input.effect);
+  if (input.strength !== undefined) formData.set("strength", String(input.strength));
   formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
     input.bridgeUrl,
@@ -102,8 +152,10 @@ export async function preprocessBrandMaskBridge(input: {
   sourceRange?: string;
   video?: File;
   sourceLocalPath?: string;
+  sourceVideoUrl?: string;
   sourceVideoName?: string;
   blockOnRed?: boolean;
+  trackingEngine?: BrandMaskTrackingEngine;
   tracks: BrandMaskTrack[];
 }) {
   const formData = new FormData();
@@ -111,23 +163,38 @@ export async function preprocessBrandMaskBridge(input: {
   formData.set("segmentId", input.segmentId);
   if (input.sourceRange) formData.set("sourceRange", input.sourceRange);
   if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
   if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
   if (input.blockOnRed !== undefined) formData.set("blockOnRed", input.blockOnRed ? "true" : "false");
+  if (input.trackingEngine) formData.set("trackingEngine", input.trackingEngine);
   formData.set("tracks", JSON.stringify(input.tracks));
   if (input.video) formData.set("video", input.video, input.video.name || `${input.segmentId}.mp4`);
+  const timeoutMs = brandMaskTimeoutMs(input.trackingEngine);
   return requestBridgeForm<{ trace: VideoPreprocessTrace }>(
     input.bridgeUrl,
     "/privacy/brand-mask",
     formData,
-    240_000
+    timeoutMs
   );
+}
+
+function brandMaskTimeoutMs(engine?: BrandMaskTrackingEngine) {
+  if (engine === "mask-tracking") return 1_200_000;
+  if (engine === "track-anything" || engine === "mixformer") return 900_000;
+  if (engine === "ddrnet") return 900_000;
+  if (engine === "vittrack") return 600_000;
+  if (engine === "homography") return 360_000;
+  return 240_000;
 }
 
 export async function preprocessDepthVideoBridge(input: {
   bridgeUrl?: string;
   projectId: string;
   clipId: string;
-  video: File;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  sourceVideoName?: string;
   model: string;
   modelPath?: string;
   resolution: "720p" | "1080p";
@@ -152,7 +219,10 @@ export async function preprocessDepthVideoBridge(input: {
   if (input.letterbox !== undefined) formData.set("letterbox", input.letterbox ? "true" : "false");
   if (input.edgeFilterStrength !== undefined) formData.set("edgeFilterStrength", String(input.edgeFilterStrength));
   if (input.edgeFilterDiameter !== undefined) formData.set("edgeFilterDiameter", String(input.edgeFilterDiameter));
-  formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
   return requestBridgeForm<{
     trace: {
       id: string;
@@ -186,6 +256,51 @@ export async function preprocessDepthVideoBridge(input: {
       updatedAt: string;
     };
   }>(input.bridgeUrl, "/depth/preprocess", formData, 600_000);
+}
+
+export async function preprocessGrayscaleVideoBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  sourceVideoName?: string;
+  resolution: "720p" | "1080p";
+  fps?: number;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("clipId", input.clipId);
+  formData.set("resolution", input.resolution);
+  if (input.fps) formData.set("fps", String(input.fps));
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  return requestBridgeForm<{
+    trace: {
+      id: string;
+      kind: "grayscale-video";
+      provider: "local-bridge";
+      status: "done";
+      sourceVideoName?: string;
+      sourceVideoUrl?: string;
+      outputVideoUrl: string;
+      localPath?: string;
+      summary?: {
+        frameCount?: number;
+        durationSec?: number;
+        width?: number;
+        height?: number;
+        fps?: number;
+        elapsedSec?: number;
+        algorithm?: string;
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+  }>(input.bridgeUrl, "/video/preprocess/grayscale", formData, 300_000);
 }
 
 export async function getSeedanceBridgeTask(input: {
@@ -251,6 +366,7 @@ export async function syncComfyUIBridgeAsset(input: {
   projectId: string;
   assetId: string;
   outputNodeId?: string;
+  targetDuration?: number;
 }) {
   return requestBridge<ComfyUISyncAssetResponse>(
     input.bridgeUrl || FALLBACK_COMFYUI_BRIDGE_URL,
@@ -261,7 +377,8 @@ export async function syncComfyUIBridgeAsset(input: {
         endpoint: input.endpoint,
         projectId: input.projectId,
         assetId: input.assetId,
-        outputNodeId: input.outputNodeId
+        outputNodeId: input.outputNodeId,
+        targetDuration: input.targetDuration
       }),
       timeoutMs: 120_000
     }
@@ -278,7 +395,7 @@ async function requestBridge<T>(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL, path: s
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   const { timeoutMs: _timeoutMs, signal, ...fetchInit } = init;
   try {
-    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+    const response = await fetch(`${normalizeVideoGenerationBridgeUrl(bridgeUrl)}${path}`, {
       ...fetchInit,
       signal: signal ?? controller.signal,
       headers: {
@@ -313,7 +430,7 @@ async function requestBridgeForm<T>(
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(`${stripTrailingSlash(bridgeUrl)}${path}`, {
+    const response = await fetch(`${normalizeVideoGenerationBridgeUrl(bridgeUrl)}${path}`, {
       method: "POST",
       body,
       signal: controller.signal
@@ -338,4 +455,12 @@ async function requestBridgeForm<T>(
 
 function stripTrailingSlash(value: string) {
   return value.replace(/\/+$/, "");
+}
+
+export function normalizeVideoGenerationBridgeUrl(bridgeUrl = DEFAULT_SEEDANCE_BRIDGE_URL) {
+  const trimmed = bridgeUrl.trim();
+  if (!trimmed || trimmed === "http://localhost:8788" || trimmed === "http://127.0.0.1:8788") {
+    return stripTrailingSlash(DEFAULT_SEEDANCE_BRIDGE_URL);
+  }
+  return stripTrailingSlash(trimmed);
 }
