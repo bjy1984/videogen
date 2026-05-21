@@ -757,11 +757,27 @@ def clamp_float(value: float, minimum: float, maximum: float) -> float:
     return min(maximum, max(minimum, value))
 
 
-def merge_audio(input_path: Path, temp_video: Path, output_path: Path, crf: str) -> None:
+def resolve_ffmpeg() -> str:
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        shutil.copyfile(temp_video, output_path)
-        return
+    if ffmpeg:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).exists():
+            return bundled
+    except Exception:
+        pass
+    raise SystemExit(
+        "未找到 ffmpeg，无法导出浏览器可播放的 H.264 视频。"
+        "请安装系统 ffmpeg（如 brew install ffmpeg），"
+        "或在虚拟环境中执行: pip install imageio-ffmpeg"
+    )
+
+
+def merge_audio(input_path: Path, temp_video: Path, output_path: Path, crf: str) -> None:
+    ffmpeg = resolve_ffmpeg()
     command = [
         ffmpeg,
         "-y",
@@ -784,6 +800,8 @@ def merge_audio(input_path: Path, temp_video: Path, output_path: Path, crf: str)
         str(crf),
         "-pix_fmt",
         "yuv420p",
+        "-movflags",
+        "+faststart",
         "-c:a",
         "copy",
         "-shortest",

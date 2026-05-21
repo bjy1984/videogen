@@ -1,7 +1,8 @@
 import cors from "cors";
 import express from "express";
 import multer from "multer";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,6 +35,11 @@ const rootDir = path.resolve(__dirname, "..");
 const assetRootDir = process.env.VIDEOGEN_ASSET_ROOT || path.join(rootDir, ".videogen-assets");
 const uploadTempDir = path.join(assetRootDir, "_uploads");
 const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8788);
+const defaultDepthAnythingOnnxPath = path.join(
+  rootDir,
+  "models",
+  "depth_anything_vits14_fabiosim_v1_opencv_static_upsample.onnx"
+);
 const app = express();
 const upload = multer({ dest: uploadTempDir });
 
@@ -63,12 +69,28 @@ app.get("/health", async (req, res) => {
       endpoint: comfyEndpoint,
       reachable: comfyHealth.reachable,
       error: comfyHealth.error
+    },
+    privacyPython: {
+      path: resolvePrivacyPythonPath(),
+      ready: privacyPythonReady()
+    },
+    ffmpeg: {
+      ready: ffmpegReady()
+    },
+    depthVideo: {
+      path: resolveDepthVideoPythonPath(),
+      ready: depthPythonReady(),
+      algorithm: "opencv-dnn-depth-anything",
+      modelPath: resolveDepthAnythingModelPath(),
+      hasModel: depthAnythingModelReady()
     }
   });
 });
 
 app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
   try {
+    assertPrivacyPythonReady();
+    assertFfmpegReady();
     if (!req.file) {
       throw new BridgeError("请上传需要预处理的原素材视频。", 400);
     }
@@ -128,6 +150,8 @@ app.post("/privacy/face-mosaic", upload.single("video"), async (req, res) => {
 
 app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   try {
+    assertPrivacyPythonReady();
+    assertFfmpegReady();
     const blockOnRed = String(req.body.blockOnRed ?? "true") !== "false";
     const commandTemplate = process.env.VIDEOGEN_BRAND_MASK_COMMAND?.trim() || defaultBrandMaskCommand(blockOnRed);
     const tracks = parseTracks(String(req.body.tracks || "[]"));
@@ -202,6 +226,86 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
     const status = error instanceof BridgeError ? error.status : 500;
     res.status(status).json({
       error: error instanceof Error ? error.message : "Brand mask preprocessing failed."
+    });
+  }
+});
+
+app.post("/depth/preprocess", upload.single("video"), async (req, res) => {
+  try {
+    assertDepthPythonReady();
+    if (!req.file) {
+      throw new BridgeError("请上传需要生成深度视频的原素材。", 400);
+    }
+    const commandTemplate = process.env.VIDEOGEN_DEPTH_VIDEO_COMMAND?.trim() || defaultDepthVideoCommand();
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const clipId = safePathPart(String(req.body.clipId || "clip"));
+    const preprocessId = safePathPart(`depth_${Date.now()}`);
+    const model = String(req.body.model || "depth-anything-dnn");
+    const modelPath = String(req.body.modelPath || resolveDepthAnythingModelPath());
+    assertDepthAnythingModelReady(modelPath);
+    const resolution = String(req.body.resolution || "1080p");
+    const colorMode = String(req.body.colorMode || "grayscale");
+    const fps = String(req.body.fps || "");
+    const invert = String(req.body.invert ?? "false") === "true";
+    const inputSize = String(req.body.inputSize || "518");
+    const letterbox = String(req.body.letterbox ?? "true") !== "false";
+    const edgeFilterStrength = String(req.body.edgeFilterStrength || "0.35");
+    const edgeFilterDiameter = String(req.body.edgeFilterDiameter || "7");
+    const extension =
+      extensionFromContentType(req.file.mimetype) ||
+      extensionFromUrl(req.file.originalname) ||
+      "mp4";
+    const relativeDir = path.join("depth", projectId, clipId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    const outputPath = path.join(outputDir, "depth.mp4");
+    await copyFile(req.file.path, sourcePath);
+
+    const commandResult = await runPreprocessCommand({
+      commandTemplate,
+      inputPath: sourcePath,
+      outputPath,
+      timeoutMs: Number(process.env.VIDEOGEN_DEPTH_VIDEO_TIMEOUT_MS || 600_000),
+      placeholderError: "VIDEOGEN_DEPTH_VIDEO_COMMAND 必须包含 {input} 和 {output} 占位符。",
+      failurePrefix: "深度视频生成命令失败",
+      timeoutMessage: "深度视频生成超时",
+      replacements: {
+        "{model}": shellQuote(model),
+        "{modelPath}": shellQuote(modelPath),
+        "{resolution}": shellQuote(resolution),
+        "{colorMode}": shellQuote(colorMode),
+        "{fps}": shellQuote(fps),
+        "{invert}": invert ? "--invert" : "",
+        "{inputSize}": shellQuote(inputSize),
+        "{letterbox}": letterbox ? "--letterbox" : "--no-letterbox",
+        "{edgeFilterStrength}": shellQuote(edgeFilterStrength),
+        "{edgeFilterDiameter}": shellQuote(edgeFilterDiameter)
+      }
+    });
+    await stat(outputPath);
+    const summary = parseCommandSummary(commandResult.stdout);
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "depth-video",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: req.file.originalname,
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        outputVideoUrl: assetUrl(req, relativeDir, "depth.mp4"),
+        localPath: outputPath,
+        summary,
+        createdAt: now,
+        updatedAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Depth video preprocessing failed."
     });
   }
 });
@@ -531,6 +635,7 @@ async function runPreprocessCommand(input: {
   failurePrefix: string;
   timeoutMessage: string;
   requiredPlaceholders?: string[];
+  replacements?: Record<string, string>;
 }) {
   const requiredPlaceholders = input.requiredPlaceholders ?? ["{input}", "{output}"];
   if (!requiredPlaceholders.every((placeholder) => input.commandTemplate.includes(placeholder))) {
@@ -540,8 +645,12 @@ async function runPreprocessCommand(input: {
     .replaceAll("{input}", shellQuote(input.inputPath))
     .replaceAll("{output}", shellQuote(input.outputPath))
     .replaceAll("{spec}", shellQuote(input.specPath || ""));
+  const commandWithReplacements = Object.entries(input.replacements || {}).reduce(
+    (current, [placeholder, value]) => current.replaceAll(placeholder, value),
+    command
+  );
   return await new Promise<{ stdout: string }>((resolve, reject) => {
-    const child = spawn(command, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(commandWithReplacements, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     const timeoutId = setTimeout(() => {
@@ -570,11 +679,115 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+const PRIVACY_VENV_SETUP_HINT =
+  "请先运行 bash scripts/setup-face-mosaic-venv.sh 创建 .venv-face-mosaic，或设置 VIDEOGEN_FACE_MOSAIC_PYTHON / VIDEOGEN_BRAND_MASK_PYTHON。";
+
+const DEPTH_VIDEO_VENV_SETUP_HINT =
+  "请先运行 bash scripts/setup-depth-video-venv.sh 创建 .venv-depth-video，设置 VIDEOGEN_DEPTH_VIDEO_PYTHON，并配置 VIDEOGEN_DEPTH_ANYTHING_ONNX 指向 Depth Anything ONNX 模型。";
+
+const FFMPEG_SETUP_HINT =
+  "预处理需要 ffmpeg 以导出浏览器可播放的 H.264 视频。请安装系统 ffmpeg（如 brew install ffmpeg），或在虚拟环境中执行: pip install imageio-ffmpeg";
+
+function defaultPrivacyVenvPythonPath() {
+  return process.platform === "win32"
+    ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
+    : path.join(rootDir, ".venv-face-mosaic", "bin", "python");
+}
+
+function defaultDepthVideoVenvPythonPath() {
+  return process.platform === "win32"
+    ? path.join(rootDir, ".venv-depth-video", "Scripts", "python.exe")
+    : path.join(rootDir, ".venv-depth-video", "bin", "python");
+}
+
+function resolvePrivacyPythonPath() {
+  const fromEnv = process.env.VIDEOGEN_BRAND_MASK_PYTHON?.trim() || process.env.VIDEOGEN_FACE_MOSAIC_PYTHON?.trim();
+  if (fromEnv) return fromEnv;
+  const venvPython = defaultPrivacyVenvPythonPath();
+  if (existsSync(venvPython)) return venvPython;
+  return "python3";
+}
+
+function resolveDepthVideoPythonPath() {
+  const fromEnv = process.env.VIDEOGEN_DEPTH_VIDEO_PYTHON?.trim();
+  if (fromEnv) return fromEnv;
+  const venvPython = defaultDepthVideoVenvPythonPath();
+  if (existsSync(venvPython)) return venvPython;
+  return resolvePrivacyPythonPath();
+}
+
+function privacyPythonReady() {
+  const pythonPath = resolvePrivacyPythonPath();
+  if (pythonPath === "python3") {
+    return existsSync(defaultPrivacyVenvPythonPath());
+  }
+  return existsSync(pythonPath);
+}
+
+function assertPrivacyPythonReady() {
+  if (privacyPythonReady()) return;
+  throw new BridgeError(PRIVACY_VENV_SETUP_HINT, 500);
+}
+
+function depthPythonReady() {
+  const pythonPath = resolveDepthVideoPythonPath();
+  if (pythonPath === "python3") {
+    return existsSync(defaultDepthVideoVenvPythonPath()) || existsSync(defaultPrivacyVenvPythonPath());
+  }
+  return existsSync(pythonPath);
+}
+
+function assertDepthPythonReady() {
+  if (depthPythonReady()) return;
+  throw new BridgeError(DEPTH_VIDEO_VENV_SETUP_HINT, 500);
+}
+
+function resolveDepthAnythingModelPath() {
+  return process.env.VIDEOGEN_DEPTH_ANYTHING_ONNX?.trim() || defaultDepthAnythingOnnxPath;
+}
+
+function depthAnythingModelReady() {
+  return existsSync(resolveDepthAnythingModelPath());
+}
+
+function assertDepthAnythingModelReady(modelPath: string) {
+  if (modelPath && existsSync(modelPath)) return;
+  throw new BridgeError(
+    `请配置 VIDEOGEN_DEPTH_ANYTHING_ONNX，或放置默认模型：${defaultDepthAnythingOnnxPath}。模型必须可被 OpenCV DNN 加载。`,
+    500
+  );
+}
+
+function ffmpegReady() {
+  const pythonPath = resolvePrivacyPythonPath();
+  const result = spawnSync(
+    pythonPath,
+    [
+      "-c",
+      [
+        "import shutil",
+        "try:",
+        "    import imageio_ffmpeg",
+        "    bundled = imageio_ffmpeg.get_ffmpeg_exe()",
+        "    if bundled:",
+        "        raise SystemExit(0)",
+        "except Exception:",
+        "    pass",
+        "raise SystemExit(0 if shutil.which('ffmpeg') else 1)"
+      ].join("\n")
+    ],
+    { encoding: "utf8" }
+  );
+  return result.status === 0;
+}
+
+function assertFfmpegReady() {
+  if (ffmpegReady()) return;
+  throw new BridgeError(FFMPEG_SETUP_HINT, 500);
+}
+
 function defaultFaceMosaicCommand(preview = false) {
-  const pythonPath = process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
-    (process.platform === "win32"
-      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
-      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const pythonPath = resolvePrivacyPythonPath();
   const scriptPath = path.join(rootDir, "scripts", "face_mosaic.py");
   if (preview) {
     return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --detector yunet --confidence 0.55 --detect-max-side 960 --crf 24 --input {input} --output {output}`;
@@ -583,13 +796,15 @@ function defaultFaceMosaicCommand(preview = false) {
 }
 
 function defaultBrandMaskCommand(blockOnRed = true) {
-  const pythonPath = process.env.VIDEOGEN_BRAND_MASK_PYTHON ||
-    process.env.VIDEOGEN_FACE_MOSAIC_PYTHON ||
-    (process.platform === "win32"
-      ? path.join(rootDir, ".venv-face-mosaic", "Scripts", "python.exe")
-      : path.join(rootDir, ".venv-face-mosaic", "bin", "python"));
+  const pythonPath = resolvePrivacyPythonPath();
   const scriptPath = path.join(rootDir, "scripts", "brand_mask.py");
   return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --spec {spec}${blockOnRed ? " --block-on-red" : ""}`;
+}
+
+function defaultDepthVideoCommand() {
+  const pythonPath = resolveDepthVideoPythonPath();
+  const scriptPath = path.join(rootDir, "scripts", "depth_video.py");
+  return `${shellQuote(pythonPath)} ${shellQuote(scriptPath)} --input {input} --output {output} --model {model} --model-path {modelPath} --resolution {resolution} --fps {fps} --color-mode {colorMode} --input-size {inputSize} {letterbox} --edge-filter-strength {edgeFilterStrength} --edge-filter-diameter {edgeFilterDiameter} {invert}`;
 }
 
 function parseCommandSummary(stdout: string) {

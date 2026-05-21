@@ -6,6 +6,7 @@ import type { ProviderSettings } from "../features/generation/providers/provider
 import type { FinalVideoRun } from "../features/lineage/lineageTypes";
 import type { MaterialBucket } from "../features/remix/remixTypes";
 import type { ScriptRevision } from "../features/script/scriptRevision";
+import type { DepthWorkbenchState } from "../features/depth-workbench/depthTypes";
 
 export interface ProjectSnapshot {
   schemaVersion: 1;
@@ -30,6 +31,7 @@ export interface ProjectSnapshot {
   segments: VideoSegment[];
   scriptRevisions?: ScriptRevision[];
   materialBuckets?: MaterialBucket[];
+  depthWorkbench?: DepthWorkbenchState;
   composeTimeline?: ComposeTimeline | null;
   finalVideoRuns?: FinalVideoRun[];
   composeStatus: "idle" | "running" | "done";

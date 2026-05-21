@@ -16,6 +16,11 @@ import type { GeminiBridgeHealth } from "./features/analysis/geminiLabels";
 import { createMockAnalysis } from "./features/analysis/mockAnalysis";
 import { ComposeExportPage } from "./features/compose/ComposeExportPage";
 import {
+  createInitialDepthWorkbenchState,
+  DepthVideoWorkbenchPage
+} from "./features/depth-workbench/DepthVideoWorkbenchPage";
+import type { ImageMaterial, MaterialClip } from "./features/depth-workbench/depthTypes";
+import {
   assembleTimelineFromBuckets,
   commitTimelineUsage,
   moveTimelineClip,
@@ -124,6 +129,10 @@ export default function App() {
   const [scriptRevisions, setScriptRevisions] = useState<ScriptRevision[]>([]);
   const [scriptSuggestions, setScriptSuggestions] = useState<Record<string, ScriptRewriteSuggestion>>({});
   const [materialBuckets, setMaterialBuckets] = useState<MaterialBucket[]>(() => ensureDefaultBuckets());
+  const [depthClips, setDepthClips] = useState(() => createInitialDepthWorkbenchState().clips);
+  const [depthImages, setDepthImages] = useState(() => createInitialDepthWorkbenchState().images);
+  const [depthRecipe, setDepthRecipe] = useState(() => createInitialDepthWorkbenchState().recipe);
+  const [depthComposePlan, setDepthComposePlan] = useState(() => createInitialDepthWorkbenchState().composePlan);
   const [composeTimeline, setComposeTimeline] = useState<ComposeTimeline | null>(null);
   const [finalVideoRuns, setFinalVideoRuns] = useState<FinalVideoRun[]>([]);
   const [composeStatus, setComposeStatus] = useState<"idle" | "running" | "done">("idle");
@@ -179,6 +188,12 @@ export default function App() {
       segments: serializeSegments(segments),
       scriptRevisions,
       materialBuckets: serializeBuckets(materialBuckets),
+      depthWorkbench: {
+        clips: serializeDepthClips(depthClips),
+        images: serializeDepthImages(depthImages),
+        recipe: depthRecipe,
+        composePlan: depthComposePlan
+      },
       composeTimeline: serializeTimeline(composeTimeline),
       finalVideoRuns,
       composeStatus
@@ -216,6 +231,11 @@ export default function App() {
     setScriptRevisions(snapshot.scriptRevisions || []);
     setScriptSuggestions({});
     setMaterialBuckets(ensureDefaultBuckets(snapshot.materialBuckets || []));
+    const depthWorkbench = snapshot.depthWorkbench || createInitialDepthWorkbenchState();
+    setDepthClips(depthWorkbench.clips || []);
+    setDepthImages(depthWorkbench.images || []);
+    setDepthRecipe(depthWorkbench.recipe?.length ? depthWorkbench.recipe : createInitialDepthWorkbenchState().recipe);
+    setDepthComposePlan(depthWorkbench.composePlan || []);
     setComposeTimeline(snapshot.composeTimeline || null);
     setFinalVideoRuns(snapshot.finalVideoRuns || []);
     setComposeStatus(snapshot.composeStatus === "done" ? "done" : "idle");
@@ -299,6 +319,11 @@ export default function App() {
     setScriptRevisions([]);
     setScriptSuggestions({});
     setMaterialBuckets(ensureDefaultBuckets());
+    const depthWorkbench = createInitialDepthWorkbenchState();
+    setDepthClips(depthWorkbench.clips);
+    setDepthImages(depthWorkbench.images);
+    setDepthRecipe(depthWorkbench.recipe);
+    setDepthComposePlan(depthWorkbench.composePlan);
     setComposeTimeline(null);
     setFinalVideoRuns([]);
     setComposeStatus("idle");
@@ -1143,7 +1168,7 @@ export default function App() {
         onImport={importProjectJson}
       />
 
-      <nav className="stepper five-stepper" aria-label="工作流页面">
+      <nav className="stepper workflow-stepper" aria-label="工作流页面">
         {workflowPages.map((item, index) => (
           <button
             key={item.key}
@@ -1274,6 +1299,27 @@ export default function App() {
           onRenameBucket={renameMaterialBucket}
           onDeleteBucket={deleteMaterialBucket}
           onBack={() => navigatePage("script")}
+          onNext={() => navigatePage("depth")}
+        />
+      )}
+
+      {page === "depth" && (
+        <DepthVideoWorkbenchPage
+          clips={depthClips}
+          images={depthImages}
+          recipe={depthRecipe}
+          composePlan={depthComposePlan}
+          segments={segments}
+          sourcePreviewUrl={sourcePreviewUrl}
+          sourceVideo={sourceVideo}
+          projectId={projectId}
+          bridgeUrl={providerSettings.seedance.bridgeUrl}
+          onClips={setDepthClips}
+          onImages={setDepthImages}
+          onRecipe={setDepthRecipe}
+          onComposePlan={setDepthComposePlan}
+          onNotice={setNotice}
+          onBack={() => navigatePage("generate")}
           onNext={() => navigatePage("compose")}
         />
       )}
@@ -1324,4 +1370,15 @@ function readInitialPage(): StepKey {
 
 function isStepKey(value: string): value is StepKey {
   return value === "mask-test" || workflowPages.some((item) => item.key === value);
+}
+
+function serializeDepthClips(clips: MaterialClip[]): MaterialClip[] {
+  return clips.map((clip) => {
+    const { sourceFile: _sourceFile, ...serializableClip } = clip;
+    return serializableClip;
+  });
+}
+
+function serializeDepthImages(images: ImageMaterial[]): ImageMaterial[] {
+  return images;
 }

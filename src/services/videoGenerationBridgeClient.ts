@@ -123,6 +123,71 @@ export async function preprocessBrandMaskBridge(input: {
   );
 }
 
+export async function preprocessDepthVideoBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  video: File;
+  model: string;
+  modelPath?: string;
+  resolution: "720p" | "1080p";
+  fps?: number;
+  colorMode: "grayscale" | "magma" | "inferno";
+  invert: boolean;
+  inputSize?: number;
+  letterbox?: boolean;
+  edgeFilterStrength?: number;
+  edgeFilterDiameter?: number;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("clipId", input.clipId);
+  formData.set("model", input.model);
+  if (input.modelPath) formData.set("modelPath", input.modelPath);
+  formData.set("resolution", input.resolution);
+  if (input.fps) formData.set("fps", String(input.fps));
+  formData.set("colorMode", input.colorMode);
+  formData.set("invert", input.invert ? "true" : "false");
+  if (input.inputSize) formData.set("inputSize", String(input.inputSize));
+  if (input.letterbox !== undefined) formData.set("letterbox", input.letterbox ? "true" : "false");
+  if (input.edgeFilterStrength !== undefined) formData.set("edgeFilterStrength", String(input.edgeFilterStrength));
+  if (input.edgeFilterDiameter !== undefined) formData.set("edgeFilterDiameter", String(input.edgeFilterDiameter));
+  formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  return requestBridgeForm<{
+    trace: {
+      id: string;
+      kind: "depth-video";
+      provider: "local-bridge";
+      status: "done";
+      sourceVideoName?: string;
+      sourceVideoUrl?: string;
+      outputVideoUrl: string;
+      localPath?: string;
+      summary?: {
+        frameCount?: number;
+        durationSec?: number;
+        width?: number;
+        height?: number;
+        fps?: number;
+        elapsedSec?: number;
+        model?: string;
+        algorithm?: string;
+        inputSize?: number;
+        letterbox?: boolean;
+        edgeFilter?: {
+          strength?: number;
+          diameter?: number;
+          sigmaColor?: number;
+          sigmaSpace?: number;
+          mode?: string;
+        };
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+  }>(input.bridgeUrl, "/depth/preprocess", formData, 600_000);
+}
+
 export async function getSeedanceBridgeTask(input: {
   bridgeUrl?: string;
   endpoint: string;

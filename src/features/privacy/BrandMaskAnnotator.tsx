@@ -1,4 +1,4 @@
-import { AlertTriangle, BadgeX, Check, ExternalLink, Loader2, PanelTopClose, Plus, ScanFace, SquareDashedMousePointer, Trash2 } from "lucide-react";
+import { AlertTriangle, BadgeX, Check, Loader2, PanelTopClose, Plus, ScanFace, SquareDashedMousePointer, Trash2 } from "lucide-react";
 import type { CSSProperties, MouseEvent, PointerEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { BrandMaskEffect, BrandMaskKeyframe, BrandMaskTargetType, BrandMaskTrack, BrandMaskTrackMode, VideoPreprocessTrace, VideoSegment } from "../../types";
@@ -54,6 +54,7 @@ export function BrandMaskAnnotator({
   const [trackingPreviewElapsed, setTrackingPreviewElapsed] = useState(0);
   const [trackingPreviewTrace, setTrackingPreviewTrace] = useState<VideoPreprocessTrace>();
   const [showTrackingPreview, setShowTrackingPreview] = useState(false);
+  const [showFacePreview, setShowFacePreview] = useState(false);
   const [facePreviewElapsed, setFacePreviewElapsed] = useState(0);
 
   const faceMosaicEnabled = Boolean(segment.privacyEdits?.faceMosaic);
@@ -63,10 +64,22 @@ export function BrandMaskAnnotator({
   const visibleMask = activeTrack ? previewMaskForTrack(activeTrack, playbackTime) : undefined;
   const review = useMemo(() => buildBrandMaskReview(tracks), [tracks]);
   const videoAspect = `${videoSize.width} / ${videoSize.height}`;
-  const displayVideoUrl = showTrackingPreview && trackingPreviewUrl ? trackingPreviewUrl : sourcePreviewUrl;
-  const isPreviewMode = Boolean(showTrackingPreview && trackingPreviewUrl);
+  const facePreviewUrl = faceTrace?.outputVideoUrl ?? "";
+  const displayVideoUrl = showFacePreview && facePreviewUrl
+    ? facePreviewUrl
+    : showTrackingPreview && trackingPreviewUrl
+      ? trackingPreviewUrl
+      : sourcePreviewUrl;
+  const isPreviewMode = Boolean((showFacePreview && facePreviewUrl) || (showTrackingPreview && trackingPreviewUrl));
   const facePreviewProgress = Math.min(92, 12 + facePreviewElapsed * 4);
   const trackingPreviewProgress = Math.min(92, 10 + trackingPreviewElapsed * 5);
+
+  useEffect(() => {
+    if (isFacePreviewRunning) {
+      setShowFacePreview(false);
+      setShowTrackingPreview(false);
+    }
+  }, [isFacePreviewRunning]);
 
   useEffect(() => {
     if (!isFacePreviewRunning) {
@@ -400,13 +413,15 @@ export function BrandMaskAnnotator({
                   <span>{preprocessSummaryText(faceTrace.summary)}</span>
                 </div>
               )}
-              {faceTrace?.outputVideoUrl && (
+              {facePreviewUrl && (
                 <button
                   className="secondary-button compact full-width"
-                  onClick={() => window.open(faceTrace.outputVideoUrl, "_blank", "noopener,noreferrer")}
+                  onClick={() => {
+                    setShowTrackingPreview(false);
+                    setShowFacePreview((value) => !value);
+                  }}
                 >
-                  <ExternalLink size={14} />
-                  查看人脸结果
+                  {showFacePreview ? "返回标注" : "查看人脸结果"}
                 </button>
               )}
             </div>
