@@ -13,6 +13,7 @@ import type {
   SeedanceTaskResponse
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
+import type { ImageMaterial, MaterialClip } from "../features/depth-workbench/depthTypes";
 import type { BrandMaskTrack, BrandMaskTrackingEngine, FaceMosaicEffect, VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
@@ -66,6 +67,46 @@ export interface UploadedBridgeAsset {
   localPath: string;
   localAssetUrl: string;
   savedAt: string;
+}
+
+export interface WorkbenchLibraryState {
+  projectId: string;
+  clips: MaterialClip[];
+  images: ImageMaterial[];
+  updatedAt: string | null;
+}
+
+export async function loadWorkbenchLibraryState(input: {
+  bridgeUrl?: string;
+  projectId: string;
+}) {
+  const query = new URLSearchParams({ projectId: input.projectId });
+  return requestBridge<{ state: WorkbenchLibraryState }>(
+    input.bridgeUrl,
+    `/library/workbench-state?${query.toString()}`,
+    { method: "GET", timeoutMs: 30_000 }
+  );
+}
+
+export async function saveWorkbenchLibraryState(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clips: MaterialClip[];
+  images: ImageMaterial[];
+}) {
+  return requestBridge<{ state: WorkbenchLibraryState }>(
+    input.bridgeUrl,
+    "/library/workbench-state",
+    {
+      method: "PUT",
+      body: JSON.stringify({
+        projectId: input.projectId,
+        clips: input.clips,
+        images: input.images
+      }),
+      timeoutMs: 30_000
+    }
+  );
 }
 
 export async function uploadVideoGenerationBridgeAsset(input: {

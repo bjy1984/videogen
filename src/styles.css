@@ -1997,6 +1997,245 @@ label.secondary-button:focus-within {
   margin-top: 0;
 }
 
+.ai-workbench-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.82fr) minmax(300px, 1fr) minmax(360px, 1.12fr);
+  gap: 14px;
+  align-items: start;
+}
+
+.ai-config-panel,
+.ai-job-panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.ai-job-panel {
+  margin-top: 14px;
+  background: white;
+}
+
+.ai-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ai-panel-title > span {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background: var(--accent);
+  color: white;
+  font-weight: 900;
+}
+
+.ai-panel-title strong,
+.ai-panel-title small {
+  display: block;
+  min-width: 0;
+}
+
+.ai-panel-title small {
+  color: var(--muted);
+}
+
+.ai-video-list,
+.ai-image-list {
+  display: grid;
+  gap: 8px;
+  max-height: 330px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.ai-video-option,
+.ai-image-option,
+.ai-selected-images button {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+  color: var(--text);
+}
+
+.ai-video-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 4px 9px;
+  align-items: center;
+  min-height: 64px;
+  padding: 10px;
+  text-align: left;
+}
+
+.ai-video-option .radio-dot {
+  width: 14px;
+  height: 14px;
+  border: 2px solid #9ab3a6;
+  border-radius: 50%;
+}
+
+.ai-video-option strong,
+.ai-video-option small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-video-option small {
+  grid-column: 2;
+  color: var(--muted);
+}
+
+.ai-video-option.active,
+.ai-image-option.active {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(25, 127, 85, 0.32);
+}
+
+.ai-video-option.active .radio-dot {
+  border-color: var(--accent);
+  background: radial-gradient(circle, var(--accent) 45%, transparent 49%);
+}
+
+.ai-reference-preview {
+  display: grid;
+  gap: 10px;
+}
+
+.ai-reference-preview video {
+  width: 100%;
+  aspect-ratio: 9 / 16;
+  max-height: 360px;
+  border-radius: 8px;
+  background: #111;
+  object-fit: contain;
+}
+
+.compact-tabs {
+  margin-bottom: 0;
+}
+
+.ai-selected-images {
+  display: flex;
+  gap: 8px;
+  min-height: 74px;
+  overflow-x: auto;
+  padding: 8px;
+  border: 1px dashed #c9d8cf;
+  border-radius: 8px;
+  background: white;
+}
+
+.ai-selected-images button {
+  display: grid;
+  grid-template-columns: 46px minmax(80px, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 150px;
+  padding: 6px;
+  text-align: left;
+}
+
+.ai-selected-images img,
+.ai-image-option img {
+  width: 46px;
+  height: 46px;
+  border-radius: 6px;
+  object-fit: cover;
+  background: #eef4f0;
+}
+
+.ai-selected-images span,
+.ai-image-option span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 800;
+}
+
+.ai-selected-images small {
+  align-self: center;
+  color: var(--muted);
+}
+
+.ai-image-option {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-height: 64px;
+  padding: 8px;
+  text-align: left;
+}
+
+.ai-source-summary {
+  display: grid;
+  gap: 5px;
+  padding: 10px;
+  border-radius: 8px;
+  background: white;
+  color: var(--muted);
+}
+
+.ai-source-summary strong {
+  color: var(--text);
+}
+
+.ai-source-summary span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-prompt-panel .control-grid,
+.ai-prompt-panel label,
+.ai-prompt-panel textarea,
+.ai-prompt-panel select,
+.ai-final-prompt,
+.ai-provider-select,
+.ai-provider-select select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+}
+
+.ai-prompt-panel .control-grid,
+.ai-final-prompt,
+.ai-provider-select {
+  display: grid;
+  gap: 8px;
+}
+
+.ai-prompt-panel textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.ai-final-prompt textarea {
+  min-height: 132px;
+}
+
+.wrap-actions {
+  flex-wrap: wrap;
+}
+
+.ai-job-table {
+  margin-top: 0;
+}
+
 .depth-table-row {
   display: grid;
   grid-template-columns: minmax(0, 1.1fr) 150px minmax(0, 1.4fr);
@@ -3922,6 +4161,7 @@ label.secondary-button:focus-within {
   .depth-layout,
   .depth-tabs,
   .depth-two-column,
+  .ai-workbench-grid,
   .comfyui-test-layout {
     grid-template-columns: 1fr;
   }

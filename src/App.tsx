@@ -1469,6 +1469,7 @@ export default function App() {
           sourceVideoName={sourceVideoMeta?.name}
           projectId={projectId}
           bridgeUrl={providerSettings.seedance.bridgeUrl}
+          seedanceSettings={providerSettings.seedance}
           onClips={setDepthClips}
           onImages={setDepthImages}
           onRecipe={setDepthRecipe}

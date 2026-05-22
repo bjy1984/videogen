@@ -71,7 +71,7 @@ await run("merges provider settings and selects provider-specific params", () =>
   assert.equal(settings.seedance.bridgeUrl, DEFAULT_SEEDANCE_BRIDGE_URL);
   assert.equal(settings.seedance.endpoint, DEFAULT_SEEDANCE_ARK_BASE_URL);
   assert.equal(settings.seedance.model, DEFAULT_SEEDANCE_MODEL);
-  assert.equal(settings.seedance.apiKeyEnvName, "ARK_API_KEY");
+  assert.equal(settings.seedance.apiKeyEnvName, "NEWAPI_API_KEY");
 
   const comfyParams = providerParamsFor("comfyui", settings);
   assert.equal(comfyParams.endpoint, "http://localhost:8188");
@@ -82,7 +82,7 @@ await run("merges provider settings and selects provider-specific params", () =>
   assert.equal(LTX2_HEAD_SWAP_COMFYUI_PRESET.outputNodeId, "341");
 });
 
-await run("builds official Ark Seedance task payload and URLs", () => {
+await run("builds NewAPI Seedance task payload and URLs", () => {
   const request = buildSeedanceCreateTaskRequest({
     prompt: "  第一人称产品展示，快速切镜  ",
     aspectRatio: "9:16",
@@ -92,7 +92,7 @@ await run("builds official Ark Seedance task payload and URLs", () => {
     params: {
       model: DEFAULT_SEEDANCE_MODEL,
       endpoint: DEFAULT_SEEDANCE_ARK_BASE_URL,
-      apiKeyEnvName: "ARK_API_KEY",
+      apiKeyEnvName: "NEWAPI_API_KEY",
       resolution: "1080p",
       defaultDuration: 5,
       seed: "11",
@@ -102,22 +102,24 @@ await run("builds official Ark Seedance task payload and URLs", () => {
     }
   });
   assert.equal(request.endpoint, DEFAULT_SEEDANCE_ARK_BASE_URL);
-  assert.equal(request.apiKeyEnvName, "ARK_API_KEY");
+  assert.equal(request.apiKeyEnvName, "NEWAPI_API_KEY");
   assert.equal(request.body.model, DEFAULT_SEEDANCE_MODEL);
-  assert.equal(request.body.content[0].type, "text");
-  assert.equal(request.body.content[1].type, "image_url");
-  assert.equal(request.body.content[2].type, "video_url");
-  assert.equal(request.body.duration, 5);
-  assert.equal(request.body.seed, 11);
-  assert.equal(request.body.generate_audio, true);
-  assert.equal(request.body.return_last_frame, true);
-  assert.equal(buildSeedanceCreateUrl(DEFAULT_SEEDANCE_ARK_BASE_URL), `${DEFAULT_SEEDANCE_ARK_BASE_URL}/contents/generations/tasks`);
+  assert.equal(request.body.prompt, "第一人称产品展示，快速切镜");
+  assert.deepEqual(request.body.metadata.image_files, ["https://example.com/ref.png"]);
+  assert.deepEqual(request.body.metadata.video_files, ["https://assets.example/preprocessed-source.mp4"]);
+  assert.equal(request.body.metadata.duration, 5);
+  assert.equal(request.body.metadata.seed, 11);
+  assert.equal(request.body.metadata.generate_audio, true);
+  assert.equal(request.body.metadata.return_last_frame, true);
+  assert.equal(buildSeedanceCreateUrl(DEFAULT_SEEDANCE_ARK_BASE_URL), `${DEFAULT_SEEDANCE_ARK_BASE_URL}/v1/video/generations`);
   assert.equal(
     buildSeedanceTaskUrl(DEFAULT_SEEDANCE_ARK_BASE_URL, "cgt_test"),
-    `${DEFAULT_SEEDANCE_ARK_BASE_URL}/contents/generations/tasks/cgt_test`
+    `${DEFAULT_SEEDANCE_ARK_BASE_URL}/v1/video/generations/cgt_test`
   );
   assert.equal(mapSeedanceTaskStatus("running"), "generating");
+  assert.equal(mapSeedanceTaskStatus("in_progress"), "generating");
   assert.equal(mapSeedanceTaskStatus("succeeded"), "done");
+  assert.equal(mapSeedanceTaskStatus("completed"), "done");
   assert.equal(mapSeedanceTaskStatus("expired"), "failed");
 });
 

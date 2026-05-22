@@ -24,12 +24,15 @@ import {
 } from "../src/features/generation/providers/comfyuiApi";
 import {
   DEFAULT_SEEDANCE_ARK_BASE_URL,
+  SEEDANCE_MODEL_PRICING,
+  buildSeedanceContentUrl,
   buildSeedanceCreateUrl,
   buildSeedanceTaskUrl,
   type SeedanceCreateTaskBridgeRequest,
   type SeedanceSyncAssetResponse,
   type SeedanceTaskResponse
 } from "../src/features/generation/providers/seedanceArk";
+import { loadWorkbenchLibraryState, saveWorkbenchLibraryState, seedSeedanceModelPricing } from "./materialLibraryStore";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -46,13 +49,59 @@ const upload = multer({ dest: uploadTempDir });
 
 await mkdir(assetRootDir, { recursive: true });
 await mkdir(uploadTempDir, { recursive: true });
+seedSeedanceModelPricing(SEEDANCE_MODEL_PRICING as unknown as Array<Record<string, unknown>>).catch((error) => {
+  console.warn(`Seedance pricing seed skipped: ${error instanceof Error ? error.message : String(error)}`);
+});
 
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: "64mb" }));
 app.use("/assets", express.static(assetRootDir));
 
+app.get("/library/workbench-state", async (req, res) => {
+  try {
+    const rawProjectId = String(req.query.projectId || "").trim();
+    if (!rawProjectId) {
+      throw new BridgeError("缺少 projectId。", 400);
+    }
+    const projectId = safePathPart(rawProjectId);
+    const state = await loadWorkbenchLibraryState(projectId);
+    res.json({
+      state: state || {
+        projectId,
+        clips: [],
+        images: [],
+        updatedAt: null
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Load material library state failed."
+    });
+  }
+});
+
+app.put("/library/workbench-state", async (req, res) => {
+  try {
+    const rawProjectId = String(req.body?.projectId || "").trim();
+    if (!rawProjectId) {
+      throw new BridgeError("缺少 projectId。", 400);
+    }
+    const projectId = safePathPart(rawProjectId);
+    const clips = Array.isArray(req.body?.clips) ? req.body.clips : [];
+    const images = Array.isArray(req.body?.images) ? req.body.images : [];
+    const state = await saveWorkbenchLibraryState({ projectId, clips, images });
+    res.json({ state });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Save material library state failed."
+    });
+  }
+});
+
 app.get("/health", async (req, res) => {
-  const apiKeyEnvName = String(req.query.apiKeyEnvName || "ARK_API_KEY");
+  const apiKeyEnvName = String(req.query.apiKeyEnvName || "NEWAPI_API_KEY");
   const comfyEndpoint = String(req.query.comfyEndpoint || DEFAULT_COMFYUI_ENDPOINT);
   const comfyHealth = await checkComfyUIHealth(comfyEndpoint);
   res.json({
@@ -62,9 +111,10 @@ app.get("/health", async (req, res) => {
     assetRootDir,
     assetBaseUrl: assetBaseUrl(req),
     seedance: {
-      endpoint: DEFAULT_SEEDANCE_ARK_BASE_URL,
+      endpoint: resolveSeedanceEndpoint(DEFAULT_SEEDANCE_ARK_BASE_URL),
       apiKeyEnvName,
-      hasApiKey: Boolean(process.env[apiKeyEnvName])
+      hasApiKey: Boolean(process.env[apiKeyEnvName]),
+      hasLogin: Boolean(process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD)
     },
     comfyui: {
       endpoint: comfyEndpoint,
@@ -445,9 +495,9 @@ app.post("/video/preprocess/grayscale", upload.single("video"), async (req, res)
 app.post("/seedance/tasks", async (req, res) => {
   const request = req.body as SeedanceCreateTaskBridgeRequest;
   try {
-    const apiKey = readApiKey(request.apiKeyEnvName);
-    const upstreamUrl = buildSeedanceCreateUrl(request.endpoint);
-    const task = await requestSeedanceTask(upstreamUrl, apiKey, {
+    const upstreamUrl = buildSeedanceCreateUrl(resolveSeedanceEndpoint(request.endpoint));
+    const auth = await resolveSeedanceAuth(request.apiKeyEnvName, upstreamUrl);
+    const task = await requestSeedanceTask(upstreamUrl, auth, {
       method: "POST",
       body: JSON.stringify(request.body)
     });
@@ -462,22 +512,20 @@ app.post("/seedance/tasks", async (req, res) => {
 
 app.post("/seedance/tasks/:id/sync", async (req, res) => {
   try {
-    const endpoint = String(req.body.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL);
-    const apiKeyEnvName = String(req.body.apiKeyEnvName || "ARK_API_KEY");
+    const endpoint = resolveSeedanceEndpoint(String(req.body.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL));
+    const apiKeyEnvName = String(req.body.apiKeyEnvName || "NEWAPI_API_KEY");
     const projectId = safePathPart(String(req.body.projectId || "default_project"));
     const assetId = safePathPart(String(req.body.assetId || req.params.id));
-    const apiKey = readApiKey(apiKeyEnvName);
     const upstreamUrl = buildSeedanceTaskUrl(endpoint, req.params.id);
-    const task = await requestSeedanceTask(upstreamUrl, apiKey, { method: "GET" });
+    const auth = await resolveSeedanceAuth(apiKeyEnvName, upstreamUrl);
+    const task = await requestSeedanceTask(upstreamUrl, auth, { method: "GET" });
     const sourceUrl = String(req.body.sourceUrl || task.content?.video_url || "");
-    if (task.status && task.status !== "succeeded") {
+    if (task.status && !["succeeded", "completed"].includes(task.status)) {
       throw new BridgeError(`Seedance 任务尚未成功，当前状态：${task.status}`, 409);
     }
-    if (!sourceUrl) {
-      throw new BridgeError("Seedance 任务没有可转存的 video_url。", 409);
-    }
-
-    const downloaded = await downloadAsset(sourceUrl);
+    const downloaded = sourceUrl
+      ? await downloadAsset(sourceUrl)
+      : await downloadAsset(buildSeedanceContentUrl(endpoint, req.params.id), "Seedance", auth);
     const fileName = `${assetId}.${downloaded.extension}`;
     const relativeDir = path.join("seedance", projectId);
     const outputDir = path.join(assetRootDir, relativeDir);
@@ -509,11 +557,11 @@ app.post("/seedance/tasks/:id/sync", async (req, res) => {
 
 app.get("/seedance/tasks/:id", async (req, res) => {
   try {
-    const endpoint = String(req.query.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL);
-    const apiKeyEnvName = String(req.query.apiKeyEnvName || "ARK_API_KEY");
-    const apiKey = readApiKey(apiKeyEnvName);
+    const endpoint = resolveSeedanceEndpoint(String(req.query.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL));
+    const apiKeyEnvName = String(req.query.apiKeyEnvName || "NEWAPI_API_KEY");
     const upstreamUrl = buildSeedanceTaskUrl(endpoint, req.params.id);
-    const task = await requestSeedanceTask(upstreamUrl, apiKey, { method: "GET" });
+    const auth = await resolveSeedanceAuth(apiKeyEnvName, upstreamUrl);
+    const task = await requestSeedanceTask(upstreamUrl, auth, { method: "GET" });
     res.json(task);
   } catch (error) {
     const status = error instanceof BridgeError ? error.status : 500;
@@ -649,13 +697,20 @@ interface TimedRequestInit extends RequestInit {
   timeoutMs?: number;
 }
 
-async function requestSeedanceTask(url: string, apiKey: string, init: TimedRequestInit) {
+interface SeedanceAuth {
+  authorization?: string;
+  cookie?: string;
+}
+
+let cachedSeedanceLogin: { endpoint: string; auth: SeedanceAuth; expiresAt: number } | undefined;
+
+async function requestSeedanceTask(url: string, auth: SeedanceAuth, init: TimedRequestInit) {
   const response = await fetchWithTimeout(url, {
     ...init,
     timeoutMs: init.timeoutMs ?? 45_000,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
+      ...seedanceAuthHeaders(auth)
     }
   });
   const payload = await readPayload(response);
@@ -792,8 +847,11 @@ async function checkComfyUIHealth(endpoint: string) {
   }
 }
 
-async function downloadAsset(url: string, providerLabel = "Seedance") {
-  const response = await fetchWithTimeout(url, { timeoutMs: 120_000 });
+async function downloadAsset(url: string, providerLabel = "Seedance", auth?: SeedanceAuth) {
+  const response = await fetchWithTimeout(url, {
+    timeoutMs: 120_000,
+    headers: auth ? seedanceAuthHeaders(auth) : undefined
+  });
   if (!response.ok) {
     throw new BridgeError(`下载 ${providerLabel} 产物失败：${response.status}`, 502);
   }
@@ -1400,12 +1458,12 @@ function normalizeSeedanceTaskResponse(payload: unknown): SeedanceTaskResponse {
         id: String(task.id || task.task_id || ""),
         model: stringifyOptional(task.model),
         status: stringifyOptional(task.status),
-        content: isRecord(task.content)
-          ? {
-              video_url: stringifyOptional(task.content.video_url),
-              last_frame_url: stringifyOptional(task.content.last_frame_url)
-            }
-          : undefined,
+        content: {
+          video_url: stringifyOptional(task.video_url)
+            || stringifyOptional(task.url)
+            || (isRecord(task.content) ? stringifyOptional(task.content.video_url) : undefined),
+          last_frame_url: isRecord(task.content) ? stringifyOptional(task.content.last_frame_url) : undefined
+        },
         error: isRecord(task.error)
           ? {
               code: stringifyOptional(task.error.code),
@@ -1418,6 +1476,7 @@ function normalizeSeedanceTaskResponse(payload: unknown): SeedanceTaskResponse {
         resolution: stringifyOptional(task.resolution),
         ratio: stringifyOptional(task.ratio),
         duration: numberOptional(task.duration),
+        progress: numberOptional(task.progress),
         usage: isRecord(task.usage) ? task.usage : undefined,
         raw: payload
       };
@@ -1462,13 +1521,84 @@ function containsPromptId(value: unknown, promptId: string): boolean {
   return Object.values(value).some((item) => containsPromptId(item, promptId));
 }
 
-function readApiKey(apiKeyEnvName: string) {
-  const safeEnvName = apiKeyEnvName || "ARK_API_KEY";
+async function resolveSeedanceAuth(apiKeyEnvName: string, requestUrl: string): Promise<SeedanceAuth> {
+  const apiKey = readApiKeyOptional(apiKeyEnvName);
+  if (apiKey) return { authorization: `Bearer ${apiKey}` };
+  return loginSeedance(requestUrl);
+}
+
+function readApiKeyOptional(apiKeyEnvName: string) {
+  const safeEnvName = apiKeyEnvName || "NEWAPI_API_KEY";
   const apiKey = process.env[safeEnvName];
-  if (!apiKey) {
-    throw new BridgeError(`未配置环境变量 ${safeEnvName}，无法调用 Seedance。`, 400);
-  }
   return apiKey;
+}
+
+async function loginSeedance(requestUrl: string): Promise<SeedanceAuth> {
+  const username = process.env.NEWAPI_USERNAME;
+  const password = process.env.NEWAPI_PASSWORD;
+  if (!username || !password) {
+    throw new BridgeError("未配置 NEWAPI_API_KEY，且未配置 NEWAPI_USERNAME/NEWAPI_PASSWORD，无法调用 Seedance。", 400);
+  }
+  const endpoint = new URL(requestUrl).origin;
+  if (cachedSeedanceLogin?.endpoint === endpoint && cachedSeedanceLogin.expiresAt > Date.now()) {
+    return cachedSeedanceLogin.auth;
+  }
+  const response = await fetchWithTimeout(`${endpoint}/api/user/login`, {
+    method: "POST",
+    timeoutMs: 30_000,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password })
+  });
+  const payload = await readPayload(response);
+  if (!response.ok) {
+    throw new BridgeError(
+      extractUpstreamError(payload) || `NewAPI 登录失败：${response.status}`,
+      response.status === 401 || response.status === 403 ? response.status : 502
+    );
+  }
+  const auth = seedanceAuthFromLogin(response, payload);
+  if (!auth.authorization && !auth.cookie) {
+    throw new BridgeError("NewAPI 登录成功但未返回 token 或 cookie，无法认证视频接口。请在控制台生成 Bearer 密钥并配置 NEWAPI_API_KEY。", 400);
+  }
+  cachedSeedanceLogin = {
+    endpoint,
+    auth,
+    expiresAt: Date.now() + 50 * 60_000
+  };
+  return auth;
+}
+
+function seedanceAuthHeaders(auth: SeedanceAuth): Record<string, string> {
+  return {
+    ...(auth.authorization ? { Authorization: auth.authorization } : {}),
+    ...(auth.cookie ? { Cookie: auth.cookie } : {})
+  };
+}
+
+function seedanceAuthFromLogin(response: Response, payload: unknown): SeedanceAuth {
+  const token = extractLoginToken(payload);
+  const cookie = response.headers.get("set-cookie")?.split(",").map((item) => item.split(";")[0].trim()).filter(Boolean).join("; ");
+  return {
+    ...(token ? { authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}` } : {}),
+    ...(cookie ? { cookie } : {})
+  };
+}
+
+function extractLoginToken(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  for (const key of ["token", "access_token", "key", "api_key", "session_token"]) {
+    if (typeof payload[key] === "string") return payload[key];
+  }
+  for (const key of ["data", "result", "user"]) {
+    const nested = payload[key];
+    const token = extractLoginToken(nested);
+    if (token) return token;
+  }
+  return undefined;
+}
+
+function resolveSeedanceEndpoint(endpoint: string) {
+  return process.env.SEEDANCE_NEWAPI_BASE_URL || process.env.NEWAPI_BASE_URL || endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL;
 }
 
 function publicBaseUrl(req: express.Request) {

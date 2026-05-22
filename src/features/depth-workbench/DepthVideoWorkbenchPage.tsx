@@ -1,9 +1,25 @@
 import { Check, Clock3, Coins, Film, Image as ImageIcon, Layers3, Plus, RefreshCw, Sparkles, Tag, Trash2, Upload, Wand2 } from "lucide-react";
 import type { Dispatch, SetStateAction } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { VideoSegment } from "../../types";
 import { createId } from "../../services/id";
-import { preprocessDepthVideoBridge, preprocessGrayscaleVideoBridge, uploadVideoGenerationBridgeAsset } from "../../services/videoGenerationBridgeClient";
+import {
+  createSeedanceBridgeTask,
+  getSeedanceBridgeTask,
+  loadWorkbenchLibraryState,
+  preprocessDepthVideoBridge,
+  preprocessGrayscaleVideoBridge,
+  saveWorkbenchLibraryState,
+  syncSeedanceBridgeAsset,
+  uploadVideoGenerationBridgeAsset
+} from "../../services/videoGenerationBridgeClient";
+import {
+  SEEDANCE_MODEL_PRICING,
+  buildSeedanceCreateTaskRequest,
+  extractSeedanceTaskError,
+  mapSeedanceTaskStatus
+} from "../generation/providers/seedanceArk";
+import type { SeedanceProviderConfig } from "../generation/providers/providerConfig";
 import type {
   AiGenerationCost,
   ComposeRecipeStep,
@@ -15,7 +31,8 @@ import type {
   MaterialClip,
   MaterialOutput,
   MaterialTag,
-  MaterialTagType
+  MaterialTagType,
+  VideoAiJob
 } from "./depthTypes";
 
 const tagOptions: Array<{ type: MaterialTagType; label: string }> = [
@@ -45,6 +62,35 @@ const providerOptions: Array<{ value: DepthAiProvider; label: string }> = [
   { value: "comfyui_remote_gpu", label: "ComfyUI 远程GPU" },
   { value: "kling_web", label: "可灵网页版" },
   { value: "gemini_web", label: "Gemini 网页版" }
+];
+
+interface AiPromptTemplate {
+  id: string;
+  name: string;
+  content: string;
+  builtin?: boolean;
+}
+
+const AI_PROMPT_TEMPLATE_STORAGE_KEY = "videogen.aiPromptTemplates";
+const defaultAiPromptTemplates: AiPromptTemplate[] = [
+  {
+    id: "tpl_replace_product_keep_audio",
+    name: "更换产品，保留声音",
+    content: "全面参考【@视频1】视频《{videoName}》{imageInstruction}，保留视频声音。",
+    builtin: true
+  },
+  {
+    id: "tpl_product_only",
+    name: "只换产品信息",
+    content: "参考【@视频1】视频《{videoName}》的镜头、动作和声音{productInstruction}。",
+    builtin: true
+  },
+  {
+    id: "tpl_face_product",
+    name: "产品与人脸参考",
+    content: "全面参考【@视频1】视频《{videoName}》{productInstruction}{faceInstruction}，保留视频声音。",
+    builtin: true
+  }
 ];
 
 type DepthWorkbenchTab = "library" | "preprocess" | "ai" | "cost" | "compose";
@@ -100,6 +146,7 @@ export function DepthVideoWorkbenchPage({
   sourceVideoName,
   projectId,
   bridgeUrl,
+  seedanceSettings,
   onClips,
   onImages,
   onRecipe,
@@ -119,6 +166,7 @@ export function DepthVideoWorkbenchPage({
   sourceVideoName?: string;
   projectId: string;
   bridgeUrl: string;
+  seedanceSettings: SeedanceProviderConfig;
   onClips: Dispatch<SetStateAction<MaterialClip[]>>;
   onImages: Dispatch<SetStateAction<ImageMaterial[]>>;
   onRecipe: Dispatch<SetStateAction<ComposeRecipeStep[]>>;
@@ -136,7 +184,13 @@ export function DepthVideoWorkbenchPage({
   const [imageTagType, setImageTagType] = useState<MaterialTagType>("product");
   const [customImageTag, setCustomImageTag] = useState("");
   const [aiProvider, setAiProvider] = useState<DepthAiProvider>("seedance_api");
-  const [prompt, setPrompt] = useState("保留原素材内容，增强镜头运动和产品质感，适合电商短视频投放。");
+  const [aiReferenceClipId, setAiReferenceClipId] = useState("");
+  const [aiReferenceOutputType, setAiReferenceOutputType] = useState<MaterialOutput["type"]>("original");
+  const [aiPromptTemplates, setAiPromptTemplates] = useState<AiPromptTemplate[]>(loadSavedAiPromptTemplates);
+  const [activePromptTemplateId, setActivePromptTemplateId] = useState(defaultAiPromptTemplates[0].id);
+  const [promptTemplateDraft, setPromptTemplateDraft] = useState(defaultAiPromptTemplates[0].content);
+  const [prompt, setPrompt] = useState("");
+  const [promptDirty, setPromptDirty] = useState(false);
   const [activeTab, setActiveTab] = useState<DepthWorkbenchTab>("library");
   const [preprocessMethod, setPreprocessMethod] = useState<VideoPreprocessMethod>("depth");
   const [depthQualityPreset, setDepthQualityPreset] = useState<DepthQualityPreset>("standard");
@@ -144,8 +198,15 @@ export function DepthVideoWorkbenchPage({
   const [depthLetterbox, setDepthLetterbox] = useState(true);
   const [depthEdgeFilterStrength, setDepthEdgeFilterStrength] = useState(0.35);
   const [depthEdgeFilterDiameter, setDepthEdgeFilterDiameter] = useState(7);
+  const libraryHydratedRef = useRef(false);
+  const lastSavedLibraryRef = useRef("");
 
   const selectedClips = clips.filter((clip) => selectedIds.includes(clip.id));
+  const aiReferenceClip = useMemo(() => clips.find((clip) => clip.id === aiReferenceClipId), [aiReferenceClipId, clips]);
+  const aiReferenceImages = useMemo(
+    () => selectedImageIds.map((id) => images.find((image) => image.id === id)).filter((image): image is ImageMaterial => Boolean(image)),
+    [images, selectedImageIds]
+  );
   const stats = useMemo(() => buildStats(clips), [clips]);
   const depthMonitor = useMemo(() => buildDepthMonitor(clips), [clips]);
   const depthProcessableIds = useMemo(
@@ -156,6 +217,91 @@ export function DepthVideoWorkbenchPage({
     () => clips.filter((clip) => !isPreprocessDoneForMethod(clip, preprocessMethod) && !isDepthBusy(clip)).map((clip) => clip.id),
     [clips, preprocessMethod]
   );
+
+  useEffect(() => {
+    if (aiReferenceClipId && clips.some((clip) => clip.id === aiReferenceClipId)) return;
+    setAiReferenceClipId(clips[0]?.id || "");
+  }, [aiReferenceClipId, clips]);
+
+  useEffect(() => {
+    const template = aiPromptTemplates.find((item) => item.id === activePromptTemplateId) || aiPromptTemplates[0] || defaultAiPromptTemplates[0];
+    setPromptTemplateDraft(template.content);
+  }, [activePromptTemplateId, aiPromptTemplates]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(AI_PROMPT_TEMPLATE_STORAGE_KEY, JSON.stringify(aiPromptTemplates.filter((item) => !item.builtin)));
+    } catch {
+      // Template persistence is a convenience layer; generation should remain usable without it.
+    }
+  }, [aiPromptTemplates]);
+
+  useEffect(() => {
+    if (promptDirty) return;
+    setPrompt(renderAiPrompt(promptTemplateDraft, aiReferenceClip, aiReferenceImages));
+  }, [aiReferenceClip, aiReferenceImages, promptDirty, promptTemplateDraft]);
+
+  useEffect(() => {
+    let cancelled = false;
+    libraryHydratedRef.current = false;
+    lastSavedLibraryRef.current = "";
+    loadWorkbenchLibraryState({ bridgeUrl, projectId })
+      .then(({ state }) => {
+        if (cancelled) return;
+        const storedClips = Array.isArray(state.clips) ? state.clips : [];
+        const storedImages = Array.isArray(state.images) ? state.images : [];
+        if (storedClips.length || storedImages.length) {
+          onClips(storedClips);
+          onImages(storedImages);
+          lastSavedLibraryRef.current = stableLibrarySnapshot(storedClips, storedImages);
+          onNotice(`已从 MongoDB 素材库恢复 ${storedClips.length} 个视频、${storedImages.length} 张图片。`);
+        } else if (clips.length || images.length) {
+          lastSavedLibraryRef.current = stableLibrarySnapshot(clips, images);
+      void saveWorkbenchLibraryState({
+            bridgeUrl,
+            projectId,
+            clips: serializeLibraryClips(clips),
+            images: serializeLibraryImages(images)
+          });
+        } else {
+          lastSavedLibraryRef.current = stableLibrarySnapshot([], []);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          onNotice(error instanceof Error ? `MongoDB 素材库加载失败：${error.message}` : "MongoDB 素材库加载失败。");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) libraryHydratedRef.current = true;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridgeUrl, projectId]);
+
+  useEffect(() => {
+    if (!libraryHydratedRef.current) return;
+    const snapshot = stableLibrarySnapshot(clips, images);
+    if (snapshot === lastSavedLibraryRef.current) return;
+    const timer = window.setTimeout(() => {
+      const serializedClips = serializeLibraryClips(clips);
+      const serializedImages = serializeLibraryImages(images);
+      saveWorkbenchLibraryState({
+        bridgeUrl,
+        projectId,
+        clips: serializedClips,
+        images: serializedImages
+      })
+        .then(() => {
+          lastSavedLibraryRef.current = stableLibrarySnapshot(serializedClips, serializedImages);
+        })
+        .catch((error) => {
+          onNotice(error instanceof Error ? `MongoDB 素材库保存失败：${error.message}` : "MongoDB 素材库保存失败。");
+        });
+    }, 650);
+    return () => window.clearTimeout(timer);
+  }, [bridgeUrl, clips, images, onNotice, projectId]);
 
   useEffect(() => {
     if (!clips.some((clip) => clip.preprocess?.status === "processing")) return;
@@ -675,22 +821,169 @@ export function DepthVideoWorkbenchPage({
     onNotice(`${preprocessMethodLabel(method)}生成完成，已写入真实产物。`);
   }
 
-  function runAiGeneration() {
-    if (!selectedIds.length) {
-      onNotice("请先选择要进行 AI 加工的素材。");
+  function selectAiReferenceClip(clipId: string) {
+    setAiReferenceClipId(clipId);
+    setSelectedIds([clipId]);
+  }
+
+  function regenerateAiPrompt() {
+    setPrompt(renderAiPrompt(promptTemplateDraft, aiReferenceClip, aiReferenceImages));
+    setPromptDirty(false);
+  }
+
+  function saveCurrentPromptTemplate() {
+    const content = promptTemplateDraft.trim();
+    if (!content) {
+      onNotice("模板内容不能为空。");
+      return;
+    }
+    const name = window.prompt("模板名称", "自定义模板");
+    if (!name?.trim()) return;
+    const template: AiPromptTemplate = {
+      id: createId("prompt_tpl"),
+      name: name.trim(),
+      content,
+      builtin: false
+    };
+    setAiPromptTemplates((items) => [...items, template]);
+    setActivePromptTemplateId(template.id);
+    onNotice(`已保存提示词模板「${template.name}」。`);
+  }
+
+  function deleteCurrentPromptTemplate() {
+    const template = aiPromptTemplates.find((item) => item.id === activePromptTemplateId);
+    if (!template || template.builtin) {
+      onNotice("内置模板不能删除，可以修改后另存为新模板。");
+      return;
+    }
+    if (!window.confirm(`确认删除提示词模板「${template.name}」？`)) return;
+    setAiPromptTemplates((items) => items.filter((item) => item.id !== template.id));
+    setActivePromptTemplateId(defaultAiPromptTemplates[0].id);
+    onNotice(`已删除提示词模板「${template.name}」。`);
+  }
+
+  async function runAiGeneration() {
+    if (!aiReferenceClip) {
+      onNotice("请先选择一条参考视频。");
+      return;
+    }
+    const finalPrompt = prompt.trim();
+    if (!finalPrompt) {
+      onNotice("请先生成或填写提示词。");
       return;
     }
     const now = new Date().toISOString();
+    const job = createAiJob(aiReferenceClip, aiProvider, finalPrompt, now, aiReferenceImages, aiReferenceOutputType, seedanceSettings);
     onClips((current) =>
       current.map((clip) => {
-        if (!selectedIds.includes(clip.id)) return clip;
-        const job = createAiJob(clip, aiProvider, prompt, now);
+        if (clip.id !== aiReferenceClip.id) return clip;
         return { ...clip, aiJobs: [job, ...clip.aiJobs], updatedAt: now };
       })
     );
-    window.setTimeout(() => markAiGenerating(selectedIds), 450);
-    window.setTimeout(() => markAiDone(selectedIds), 1500);
-    onNotice(`已提交 ${selectedIds.length} 个 AI 加工任务到 ${providerLabel(aiProvider)}。`);
+    if (aiProvider !== "seedance_api") {
+      window.setTimeout(() => markAiGenerating([aiReferenceClip.id]), 450);
+      window.setTimeout(() => markAiDone([aiReferenceClip.id]), 1500);
+      onNotice(`已提交「${aiReferenceClip.title}」到 ${providerLabel(aiProvider)}，参考图片 ${aiReferenceImages.length} 张。`);
+      return;
+    }
+    try {
+      markAiGenerating([aiReferenceClip.id]);
+      const task = await submitSeedanceAiJob(aiReferenceClip, job, finalPrompt);
+      updateAiJob(aiReferenceClip.id, job.id, {
+        remoteTaskId: task.id,
+        status: mapSeedanceTaskStatus(task.status) === "done" ? "done" : "generating",
+        outputVideoUrl: task.content?.video_url,
+        error: extractSeedanceTaskError(task)
+      });
+      onNotice(`Seedance 任务已提交：${task.id || "等待返回任务ID"}。可稍后刷新任务状态。`);
+      if (task.id) {
+        window.setTimeout(() => void refreshSeedanceAiJob(aiReferenceClip.id, job.id, task.id), 8000);
+      }
+    } catch (error) {
+      updateAiJob(aiReferenceClip.id, job.id, {
+        status: "failed",
+        error: error instanceof Error ? error.message : "Seedance 任务提交失败。"
+      });
+      onNotice(error instanceof Error ? error.message : "Seedance 任务提交失败。");
+    }
+  }
+
+  async function submitSeedanceAiJob(clip: MaterialClip, job: VideoAiJob, finalPrompt: string) {
+    const sourceVideoUrl = persistentAiVideoUrl(clip, aiReferenceOutputType);
+    if (!sourceVideoUrl) {
+      throw new Error("Seedance 需要可访问的参考视频 URL。请先上传素材到本地素材库，并配置可被后台访问的 VIDEOGEN_PUBLIC_ASSET_BASE_URL。");
+    }
+    const imageUrls = aiReferenceImages.map((image) => image.imageUrl).filter((url) => url && !url.startsWith("blob:"));
+    const request = buildSeedanceCreateTaskRequest({
+      prompt: withSeedanceMediaRefs(finalPrompt, imageUrls.length, Boolean(sourceVideoUrl)),
+      aspectRatio: "9:16",
+      duration: 5,
+      sourceVideoUrl,
+      referenceImageUrls: imageUrls,
+      params: {
+        bridgeUrl,
+        endpoint: seedanceSettings.endpoint,
+        apiKeyEnvName: seedanceSettings.apiKeyEnvName,
+        model: seedanceSettings.model,
+        defaultDuration: seedanceSettings.defaultDuration,
+        resolution: seedanceSettings.resolution,
+        seed: seedanceSettings.seed,
+        generateAudio: seedanceSettings.generateAudio,
+        watermark: seedanceSettings.watermark,
+        returnLastFrame: seedanceSettings.returnLastFrame
+      }
+    });
+    const task = await createSeedanceBridgeTask({ bridgeUrl, request });
+    return { ...task, localJobId: job.id };
+  }
+
+  async function refreshSeedanceAiJob(clipId: string, jobId: string, taskId: string) {
+    try {
+      const task = await getSeedanceBridgeTask({
+        bridgeUrl,
+        endpoint: seedanceSettings.endpoint,
+        apiKeyEnvName: seedanceSettings.apiKeyEnvName,
+        taskId
+      });
+      const status = mapSeedanceTaskStatus(task.status);
+      if (status !== "done") {
+        updateAiJob(clipId, jobId, {
+          status: status === "failed" ? "failed" : "generating",
+          error: extractSeedanceTaskError(task)
+        });
+        return;
+      }
+      const synced = await syncSeedanceBridgeAsset({
+        bridgeUrl,
+        endpoint: seedanceSettings.endpoint,
+        apiKeyEnvName: seedanceSettings.apiKeyEnvName,
+        taskId,
+        projectId,
+        assetId: jobId,
+        sourceUrl: task.content?.video_url
+      });
+      markAiDoneWithOutput(clipId, jobId, synced.asset.localAssetUrl);
+    } catch (error) {
+      updateAiJob(clipId, jobId, {
+        status: "failed",
+        error: error instanceof Error ? error.message : "Seedance 任务刷新失败。"
+      });
+    }
+  }
+
+  function updateAiJob(clipId: string, jobId: string, patch: Partial<VideoAiJob>) {
+    const now = new Date().toISOString();
+    onClips((current) =>
+      current.map((clip) =>
+        clip.id === clipId
+          ? {
+              ...clip,
+              aiJobs: clip.aiJobs.map((job) => (job.id === jobId ? { ...job, ...patch } : job)),
+              updatedAt: now
+            }
+          : clip
+      )
+    );
   }
 
   function markAiGenerating(targetIds: string[]) {
@@ -736,6 +1029,36 @@ export function DepthVideoWorkbenchPage({
       })
     );
     onNotice("AI 加工任务已完成，已写入成本、耗时和生成产物。");
+  }
+
+  function markAiDoneWithOutput(clipId: string, jobId: string, outputVideoUrl: string) {
+    const now = new Date().toISOString();
+    onClips((current) =>
+      current.map((clip) => {
+        if (clip.id !== clipId) return clip;
+        const currentJob = clip.aiJobs.find((job) => job.id === jobId);
+        if (!currentJob) return clip;
+        const job = { ...currentJob, status: "done" as const, outputVideoUrl, finishedAt: now };
+        const parentOutput = getBestParentOutputForAi(clip);
+        return {
+          ...clip,
+          aiJobs: clip.aiJobs.map((item) => (item.id === jobId ? job : item)),
+          outputs: upsertOutput(clip.outputs, {
+            id: createId("output"),
+            sourceClipId: clip.id,
+            lineageId: clip.lineageId,
+            parentOutputId: parentOutput?.id,
+            type: "ai_video",
+            provider: job.provider,
+            videoUrl: outputVideoUrl,
+            jobId: job.id,
+            createdAt: now
+          }),
+          updatedAt: now
+        };
+      })
+    );
+    onNotice("Seedance 任务完成，产物已转存并写入素材库。");
   }
 
   function updateRecipeStep(stepId: string, patch: Partial<ComposeRecipeStep>) {
@@ -1132,38 +1455,176 @@ export function DepthVideoWorkbenchPage({
             </div>
             <button className="secondary-button compact" onClick={() => setActiveTab("preprocess")}>返回前置处理</button>
           </div>
-          <div className="depth-two-column">
-            <div>
+          <div className="ai-workbench-grid">
+            <section className="ai-config-panel">
+              <div className="ai-panel-title">
+                <span>1</span>
+                <div>
+                  <strong>参考视频</strong>
+                  <small>单选一条视频作为完整参考</small>
+                </div>
+              </div>
+              <div className="ai-video-list">
+                {clips.map((clip) => (
+                  <button
+                    className={`ai-video-option ${aiReferenceClipId === clip.id ? "active" : ""}`}
+                    key={clip.id}
+                    onClick={() => selectAiReferenceClip(clip.id)}
+                  >
+                    <span className="radio-dot" />
+                    <strong>{clip.title}</strong>
+                    <small>{clip.tags.map((tag) => tag.label).join(" / ") || "未打标签"}</small>
+                  </button>
+                ))}
+                {!clips.length && <p className="muted-note">素材片段库为空，请先导入或上传参考视频。</p>}
+              </div>
+              {aiReferenceClip && (
+                <div className="ai-reference-preview">
+                  <video src={selectedClipVideoUrl(aiReferenceClip, aiReferenceOutputType)} controls muted playsInline />
+                  <label>
+                    <span>使用版本</span>
+                    <select value={aiReferenceOutputType} onChange={(event) => setAiReferenceOutputType(event.target.value as MaterialOutput["type"])}>
+                      {availableVideoOutputTypes(aiReferenceClip).map((type) => (
+                        <option value={type} key={type}>{outputTypeLabel(type)}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+              )}
+            </section>
+
+            <section className="ai-config-panel">
+              <div className="ai-panel-title">
+                <span>2</span>
+                <div>
+                  <strong>参考图片</strong>
+                  <small>可多选，图片名会写入提示词</small>
+                </div>
+              </div>
+              <div className="image-library-tabs compact-tabs">
+                {imageCategoryOptions.map((item) => (
+                  <button
+                    className={imageCategory === item.value ? "active" : ""}
+                    key={item.value}
+                    onClick={() => setImageCategory(item.value)}
+                  >
+                    {item.label}
+                    <span>{images.filter((image) => image.category === item.value).length}</span>
+                  </button>
+                ))}
+              </div>
+              <div className="ai-selected-images">
+                {aiReferenceImages.length ? aiReferenceImages.map((image) => (
+                  <button key={image.id} onClick={() => toggleSelectedImage(image.id)} title="移除参考图片">
+                    <img src={image.imageUrl} alt={image.title} />
+                    <span>{image.title}</span>
+                  </button>
+                )) : <small>还没有选择参考图片。</small>}
+              </div>
+              <div className="ai-image-list">
+                {images.filter((image) => image.category === imageCategory).map((image) => (
+                  <button
+                    className={`ai-image-option ${selectedImageIds.includes(image.id) ? "active" : ""}`}
+                    key={image.id}
+                    onClick={() => toggleSelectedImage(image.id)}
+                  >
+                    <img src={image.imageUrl} alt={image.title} />
+                    <span>{image.title}</span>
+                  </button>
+                ))}
+                {!images.some((image) => image.category === imageCategory) && <p className="muted-note">当前图片库为空，请先上传图片素材。</p>}
+              </div>
+            </section>
+
+            <section className="ai-config-panel ai-prompt-panel">
+              <div className="ai-panel-title">
+                <span>3</span>
+                <div>
+                  <strong>提示词与生成</strong>
+                  <small>模板可多选保存，最终提示词可编辑</small>
+                </div>
+              </div>
               <div className="control-grid single-column">
                 <label>
-                  <span>加工方式</span>
-                  <select value={aiProvider} onChange={(event) => setAiProvider(event.target.value as DepthAiProvider)}>
-                    {providerOptions.map((item) => (
-                      <option value={item.value} key={item.value}>{item.label}</option>
+                  <span>提示词模板</span>
+                  <select value={activePromptTemplateId} onChange={(event) => setActivePromptTemplateId(event.target.value)}>
+                    {aiPromptTemplates.map((item) => (
+                      <option value={item.id} key={item.id}>{item.name}</option>
                     ))}
                   </select>
                 </label>
                 <label>
-                  <span>加工提示词</span>
-                  <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} />
+                  <span>模板内容</span>
+                  <textarea
+                    value={promptTemplateDraft}
+                    onChange={(event) => setPromptTemplateDraft(event.target.value)}
+                    placeholder="例如：全面参考【@视频1】视频《{videoName}》{imageInstruction}，保留视频声音。"
+                  />
                 </label>
               </div>
-              <button className="primary-button" onClick={runAiGeneration}>
+              <div className="prompt-actions wrap-actions">
+                <button className="secondary-button compact" onClick={regenerateAiPrompt}>
+                  <RefreshCw size={15} />
+                  重新生成提示词
+                </button>
+                <button className="secondary-button compact" onClick={saveCurrentPromptTemplate}>
+                  <Plus size={15} />
+                  保存为模板
+                </button>
+                <button className="secondary-button compact" onClick={deleteCurrentPromptTemplate}>
+                  <Trash2 size={15} />
+                  删除模板
+                </button>
+              </div>
+              <div className="ai-source-summary">
+                <strong>参考来源</strong>
+                <span>视频：{aiReferenceClip?.title || "未选择"}</span>
+                <span>图片：{aiReferenceImages.map((image) => image.title).join("、") || "未选择"}</span>
+              </div>
+              <label className="ai-final-prompt">
+                <span>生成后的提示词</span>
+                <textarea
+                  value={prompt}
+                  onChange={(event) => {
+                    setPrompt(event.target.value);
+                    setPromptDirty(true);
+                  }}
+                />
+              </label>
+              <label className="ai-provider-select">
+                <span>加工方式</span>
+                <select value={aiProvider} onChange={(event) => setAiProvider(event.target.value as DepthAiProvider)}>
+                  {providerOptions.map((item) => (
+                    <option value={item.value} key={item.value}>{item.label}</option>
+                  ))}
+                </select>
+              </label>
+              <button className="primary-button" onClick={runAiGeneration} disabled={!aiReferenceClip}>
                 <Wand2 size={16} />
                 提交AI加工
               </button>
+            </section>
+          </div>
+
+          <section className="ai-job-panel">
+            <div className="ai-panel-title">
+              <span>4</span>
+              <div>
+                <strong>最近任务</strong>
+                <small>查看当前素材库里的 AI 加工状态</small>
+              </div>
             </div>
-            <div className="depth-table">
+            <div className="depth-table ai-job-table">
               {clips.map((clip) => (
                 <div className="depth-table-row" key={clip.id}>
                   <strong>{clip.title}</strong>
                   <span>{clip.aiJobs[0] ? aiStatusLabel(clip.aiJobs[0].status) : "未AI加工"}</span>
-                  <small>{clip.aiJobs[0] ? `${providerLabel(clip.aiJobs[0].provider)} · ${clip.aiJobs[0].cost.generationSec}s · ¥${clip.aiJobs[0].cost.estimatedCash.toFixed(2)}` : "可选择后提交加工"}</small>
+                  <small>{clip.aiJobs[0] ? `${providerLabel(clip.aiJobs[0].provider)} · ${clip.aiJobs[0].cost.generationSec}s · ¥${clip.aiJobs[0].cost.estimatedCash.toFixed(2)}` : "选择为参考视频后提交加工"}</small>
                 </div>
               ))}
               {!clips.length && <p className="muted-note">素材片段库为空，请先导入素材。</p>}
             </div>
-          </div>
+          </section>
         </section>
       )}
 
@@ -1612,6 +2073,14 @@ function selectedClipVideoUrl(clip: MaterialClip, preferredType?: MaterialOutput
   return clip.outputs.find((item) => item.type === type)?.videoUrl || clip.originalVideoUrl;
 }
 
+function availableVideoOutputTypes(clip: MaterialClip): MaterialOutput["type"][] {
+  const types: MaterialOutput["type"][] = ["original"];
+  for (const type of ["depth_video", "grayscale_video", "ai_video"] as MaterialOutput["type"][]) {
+    if (clip.outputs.some((item) => item.type === type)) types.push(type);
+  }
+  return types;
+}
+
 function currentPreviewType(clip: MaterialClip, preferredType?: MaterialOutput["type"]): MaterialOutput["type"] {
   if (preferredType === "depth_video" && clip.outputs.some((item) => item.type === "depth_video")) return "depth_video";
   if (preferredType === "grayscale_video" && clip.outputs.some((item) => item.type === "grayscale_video")) return "grayscale_video";
@@ -1647,6 +2116,12 @@ function persistentVideoUrl(clip: MaterialClip) {
   const originalUrl = getOriginalOutput(clip)?.videoUrl || clip.originalVideoUrl;
   if (!originalUrl || originalUrl.startsWith("blob:")) return undefined;
   return originalUrl;
+}
+
+function persistentAiVideoUrl(clip: MaterialClip, preferredType: MaterialOutput["type"]) {
+  const videoUrl = selectedClipVideoUrl(clip, preferredType);
+  if (!videoUrl || videoUrl.startsWith("blob:")) return undefined;
+  return videoUrl;
 }
 
 function getBestParentOutputForAi(clip: MaterialClip) {
@@ -1689,13 +2164,110 @@ function unique(items: string[]) {
   return Array.from(new Set(items));
 }
 
+function loadSavedAiPromptTemplates(): AiPromptTemplate[] {
+  try {
+    const raw = window.localStorage.getItem(AI_PROMPT_TEMPLATE_STORAGE_KEY);
+    const customTemplates = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(customTemplates)) return defaultAiPromptTemplates;
+    return [
+      ...defaultAiPromptTemplates,
+      ...customTemplates
+        .filter((item) => item && typeof item.name === "string" && typeof item.content === "string")
+        .map((item) => ({
+          id: typeof item.id === "string" ? item.id : createId("prompt_tpl"),
+          name: item.name,
+          content: item.content,
+          builtin: false
+        }))
+    ];
+  } catch {
+    return defaultAiPromptTemplates;
+  }
+}
+
+function renderAiPrompt(template: string, clip?: MaterialClip, images: ImageMaterial[] = []) {
+  const videoName = clip?.title || "未选择参考视频";
+  const imageNames = formatPromptNames(images.map((image) => image.title));
+  const productImages = formatPromptNames(images.filter((image) => image.category === "product").map((image) => image.title));
+  const faceImages = formatPromptNames(images.filter((image) => image.category === "face").map((image) => image.title));
+  const styleImages = formatPromptNames(images.filter((image) => image.category === "other").map((image) => image.title));
+  const imageRefs = formatSeedanceImageRefs(images);
+  const productImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "product"), images);
+  const faceImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "face"), images);
+  const styleImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "other"), images);
+  const imageInstruction = images.length ? `，根据${imageRefs}更换产品信息为${imageNames}` : "";
+  const productInstruction = productImageRefs
+    ? `，根据${productImageRefs}将产品信息替换为${productImages}`
+    : imageRefs
+      ? `，根据${imageRefs}将产品信息替换为${imageNames}`
+      : "";
+  const faceInstruction = faceImageRefs ? `，人物或人脸参考${faceImageRefs}${faceImages}` : "";
+  const styleInstruction = styleImageRefs ? `，风格参考${styleImageRefs}${styleImages}` : "";
+  const videoTags = clip?.tags.map((tag) => tag.label).join("、") || "无";
+  const imageTags = unique(images.flatMap((image) => image.tags.map((tag) => tag.label))).join("、") || "无";
+  return [
+    ["{videoName}", videoName],
+    ["{imageNames}", imageNames || "未选择参考图片"],
+    ["{productImages}", productImages || imageNames || "未选择产品图片"],
+    ["{faceImages}", faceImages || "未选择人脸图片"],
+    ["{styleImages}", styleImages || "未选择风格图片"],
+    ["{imageRefs}", imageRefs || "参考图片"],
+    ["{productImageRefs}", productImageRefs || imageRefs || "产品参考图片"],
+    ["{faceImageRefs}", faceImageRefs || "人脸参考图片"],
+    ["{styleImageRefs}", styleImageRefs || "风格参考图片"],
+    ["{imageInstruction}", imageInstruction],
+    ["{productInstruction}", productInstruction],
+    ["{faceInstruction}", faceInstruction],
+    ["{styleInstruction}", styleInstruction],
+    ["{videoTags}", videoTags],
+    ["{imageTags}", imageTags]
+  ].reduce((text, [token, value]) => text.split(token).join(value), template);
+}
+
+function formatPromptNames(names: string[]) {
+  return names.filter(Boolean).map((name) => `《${name}》`).join("");
+}
+
+function formatSeedanceImageRefs(targetImages: ImageMaterial[], allImages = targetImages) {
+  return targetImages
+    .map((image) => {
+      const index = allImages.findIndex((item) => item.id === image.id);
+      return index >= 0 ? `【@图片${index + 1}】` : "";
+    })
+    .filter(Boolean)
+    .join("");
+}
+
+function withSeedanceMediaRefs(prompt: string, imageCount: number, hasVideo: boolean) {
+  let nextPrompt = prompt.trim();
+  if (hasVideo && !nextPrompt.includes("【@视频1】")) {
+    nextPrompt = `参考【@视频1】视频，${nextPrompt}`;
+  }
+  const missingImageRefs = Array.from({ length: imageCount }, (_, index) => `【@图片${index + 1}】`)
+    .filter((ref) => !nextPrompt.includes(ref));
+  if (missingImageRefs.length) {
+    nextPrompt = `${missingImageRefs.join("")}作为产品/人物/风格参考，${nextPrompt}`;
+  }
+  return nextPrompt;
+}
+
 function upsertOutput(outputs: MaterialClip["outputs"], output: MaterialClip["outputs"][number]) {
   return [...outputs.filter((item) => item.type !== output.type || item.provider !== output.provider), output];
 }
 
-function createAiJob(clip: MaterialClip, provider: DepthAiProvider, prompt: string, now: string) {
-  const cost = estimateProviderCost(provider);
-  const inputOutput = getBestParentOutputForAi(clip);
+function createAiJob(
+  clip: MaterialClip,
+  provider: DepthAiProvider,
+  prompt: string,
+  now: string,
+  referenceImages: ImageMaterial[],
+  preferredInputType: MaterialOutput["type"],
+  seedanceSettings: SeedanceProviderConfig
+) {
+  const cost = estimateProviderCost(provider, seedanceSettings);
+  const inputOutput = preferredInputType === "original"
+    ? getOriginalOutput(clip)
+    : clip.outputs.find((item) => item.type === preferredInputType) || getBestParentOutputForAi(clip);
   return {
     id: createId("aijob"),
     sourceClipId: clip.id,
@@ -1704,14 +2276,26 @@ function createAiJob(clip: MaterialClip, provider: DepthAiProvider, prompt: stri
     inputVideoUrl: inputOutput?.videoUrl || clip.originalVideoUrl,
     provider,
     status: "queued" as const,
-    prompt,
-    remoteTaskId: createId("remote"),
+    prompt: `${prompt}\n\n参考图片：${referenceImages.map((image) => image.title).join("、") || "无"}`,
+    referenceImageUrls: referenceImages.map((image) => image.imageUrl),
     cost,
     createdAt: now
   };
 }
 
-function estimateProviderCost(provider: DepthAiProvider): AiGenerationCost {
+function estimateProviderCost(provider: DepthAiProvider, seedanceSettings?: SeedanceProviderConfig): AiGenerationCost {
+  if (provider === "seedance_api" && seedanceSettings) {
+    const pricing = SEEDANCE_MODEL_PRICING.find(
+      (item) => item.model === seedanceSettings.model && item.resolution === seedanceSettings.resolution
+    ) || SEEDANCE_MODEL_PRICING.find((item) => item.model === seedanceSettings.model) || SEEDANCE_MODEL_PRICING[0];
+    const duration = Math.max(1, seedanceSettings.defaultDuration || 5);
+    return {
+      creditsUsed: undefined,
+      queueWaitSec: 8,
+      generationSec: duration,
+      estimatedCash: Number((pricing.cnyPerSecond * duration).toFixed(3))
+    };
+  }
   const table: Record<DepthAiProvider, AiGenerationCost> = {
     seedance_api: { creditsUsed: 18, queueWaitSec: 8, generationSec: 42, estimatedCash: 3.6 },
     jimeng_web: { creditsUsed: 12, queueWaitSec: 15, generationSec: 55, captureSec: 12, manualSec: 20, estimatedCash: 2.4 },
@@ -1760,6 +2344,24 @@ function isPreprocessDoneForMethod(clip: MaterialClip, method: VideoPreprocessMe
 
 function elapsedSince(isoDate: string) {
   return Math.max(0, Math.floor((Date.now() - new Date(isoDate).getTime()) / 1000));
+}
+
+function serializeLibraryClips(clips: MaterialClip[]): MaterialClip[] {
+  return clips.map((clip) => {
+    const { sourceFile: _sourceFile, ...serializableClip } = clip;
+    return serializableClip;
+  });
+}
+
+function serializeLibraryImages(images: ImageMaterial[]): ImageMaterial[] {
+  return images.map((image) => ({ ...image }));
+}
+
+function stableLibrarySnapshot(clips: MaterialClip[], images: ImageMaterial[]) {
+  return JSON.stringify({
+    clips: serializeLibraryClips(clips),
+    images: serializeLibraryImages(images)
+  });
 }
 
 function elapsedBetween(startIso: string, endIso: string) {

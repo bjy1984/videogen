@@ -78,6 +78,8 @@ export interface VideoAiJob {
   outputVideoUrl?: string;
   outputThumbnailUrl?: string;
   remoteTaskId?: string;
+  referenceImageUrls?: string[];
+  error?: string;
   cost: AiGenerationCost;
   createdAt: string;
   startedAt?: string;

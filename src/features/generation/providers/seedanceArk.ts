@@ -1,10 +1,65 @@
 import type { GenerationJobStatus } from "../generationTypes";
 
 export const DEFAULT_SEEDANCE_BRIDGE_URL = "http://127.0.0.1:8790";
-export const DEFAULT_SEEDANCE_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3";
-export const DEFAULT_SEEDANCE_MODEL = "doubao-seedance-2-0-260128";
+export const DEFAULT_SEEDANCE_ARK_BASE_URL = "https://apicoco.com";
+export const DEFAULT_SEEDANCE_MODEL = "xsdoubao/seedance2.0_fast_direct";
 
-export type SeedanceArkTaskStatus = "queued" | "running" | "succeeded" | "failed" | "expired" | "cancelled";
+export interface SeedanceModelPricing {
+  model: string;
+  label: string;
+  resolution: "720p" | "1080p";
+  cnyPerSecond: number;
+  supportsReferenceMedia: boolean;
+}
+
+export const SEEDANCE_MODEL_PRICING: SeedanceModelPricing[] = [
+  {
+    model: "xsdoubao/seedance2.0_fast_direct",
+    label: "Seedance 2.0 Fast Direct",
+    resolution: "720p",
+    cnyPerSecond: 0.75,
+    supportsReferenceMedia: false
+  },
+  {
+    model: "xsdoubao/seedance2.0_direct",
+    label: "Seedance 2.0 Direct",
+    resolution: "720p",
+    cnyPerSecond: 1.05,
+    supportsReferenceMedia: false
+  },
+  {
+    model: "xsdoubao/seedance2.0_fast_vision",
+    label: "Seedance 2.0 Fast Vision",
+    resolution: "720p",
+    cnyPerSecond: 0.912,
+    supportsReferenceMedia: true
+  },
+  {
+    model: "xsdoubao/seedance2.0_vision",
+    label: "Seedance 2.0 Vision",
+    resolution: "720p",
+    cnyPerSecond: 1.368,
+    supportsReferenceMedia: true
+  },
+  {
+    model: "xsdoubao/seedance2.0_vision",
+    label: "Seedance 2.0 Vision",
+    resolution: "1080p",
+    cnyPerSecond: 2.28,
+    supportsReferenceMedia: true
+  }
+];
+
+export type SeedanceArkTaskStatus =
+  | "queued"
+  | "running"
+  | "in_progress"
+  | "processing"
+  | "completed"
+  | "succeeded"
+  | "failed"
+  | "expired"
+  | "cancelled";
 
 export interface SeedanceProviderParams {
   bridgeUrl?: string;
@@ -44,14 +99,19 @@ export type SeedanceArkContentItem = SeedanceArkContentText | SeedanceArkContent
 
 export interface SeedanceCreateTaskRequest {
   model: string;
-  content: SeedanceArkContentItem[];
-  ratio: "9:16" | "16:9" | "1:1";
-  resolution: "720p" | "1080p";
-  duration: number;
-  seed?: number;
-  generate_audio?: boolean;
-  watermark?: boolean;
-  return_last_frame?: boolean;
+  prompt: string;
+  metadata: {
+    ratio: "9:16" | "16:9" | "1:1";
+    duration: number;
+    resolution: "720p" | "1080p";
+    image_files?: string[];
+    video_files?: string[];
+    audio_files?: string[];
+    seed?: number;
+    generate_audio?: boolean;
+    watermark?: boolean;
+    return_last_frame?: boolean;
+  };
 }
 
 export interface SeedanceCreateTaskBridgeRequest {
@@ -78,6 +138,7 @@ export interface SeedanceTaskResponse {
   resolution?: string;
   ratio?: string;
   duration?: number;
+  progress?: number;
   usage?: Record<string, unknown>;
   raw?: unknown;
 }
@@ -102,6 +163,7 @@ export function buildSeedanceCreateTaskRequest(input: {
   aspectRatio: "9:16" | "16:9" | "1:1";
   duration: number;
   referenceImageUrl?: string;
+  referenceImageUrls?: string[];
   sourceVideoUrl?: string;
   params?: SeedanceProviderParams;
 }): SeedanceCreateTaskBridgeRequest {
@@ -109,55 +171,54 @@ export function buildSeedanceCreateTaskRequest(input: {
   const prompt = input.prompt.trim();
   if (!prompt) throw new Error("Seedance prompt 不能为空。");
 
-  const content: SeedanceArkContentItem[] = [{ type: "text", text: prompt }];
-  if (input.referenceImageUrl?.trim()) {
-    content.push({
-      type: "image_url",
-      image_url: { url: input.referenceImageUrl.trim() },
-      role: "reference_image"
-    });
-  }
-  if (input.sourceVideoUrl?.trim()) {
-    content.push({
-      type: "video_url",
-      video_url: { url: input.sourceVideoUrl.trim() },
-      role: "source_video"
-    });
-  }
+  const imageFiles = uniqueNonEmpty([
+    input.referenceImageUrl,
+    ...(input.referenceImageUrls || [])
+  ]);
+  const videoFiles = uniqueNonEmpty([input.sourceVideoUrl]);
 
   const seed = parseSeed(params.seed);
   return {
     endpoint: params.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL,
-    apiKeyEnvName: params.apiKeyEnvName || "ARK_API_KEY",
+    apiKeyEnvName: params.apiKeyEnvName || "NEWAPI_API_KEY",
     body: {
       model: params.model || DEFAULT_SEEDANCE_MODEL,
-      content,
-      ratio: input.aspectRatio,
-      resolution: params.resolution || "1080p",
-      duration: normalizeDuration(params.defaultDuration ?? input.duration),
-      ...(seed === undefined ? {} : { seed }),
-      ...(params.generateAudio === undefined ? {} : { generate_audio: params.generateAudio }),
-      ...(params.watermark === undefined ? {} : { watermark: params.watermark }),
-      ...(params.returnLastFrame === undefined ? {} : { return_last_frame: params.returnLastFrame })
+      prompt,
+      metadata: {
+        ratio: input.aspectRatio,
+        resolution: params.resolution || "720p",
+        duration: normalizeDuration(params.defaultDuration ?? input.duration),
+        ...(imageFiles.length ? { image_files: imageFiles } : {}),
+        ...(videoFiles.length ? { video_files: videoFiles } : {}),
+        ...(seed === undefined ? {} : { seed }),
+        ...(params.generateAudio === undefined ? {} : { generate_audio: params.generateAudio }),
+        ...(params.watermark === undefined ? {} : { watermark: params.watermark }),
+        ...(params.returnLastFrame === undefined ? {} : { return_last_frame: params.returnLastFrame })
+      }
     }
   };
 }
 
 export function buildSeedanceCreateUrl(endpoint: string) {
   const cleanEndpoint = stripTrailingSlash(endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL);
-  return cleanEndpoint.endsWith("/contents/generations/tasks")
+  return cleanEndpoint.endsWith("/v1/video/generations")
     ? cleanEndpoint
-    : `${cleanEndpoint}/contents/generations/tasks`;
+    : `${cleanEndpoint}/v1/video/generations`;
 }
 
 export function buildSeedanceTaskUrl(endpoint: string, taskId: string) {
   return `${buildSeedanceCreateUrl(endpoint)}/${encodeURIComponent(taskId)}`;
 }
 
+export function buildSeedanceContentUrl(endpoint: string, taskId: string) {
+  const cleanEndpoint = stripTrailingSlash(endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL);
+  return `${cleanEndpoint}/v1/videos/${encodeURIComponent(taskId)}/content`;
+}
+
 export function mapSeedanceTaskStatus(status?: string): GenerationJobStatus {
   if (status === "queued") return "queued";
-  if (status === "running") return "generating";
-  if (status === "succeeded") return "done";
+  if (status === "running" || status === "in_progress" || status === "processing") return "generating";
+  if (status === "succeeded" || status === "completed") return "done";
   if (status === "failed" || status === "expired" || status === "cancelled") return "failed";
   return "generating";
 }
@@ -176,6 +237,10 @@ function parseSeed(seed?: string) {
   const parsed = Number(seed);
   if (!Number.isFinite(parsed)) return undefined;
   return Math.floor(parsed);
+}
+
+function uniqueNonEmpty(items: Array<string | undefined>) {
+  return Array.from(new Set(items.map((item) => item?.trim()).filter((item): item is string => Boolean(item))));
 }
 
 function stripTrailingSlash(value: string) {

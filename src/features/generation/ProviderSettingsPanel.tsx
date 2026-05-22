@@ -2,6 +2,7 @@ import type { GenerationOptions } from "../../types";
 import { LTX2_HEAD_SWAP_COMFYUI_PRESET } from "./providers/comfyuiApi";
 import type { ProviderSettings } from "./providers/providerConfig";
 import { getVideoGenerationProvider } from "./providers/providerRegistry";
+import { SEEDANCE_MODEL_PRICING } from "./providers/seedanceArk";
 
 export function ProviderSettingsPanel({
   providerId,
@@ -79,7 +80,30 @@ export function ProviderSettingsPanel({
         <div className="provider-settings-grid">
           <Field label="Bridge URL" value={settings.seedance.bridgeUrl} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, bridgeUrl: value } })} />
           <Field label="Endpoint" value={settings.seedance.endpoint} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, endpoint: value } })} />
-          <Field label="Model" value={settings.seedance.model} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, model: value } })} />
+          <label>
+            <span>Model</span>
+            <select
+              value={`${settings.seedance.model}__${settings.seedance.resolution}`}
+              onChange={(event) => {
+                const option = SEEDANCE_MODEL_PRICING.find((item) => `${item.model}__${item.resolution}` === event.target.value);
+                if (!option) return;
+                onSettings({
+                  ...settings,
+                  seedance: {
+                    ...settings.seedance,
+                    model: option.model,
+                    resolution: option.resolution
+                  }
+                });
+              }}
+            >
+              {SEEDANCE_MODEL_PRICING.map((item) => (
+                <option value={`${item.model}__${item.resolution}`} key={`${item.model}_${item.resolution}`}>
+                  {item.model} · {item.resolution} · ¥{item.cnyPerSecond}/秒
+                </option>
+              ))}
+            </select>
+          </label>
           <Field label="API Key Env" value={settings.seedance.apiKeyEnvName} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, apiKeyEnvName: value } })} />
           <Field label="Seed" value={settings.seedance.seed} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, seed: value } })} />
           <NumberField label="Duration" value={settings.seedance.defaultDuration} onValue={(value) => onSettings({ ...settings, seedance: { ...settings.seedance, defaultDuration: value } })} />
