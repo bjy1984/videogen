@@ -84,6 +84,9 @@ export interface VideoAiJob {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  progress?: number;
+  remoteStatus?: string;
+  elapsedSec?: number;
 }
 
 export interface MaterialOutput {

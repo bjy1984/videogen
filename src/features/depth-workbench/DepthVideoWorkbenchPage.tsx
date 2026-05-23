@@ -949,8 +949,13 @@ export function DepthVideoWorkbenchPage({
       if (status !== "done") {
         updateAiJob(clipId, jobId, {
           status: status === "failed" ? "failed" : "generating",
+          remoteStatus: task.status,
+          progress: task.progress ?? 0,
           error: extractSeedanceTaskError(task)
         });
+        if (status !== "failed") {
+          window.setTimeout(() => void refreshSeedanceAiJob(clipId, jobId, taskId), 8000);
+        }
         return;
       }
       const synced = await syncSeedanceBridgeAsset({
@@ -978,7 +983,20 @@ export function DepthVideoWorkbenchPage({
         clip.id === clipId
           ? {
               ...clip,
-              aiJobs: clip.aiJobs.map((job) => (job.id === jobId ? { ...job, ...patch } : job)),
+              aiJobs: clip.aiJobs.map((job) => {
+                if (job.id !== jobId) return job;
+                const updated = { ...job, ...patch };
+                const end = updated.finishedAt || now;
+                updated.elapsedSec = elapsedBetween(job.createdAt, end);
+                if (updated.status === "done" || updated.status === "failed") {
+                  updated.finishedAt = updated.finishedAt || end;
+                  updated.cost = {
+                    ...updated.cost,
+                    generationSec: updated.elapsedSec
+                  };
+                }
+                return updated;
+              }),
               updatedAt: now
             }
           : clip
@@ -1008,7 +1026,18 @@ export function DepthVideoWorkbenchPage({
     onClips((current) =>
       current.map((clip) => {
         if (!targetIds.includes(clip.id) || !clip.aiJobs[0]) return clip;
-        const job = { ...clip.aiJobs[0], status: "done" as const, outputVideoUrl: clip.preprocess?.depthVideoUrl || clip.originalVideoUrl, finishedAt: now };
+        const elapsedSec = elapsedBetween(clip.aiJobs[0].createdAt, now);
+        const job = {
+          ...clip.aiJobs[0],
+          status: "done" as const,
+          outputVideoUrl: clip.preprocess?.depthVideoUrl || clip.originalVideoUrl,
+          finishedAt: now,
+          elapsedSec,
+          cost: {
+            ...clip.aiJobs[0].cost,
+            generationSec: elapsedSec
+          }
+        };
         const parentOutput = getBestParentOutputForAi(clip);
         return {
           ...clip,
@@ -1028,7 +1057,7 @@ export function DepthVideoWorkbenchPage({
         };
       })
     );
-    onNotice("AI 加工任务已完成，已写入成本、耗时和生成产物。");
+    onNotice("AI 加工任务已完成，已写入成本、耗时 and 生成产物。");
   }
 
   function markAiDoneWithOutput(clipId: string, jobId: string, outputVideoUrl: string) {
@@ -1038,7 +1067,20 @@ export function DepthVideoWorkbenchPage({
         if (clip.id !== clipId) return clip;
         const currentJob = clip.aiJobs.find((job) => job.id === jobId);
         if (!currentJob) return clip;
-        const job = { ...currentJob, status: "done" as const, outputVideoUrl, finishedAt: now };
+        const elapsedSec = elapsedBetween(currentJob.createdAt, now);
+        const job = {
+          ...currentJob,
+          status: "done" as const,
+          remoteStatus: "completed",
+          progress: 100,
+          outputVideoUrl,
+          finishedAt: now,
+          elapsedSec,
+          cost: {
+            ...currentJob.cost,
+            generationSec: elapsedSec
+          }
+        };
         const parentOutput = getBestParentOutputForAi(clip);
         return {
           ...clip,
@@ -1618,7 +1660,9 @@ export function DepthVideoWorkbenchPage({
               {clips.map((clip) => (
                 <div className="depth-table-row" key={clip.id}>
                   <strong>{clip.title}</strong>
-                  <span>{clip.aiJobs[0] ? aiStatusLabel(clip.aiJobs[0].status) : "未AI加工"}</span>
+                  <span title={clip.aiJobs[0]?.error || undefined}>
+                    {clip.aiJobs[0] ? renderAiJobStatus(clip.aiJobs[0]) : "未AI加工"}
+                  </span>
                   <small>{clip.aiJobs[0] ? `${providerLabel(clip.aiJobs[0].provider)} · ${clip.aiJobs[0].cost.generationSec}s · ¥${clip.aiJobs[0].cost.estimatedCash.toFixed(2)}` : "选择为参考视频后提交加工"}</small>
                 </div>
               ))}
@@ -1812,7 +1856,9 @@ function ClipGrid({
             </div>
             <div className="clip-status-row">
               <span>{depthStatusLabel(clip.preprocess?.status)}</span>
-              <span>{clip.aiJobs[0] ? aiStatusLabel(clip.aiJobs[0].status) : "未AI加工"}</span>
+              <span title={clip.aiJobs[0]?.error || undefined}>
+                {clip.aiJobs[0] ? renderAiJobStatus(clip.aiJobs[0]) : "未AI加工"}
+              </span>
             </div>
             <InlineTagEditor
               options={tagOptions}
@@ -2453,4 +2499,22 @@ function aiStatusLabel(status: string) {
     failed: "AI失败"
   };
   return labels[status] ?? status;
+}
+
+function renderAiJobStatus(job: VideoAiJob) {
+  if (job.status === "generating") {
+    const progressText = job.progress !== undefined ? ` ${job.progress}%` : "";
+    const remoteText = job.remoteStatus ? ` [${job.remoteStatus}]` : "";
+    const elapsedText = job.elapsedSec !== undefined ? ` ${job.elapsedSec}s` : "";
+    return `生成中${progressText}${remoteText}${elapsedText}`;
+  }
+  if (job.status === "done") {
+    const elapsedText = job.elapsedSec !== undefined ? ` (${job.elapsedSec}s)` : "";
+    return `完成${elapsedText}`;
+  }
+  if (job.status === "failed") {
+    const remoteText = job.remoteStatus ? ` [${job.remoteStatus}]` : "";
+    return `失败${remoteText}`;
+  }
+  return aiStatusLabel(job.status);
 }
