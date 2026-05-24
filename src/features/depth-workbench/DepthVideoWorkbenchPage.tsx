@@ -9,6 +9,7 @@ import {
   loadWorkbenchLibraryState,
   preprocessDepthVideoBridge,
   preprocessGrayscaleVideoBridge,
+  preprocessSplitVideoBridge,
   saveWorkbenchLibraryState,
   syncSeedanceBridgeAsset,
   uploadVideoGenerationBridgeAsset
@@ -32,8 +33,10 @@ import type {
   MaterialOutput,
   MaterialTag,
   MaterialTagType,
+  VideoPreprocessMethod,
   VideoAiJob
 } from "./depthTypes";
+import type { VideoSplitRange } from "./splitPlanning";
 
 const tagOptions: Array<{ type: MaterialTagType; label: string }> = [
   { type: "hook", label: "钩子" },
@@ -96,7 +99,19 @@ const defaultAiPromptTemplates: AiPromptTemplate[] = [
 type DepthWorkbenchTab = "library" | "preprocess" | "ai" | "cost" | "compose";
 type MaterialLibraryMode = "video" | "image";
 type DepthQualityPreset = "fast" | "standard" | "portrait";
-type VideoPreprocessMethod = "depth" | "grayscale";
+type SplitBridgeSegment = {
+  id: string;
+  sourceClipId: string;
+  lineageId: string;
+  index: number;
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+  videoUrl: string;
+  localPath: string;
+  fileName: string;
+  range: VideoSplitRange;
+};
 
 const depthQualityDefaults: Record<DepthQualityPreset, {
   label: string;
@@ -655,7 +670,7 @@ export function DepthVideoWorkbenchPage({
             params: {
               resolution: "1080p",
               fps: 24,
-              depthModel: method === "depth" ? "depth-anything-dnn" : "opencv-grayscale",
+              depthModel: method === "depth" ? "depth-anything-dnn" : method === "grayscale" ? "opencv-grayscale" : "ffmpeg-split",
               inputSize: method === "depth" ? depthInputSize : undefined,
               letterbox: method === "depth" ? depthLetterbox : undefined,
               edgeFilterStrength: method === "depth" ? depthEdgeFilterStrength : undefined,
@@ -688,6 +703,20 @@ export function DepthVideoWorkbenchPage({
         continue;
       }
       try {
+        if (method === "split") {
+          const result = await preprocessSplitVideoBridge({
+            bridgeUrl,
+            projectId,
+            clipId: clip.id,
+            lineageId: clip.lineageId,
+            video,
+            sourceLocalPath,
+            sourceVideoUrl,
+            sourceVideoName: clip.sourceFileName || clip.title
+          });
+          markSplitDone(clipId, result);
+          continue;
+        }
         const result = method === "depth"
           ? await preprocessDepthVideoBridge({
               bridgeUrl,
@@ -819,6 +848,58 @@ export function DepthVideoWorkbenchPage({
       })
     );
     onNotice(`${preprocessMethodLabel(method)}生成完成，已写入真实产物。`);
+  }
+
+  function markSplitDone(
+    clipId: string,
+    result: Awaited<ReturnType<typeof preprocessSplitVideoBridge>>
+  ) {
+    const now = new Date().toISOString();
+    onClips((current) => {
+      const sourceClip = current.find((clip) => clip.id === clipId);
+      if (!sourceClip?.preprocess) return current;
+      const createdClips = result.segments.map((segment) => createClipFromSplitSegment(sourceClip, segment, result.trace.id, now));
+      const outputClipIds = createdClips.map((clip) => clip.id);
+      return [
+        ...current.map((clip) => {
+          if (clip.id !== clipId || !clip.preprocess) return clip;
+          const elapsedSec = result.trace.summary.elapsedSec ?? 0;
+          return {
+            ...clip,
+            split: {
+              id: result.trace.id,
+              sourceClipId: clip.id,
+              lineageId: clip.lineageId,
+              status: "done" as const,
+              inputVideoUrl: clip.originalVideoUrl,
+              provider: "local-bridge" as const,
+              segmentCount: result.trace.summary.segmentCount,
+              targetSec: result.trace.summary.targetSec,
+              maxSec: result.trace.summary.maxSec,
+              minLastSec: result.trace.summary.minLastSec,
+              sourceDurationSec: result.trace.summary.sourceDurationSec,
+              outputClipIds,
+              cost: { elapsedSec },
+              createdAt: clip.preprocess.createdAt,
+              startedAt: clip.preprocess.startedAt,
+              finishedAt: now,
+              updatedAt: now
+            },
+            preprocess: {
+              ...clip.preprocess,
+              status: "done" as const,
+              method: "split" as const,
+              cost: { elapsedSec, gpuSec: 0 },
+              finishedAt: now,
+              updatedAt: now
+            },
+            updatedAt: now
+          };
+        }),
+        ...createdClips
+      ];
+    });
+    onNotice(`视频切分完成，已生成 ${result.segments.length} 个不超过 10 秒的素材片段。`);
   }
 
   function selectAiReferenceClip(clipId: string) {
@@ -1325,6 +1406,13 @@ export function DepthVideoWorkbenchPage({
                 <small>OpenCV 灰度转换，输出保留音频的黑白视频。</small>
               </span>
             </button>
+            <button className={preprocessMethod === "split" ? "active" : ""} onClick={() => setPreprocessMethod("split")}>
+              <Layers3 size={16} />
+              <span>
+                <strong>视频切分</strong>
+                <small>按 9.9 秒切片，自动保障末段不少于 5 秒且每段不超过 10 秒。</small>
+              </span>
+            </button>
           </div>
           {preprocessMethod === "depth" && <div className="depth-quality-panel">
             <div className="quality-preset-row">
@@ -1421,6 +1509,24 @@ export function DepthVideoWorkbenchPage({
                 <div>
                   <strong>使用场景</strong>
                   <small>适合做黑白风格素材、后续 AI 风格化输入，处理速度显著快于深度视频。</small>
+                </div>
+              </div>
+            </div>
+          )}
+          {preprocessMethod === "split" && (
+            <div className="depth-quality-panel">
+              <div className="quality-help-grid">
+                <div>
+                  <strong>切分规则</strong>
+                  <small>以 9.9 秒为目标长度切分；最后一段不足 5 秒时，从前面片段均匀挪出时长。</small>
+                </div>
+                <div>
+                  <strong>长度限制</strong>
+                  <small>所有切片都会保持不超过 10 秒，适配后续 AI 再加工的视频时长限制。</small>
+                </div>
+                <div>
+                  <strong>关联关系</strong>
+                  <small>原视频保留在素材库，新切片继承标签和 lineage，并记录父素材与原视频时间范围。</small>
                 </div>
               </div>
             </div>
@@ -1806,6 +1912,9 @@ function ClipGrid({
           <div className="clip-body">
             <strong>{clip.title}</strong>
             <small>ID {clip.id} · lineage {clip.lineageId}</small>
+            {clip.parentClipId && clip.sourceRange && (
+              <small>来自 {clip.parentClipId} · {formatRangeLabel(clip.sourceRange.startSec, clip.sourceRange.endSec)}</small>
+            )}
             <div className="asset-preview-switcher">
               {clip.originalVideoUrl && (
                 <button
@@ -2074,6 +2183,69 @@ async function createClipFromFile(file: File, now: string, projectId: string, br
   };
 }
 
+function createClipFromSplitSegment(sourceClip: MaterialClip, segment: SplitBridgeSegment, splitBatchId: string, now: string): MaterialClip {
+  const id = createId("clip");
+  const originalOutputId = createId("output");
+  const parentOutput = getOriginalOutput(sourceClip);
+  const title = `${sourceClip.title} ${String(segment.index + 1).padStart(2, "0")} ${formatRangeLabel(segment.startSec, segment.endSec)}`;
+  return {
+    id,
+    lineageId: sourceClip.lineageId,
+    parentClipId: sourceClip.id,
+    sourceSegmentId: sourceClip.sourceSegmentId,
+    sourceRange: {
+      startSec: segment.startSec,
+      endSec: segment.endSec,
+      durationSec: segment.durationSec
+    },
+    splitBatchId,
+    title,
+    description: sourceClip.description,
+    duration: segment.durationSec,
+    originalVideoUrl: segment.videoUrl,
+    sourceFileName: segment.fileName,
+    sourceLocalPath: segment.localPath,
+    sourceMimeType: "video/mp4",
+    sourceSize: undefined,
+    tags: sourceClip.tags.map((tag) => ({ ...tag, id: createId("tag"), source: "import" as const, createdAt: now })),
+    customTags: [...sourceClip.customTags],
+    preprocess: {
+      id: createId("split"),
+      sourceClipId: id,
+      lineageId: sourceClip.lineageId,
+      status: "done",
+      method: "split",
+      inputVideoUrl: sourceClip.originalVideoUrl,
+      outputVideoUrl: segment.videoUrl,
+      provider: "local-bridge",
+      params: {
+        resolution: "1080p",
+        fps: 24,
+        depthModel: "ffmpeg-split"
+      },
+      cost: { elapsedSec: 0, gpuSec: 0 },
+      createdAt: now,
+      startedAt: now,
+      finishedAt: now,
+      updatedAt: now
+    },
+    aiJobs: [],
+    outputs: [{
+      id: originalOutputId,
+      sourceClipId: id,
+      lineageId: sourceClip.lineageId,
+      parentOutputId: parentOutput?.id,
+      type: "original",
+      provider: "split",
+      videoUrl: segment.videoUrl,
+      createdAt: now
+    }],
+    usageCount: 0,
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
 async function createImageMaterial(file: File, category: ImageLibraryCategory, now: string, projectId: string, bridgeUrl: string): Promise<ImageMaterial> {
   const id = createId("image");
   const lineageId = createId("lineage");
@@ -2184,6 +2356,16 @@ function outputTypeLabel(type: MaterialOutput["type"]) {
     ai_video: "AI产物"
   };
   return labels[type];
+}
+
+function formatRangeLabel(startSec: number, endSec: number) {
+  return `${formatTimestamp(startSec)}-${formatTimestamp(endSec)}`;
+}
+
+function formatTimestamp(totalSec: number) {
+  const minutes = Math.floor(totalSec / 60);
+  const seconds = totalSec - minutes * 60;
+  return `${String(minutes).padStart(2, "0")}:${seconds.toFixed(1).padStart(4, "0")}`;
 }
 
 function imageCategoryLabel(category: ImageLibraryCategory) {
@@ -2418,7 +2600,9 @@ function depthMetaText(clip: MaterialClip) {
   const record = clip.preprocess;
   if (!record) return "等待处理，可单独选择或批量处理";
   const method = record.method || "depth";
-  const quality = method === "depth"
+  const quality = method === "split"
+    ? `${clip.split?.segmentCount ?? 0} 个切片 · 每段 ≤10s`
+    : method === "depth"
     ? `${record.params.inputSize ?? 518}px · ${record.params.letterbox === false ? "拉伸" : "Letterbox"} · 滤波 ${record.params.edgeFilterStrength ?? 0}`
     : "OpenCV 灰度转换";
   const runtime = `${quality} · 耗时 ${record.cost.elapsedSec}s`;
@@ -2486,7 +2670,9 @@ function depthStatusLabel(status?: string) {
 }
 
 function preprocessMethodLabel(method: VideoPreprocessMethod) {
-  return method === "depth" ? "深度视频" : "黑白视频";
+  if (method === "depth") return "深度视频";
+  if (method === "grayscale") return "黑白视频";
+  return "视频切分";
 }
 
 function aiStatusLabel(status: string) {

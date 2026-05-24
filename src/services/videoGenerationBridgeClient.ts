@@ -14,6 +14,7 @@ import type {
 } from "../features/generation/providers/seedanceArk";
 import { DEFAULT_SEEDANCE_BRIDGE_URL } from "../features/generation/providers/seedanceArk";
 import type { ImageMaterial, MaterialClip } from "../features/depth-workbench/depthTypes";
+import type { VideoSplitRange } from "../features/depth-workbench/splitPlanning";
 import type { BrandMaskTrack, BrandMaskTrackingEngine, FaceMosaicEffect, VideoPreprocessTrace } from "../types";
 
 export interface VideoGenerationBridgeHealth {
@@ -342,6 +343,60 @@ export async function preprocessGrayscaleVideoBridge(input: {
       updatedAt: string;
     };
   }>(input.bridgeUrl, "/video/preprocess/grayscale", formData, 300_000);
+}
+
+export async function preprocessSplitVideoBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  lineageId?: string;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  sourceVideoName?: string;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("clipId", input.clipId);
+  if (input.lineageId) formData.set("lineageId", input.lineageId);
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  return requestBridgeForm<{
+    trace: {
+      id: string;
+      kind: "video-split";
+      provider: "local-bridge";
+      status: "done";
+      sourceVideoName?: string;
+      sourceVideoUrl?: string;
+      localPath?: string;
+      summary: {
+        sourceDurationSec: number;
+        segmentCount: number;
+        targetSec: number;
+        maxSec: number;
+        minLastSec: number;
+        elapsedSec: number;
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+    segments: Array<{
+      id: string;
+      sourceClipId: string;
+      lineageId: string;
+      index: number;
+      startSec: number;
+      endSec: number;
+      durationSec: number;
+      videoUrl: string;
+      localPath: string;
+      fileName: string;
+      range: VideoSplitRange;
+    }>;
+  }>(input.bridgeUrl, "/video/preprocess/split", formData, 600_000);
 }
 
 export async function getSeedanceBridgeTask(input: {

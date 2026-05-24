@@ -18,12 +18,43 @@ export interface MaterialTag {
   createdAt: string;
 }
 
+export type VideoPreprocessMethod = "depth" | "grayscale" | "split";
+
+export interface VideoSourceRange {
+  startSec: number;
+  endSec: number;
+  durationSec: number;
+}
+
+export interface VideoSplitRecord {
+  id: string;
+  sourceClipId: string;
+  lineageId: string;
+  status: "queued" | "processing" | "done" | "failed";
+  inputVideoUrl: string;
+  provider: "local-bridge";
+  segmentCount: number;
+  targetSec: number;
+  maxSec: number;
+  minLastSec: number;
+  sourceDurationSec?: number;
+  outputClipIds: string[];
+  cost: {
+    elapsedSec: number;
+  };
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt: string;
+}
+
 export interface DepthPreprocessRecord {
   id: string;
   sourceClipId: string;
   lineageId: string;
   status: "queued" | "processing" | "done" | "failed";
-  method?: "depth" | "grayscale";
+  method?: VideoPreprocessMethod;
   inputVideoUrl: string;
   outputVideoUrl?: string;
   depthVideoUrl?: string;
@@ -124,7 +155,10 @@ export interface DepthComposePlanItem {
 export interface MaterialClip {
   id: string;
   lineageId: string;
+  parentClipId?: string;
   sourceSegmentId?: string;
+  sourceRange?: VideoSourceRange;
+  splitBatchId?: string;
   title: string;
   description: string;
   duration: number;
@@ -136,6 +170,7 @@ export interface MaterialClip {
   sourceFile?: File;
   tags: MaterialTag[];
   customTags: string[];
+  split?: VideoSplitRecord;
   preprocess?: DepthPreprocessRecord;
   aiJobs: VideoAiJob[];
   outputs: MaterialOutput[];

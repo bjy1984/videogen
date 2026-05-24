@@ -56,9 +56,47 @@ import {
 } from "../src/features/script/scriptRevision";
 import { createMockAnalysis } from "../src/features/analysis/mockAnalysis";
 import { buildOperationAnalytics } from "../src/features/lineage/operationAnalytics";
+import { planVideoSplitRanges } from "../src/features/depth-workbench/splitPlanning";
 
 const analysis = createMockAnalysis(45);
 const segments = createSegmentsFromAnalysis(analysis, initialGenerationOptions);
+
+await run("plans video split ranges under ten seconds with balanced short tail", () => {
+  assert.deepEqual(
+    planVideoSplitRanges(29).map(({ startSec, endSec, durationSec }) => ({ startSec, endSec, durationSec })),
+    [
+      { startSec: 0, endSec: 9.9, durationSec: 9.9 },
+      { startSec: 9.9, endSec: 19.8, durationSec: 9.9 },
+      { startSec: 19.8, endSec: 29, durationSec: 9.2 }
+    ]
+  );
+  assert.deepEqual(
+    planVideoSplitRanges(23).map(({ startSec, endSec, durationSec }) => ({ startSec, endSec, durationSec })),
+    [
+      { startSec: 0, endSec: 9, durationSec: 9 },
+      { startSec: 9, endSec: 18, durationSec: 9 },
+      { startSec: 18, endSec: 23, durationSec: 5 }
+    ]
+  );
+  assert.deepEqual(
+    planVideoSplitRanges(12).map(({ startSec, endSec, durationSec }) => ({ startSec, endSec, durationSec })),
+    [
+      { startSec: 0, endSec: 7, durationSec: 7 },
+      { startSec: 7, endSec: 12, durationSec: 5 }
+    ]
+  );
+  assert.deepEqual(
+    planVideoSplitRanges(9.95).map(({ startSec, endSec, durationSec }) => ({ startSec, endSec, durationSec })),
+    [{ startSec: 0, endSec: 9.95, durationSec: 9.95 }]
+  );
+  assert.deepEqual(
+    planVideoSplitRanges(4).map(({ startSec, endSec, durationSec }) => ({ startSec, endSec, durationSec })),
+    [{ startSec: 0, endSec: 4, durationSec: 4 }]
+  );
+  for (const duration of [10.01, 19.8, 23, 29, 60.2, 95.1]) {
+    assert.ok(planVideoSplitRanges(duration).every((range) => range.durationSec <= 10));
+  }
+});
 
 await run("merges provider settings and selects provider-specific params", () => {
   const settings = mergeProviderSettings({

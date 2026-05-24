@@ -32,6 +32,7 @@ import {
   type SeedanceSyncAssetResponse,
   type SeedanceTaskResponse
 } from "../src/features/generation/providers/seedanceArk";
+import { planVideoSplitRanges } from "../src/features/depth-workbench/splitPlanning";
 import { loadWorkbenchLibraryState, saveWorkbenchLibraryState, seedSeedanceModelPricing } from "./materialLibraryStore";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -492,6 +493,99 @@ app.post("/video/preprocess/grayscale", upload.single("video"), async (req, res)
   }
 });
 
+app.post("/video/preprocess/split", upload.single("video"), async (req, res) => {
+  try {
+    const sourceLocalPath = String(req.body.sourceLocalPath || "").trim();
+    const sourceVideoUrl = String(req.body.sourceVideoUrl || "").trim();
+    if (!req.file && !sourceLocalPath && !sourceVideoUrl) {
+      throw new BridgeError("请上传需要切分的原素材，或传入本地素材路径/素材 URL。", 400);
+    }
+    const startedAt = Date.now();
+    const projectId = safePathPart(String(req.body.projectId || "default_project"));
+    const clipId = safePathPart(String(req.body.clipId || "clip"));
+    const lineageId = safePathPart(String(req.body.lineageId || "lineage"));
+    const preprocessId = safePathPart(`split_${Date.now()}`);
+    const extension =
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(req.file?.originalname || "") ||
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceVideoUrl) ||
+      "mp4";
+    const sourceName = req.file?.originalname || String(req.body.sourceVideoName || `source.${extension}`);
+    const relativeDir = path.join("split", projectId, clipId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    await copyPreprocessSource({
+      uploadPath: req.file?.path,
+      sourceLocalPath,
+      sourceVideoUrl,
+      targetPath: sourcePath,
+      providerLabel: "切分源素材"
+    });
+    const durationSec = await probeMediaDuration(sourcePath);
+    if (!durationSec) {
+      throw new BridgeError("无法读取源视频时长，切分失败。", 400);
+    }
+    const ranges = planVideoSplitRanges(durationSec);
+    const segmentResults = [];
+    for (const range of ranges) {
+      const segmentId = safePathPart(`${clipId}_part_${String(range.index + 1).padStart(2, "0")}`);
+      const fileName = `part_${String(range.index + 1).padStart(2, "0")}.mp4`;
+      const outputPath = path.join(outputDir, fileName);
+      await splitVideoRange({
+        inputPath: sourcePath,
+        outputPath,
+        startSec: range.startSec,
+        durationSec: range.durationSec
+      });
+      segmentResults.push({
+        id: segmentId,
+        sourceClipId: clipId,
+        lineageId,
+        index: range.index,
+        startSec: range.startSec,
+        endSec: range.endSec,
+        durationSec: range.durationSec,
+        videoUrl: assetUrl(req, relativeDir, fileName),
+        localPath: outputPath,
+        fileName,
+        range
+      });
+    }
+
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "video-split",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: sourceName,
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        localPath: outputDir,
+        summary: {
+          sourceDurationSec: Number(durationSec.toFixed(3)),
+          segmentCount: segmentResults.length,
+          targetSec: 9.9,
+          maxSec: 10,
+          minLastSec: 5,
+          elapsedSec: Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+        },
+        createdAt: now,
+        updatedAt: now
+      },
+      segments: segmentResults
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Video split preprocessing failed."
+    });
+  }
+});
+
 app.post("/seedance/tasks", async (req, res) => {
   const request = req.body as SeedanceCreateTaskBridgeRequest;
   try {
@@ -920,7 +1014,7 @@ async function normalizeVideoDuration(filePath: string, targetDuration: number) 
   }
   args.push(tempPath);
   try {
-    await runProcess("ffmpeg", args, 180_000);
+    await runProcess(resolveFfmpegCommand(), args, 180_000);
     await rename(tempPath, filePath);
   } catch (error) {
     await unlink(tempPath).catch(() => undefined);
@@ -929,21 +1023,104 @@ async function normalizeVideoDuration(filePath: string, targetDuration: number) 
 }
 
 async function probeMediaDuration(filePath: string) {
-  const result = await runProcess(
-    "ffprobe",
-    ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", filePath],
-    30_000
-  );
-  return positiveNumberOptional(Number(result.stdout.trim()));
+  try {
+    const result = await runProcess(
+      resolveFfprobeCommand(),
+      ["-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", filePath],
+      30_000
+    );
+    return positiveNumberOptional(Number(result.stdout.trim()));
+  } catch {
+    return await probeMediaDurationWithFfmpeg(filePath);
+  }
 }
 
 async function probeHasAudioStream(filePath: string) {
-  const result = await runProcess(
-    "ffprobe",
-    ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", filePath],
-    30_000
+  try {
+    const result = await runProcess(
+      resolveFfprobeCommand(),
+      ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", filePath],
+      30_000
+    );
+    return result.stdout.trim().length > 0;
+  } catch {
+    const result = await runProcessAllowFailure(resolveFfmpegCommand(), ["-i", filePath], 30_000);
+    return /Stream #\d+:\d+.*Audio:/i.test(result.stderr);
+  }
+}
+
+async function splitVideoRange(input: {
+  inputPath: string;
+  outputPath: string;
+  startSec: number;
+  durationSec: number;
+}) {
+  const args = [
+    "-y",
+    "-ss",
+    formatFfmpegNumber(input.startSec),
+    "-t",
+    formatFfmpegNumber(input.durationSec),
+    "-i",
+    input.inputPath,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a?",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "18",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-movflags",
+    "+faststart",
+    input.outputPath
+  ];
+  await runProcess(resolveFfmpegCommand(), args, 600_000);
+  await stat(input.outputPath);
+}
+
+async function probeMediaDurationWithFfmpeg(filePath: string) {
+  const result = await runProcessAllowFailure(resolveFfmpegCommand(), ["-i", filePath], 30_000);
+  const match = result.stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  if (!match) return undefined;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3]);
+  return positiveNumberOptional(hours * 3600 + minutes * 60 + seconds);
+}
+
+function resolveFfmpegCommand() {
+  return process.env.VIDEOGEN_FFMPEG_PATH?.trim() || resolveImageioFfmpegCommand() || "ffmpeg";
+}
+
+function resolveFfprobeCommand() {
+  return process.env.VIDEOGEN_FFPROBE_PATH?.trim() || "ffprobe";
+}
+
+function resolveImageioFfmpegCommand() {
+  const pythonPath = resolvePrivacyPythonPath();
+  const result = spawnSync(
+    pythonPath,
+    [
+      "-c",
+      [
+        "try:",
+        "    import imageio_ffmpeg",
+        "    print(imageio_ffmpeg.get_ffmpeg_exe())",
+        "except Exception:",
+        "    pass"
+      ].join("\n")
+    ],
+    { encoding: "utf8" }
   );
-  return result.stdout.trim().length > 0;
+  const command = result.stdout.trim();
+  return result.status === 0 && command ? command : undefined;
 }
 
 async function runProcess(command: string, args: string[], timeoutMs: number) {
@@ -972,6 +1149,32 @@ async function runProcess(command: string, args: string[], timeoutMs: number) {
         return;
       }
       reject(new BridgeError(`${command} 执行失败：${code}${output.stderr.trim() ? `，${output.stderr.trim()}` : ""}`, 500));
+    });
+  });
+}
+
+async function runProcessAllowFailure(command: string, args: string[], timeoutMs: number) {
+  return await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    const timeoutId = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new BridgeError(`${command} 执行超时：${Math.round(timeoutMs / 1000)}秒未完成。`, 504));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.on("error", (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeoutId);
+      resolve({
+        stdout: Buffer.concat(stdout).toString("utf8"),
+        stderr: Buffer.concat(stderr).toString("utf8"),
+        code
+      });
     });
   });
 }
