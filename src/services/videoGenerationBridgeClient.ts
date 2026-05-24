@@ -28,6 +28,7 @@ export interface VideoGenerationBridgeHealth {
     hasApiKey: boolean;
     hasLogin?: boolean;
     authReady?: boolean;
+    ossReady?: boolean;
     authMode?: "api-key" | "login-token" | "missing";
   };
   comfyui?: {
@@ -70,6 +71,9 @@ export interface UploadedBridgeAsset {
   fileName: string;
   localPath: string;
   localAssetUrl: string;
+  ossObjectKey?: string;
+  remoteAssetUrl?: string;
+  remoteAssetUrlExpiresAt?: string;
   savedAt: string;
 }
 

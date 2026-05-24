@@ -33,7 +33,13 @@ import {
   type SeedanceTaskResponse
 } from "../src/features/generation/providers/seedanceArk";
 import { planVideoSplitRanges } from "../src/features/depth-workbench/splitPlanning";
-import { loadWorkbenchLibraryState, saveWorkbenchLibraryState, seedSeedanceModelPricing } from "./materialLibraryStore";
+import {
+  loadWorkbenchLibraryState,
+  saveWorkbenchLibraryState,
+  seedSeedanceModelPricing,
+  type WorkbenchLibraryState
+} from "./materialLibraryStore";
+import { isOssConfigured, uploadAndSignOssAsset } from "./ossAssetStore";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, "..");
@@ -67,12 +73,12 @@ app.get("/library/workbench-state", async (req, res) => {
     const projectId = safePathPart(rawProjectId);
     const state = await loadWorkbenchLibraryState(projectId);
     res.json({
-      state: state || {
+      state: normalizeWorkbenchAssetUrls(req, state || {
         projectId,
         clips: [],
         images: [],
         updatedAt: null
-      }
+      })
     });
   } catch (error) {
     const status = error instanceof BridgeError ? error.status : 500;
@@ -89,10 +95,10 @@ app.put("/library/workbench-state", async (req, res) => {
       throw new BridgeError("缺少 projectId。", 400);
     }
     const projectId = safePathPart(rawProjectId);
-    const clips = Array.isArray(req.body?.clips) ? req.body.clips : [];
-    const images = Array.isArray(req.body?.images) ? req.body.images : [];
+    const clips = normalizeAssetUrlsInValue(req, Array.isArray(req.body?.clips) ? req.body.clips : []);
+    const images = normalizeAssetUrlsInValue(req, Array.isArray(req.body?.images) ? req.body.images : []);
     const state = await saveWorkbenchLibraryState({ projectId, clips, images });
-    res.json({ state });
+    res.json({ state: normalizeWorkbenchAssetUrls(req, state) });
   } catch (error) {
     const status = error instanceof BridgeError ? error.status : 500;
     res.status(status).json({
@@ -117,6 +123,7 @@ app.get("/health", async (req, res) => {
       hasApiKey: Boolean(process.env[apiKeyEnvName]),
       hasLogin: Boolean(process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD),
       authReady: Boolean(process.env[apiKeyEnvName] || (process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD)),
+      ossReady: isOssConfigured(),
       authMode: process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD
         ? "login-token"
         : process.env[apiKeyEnvName]
@@ -325,6 +332,7 @@ app.post("/assets/upload", upload.single("file"), async (req, res) => {
         fileName,
         localPath: outputPath,
         localAssetUrl: assetUrl(req, relativeDir, fileName),
+        ...(await ossAssetFields(relativeDir, fileName, outputPath, req.file.mimetype)),
         savedAt: new Date().toISOString()
       }
     });
@@ -595,6 +603,8 @@ app.post("/video/preprocess/split", upload.single("video"), async (req, res) => 
 app.post("/seedance/tasks", async (req, res) => {
   const request = req.body as SeedanceCreateTaskBridgeRequest;
   try {
+    request.body = await normalizeSeedanceMediaUrls(req, request.body);
+    validateSeedanceRemoteMediaUrls(request.body);
     const upstreamUrl = buildSeedanceCreateUrl(resolveSeedanceEndpoint(request.endpoint));
     const auth = await resolveSeedanceAuth(request.apiKeyEnvName, upstreamUrl);
     const task = await requestSeedanceTask(upstreamUrl, auth, {
@@ -1918,6 +1928,128 @@ function formatSeedanceUpstreamError(payload: unknown, status: number) {
     return `${message}。本地 NewAPI Bearer 鉴权已通过，但 apicoco 的 Seedance 渠道上游 API Key/AK/SK 缺失或无效，请在 apicoco 后台检查 xsdoubao/seedance 渠道配置。`;
   }
   return message;
+}
+
+function validateSeedanceRemoteMediaUrls(body: SeedanceCreateTaskBridgeRequest["body"]) {
+  const mediaUrls = [
+    ...(body?.metadata?.image_files || []),
+    ...(body?.metadata?.audio_files || []),
+    ...(body?.metadata?.video_files || [])
+  ];
+  const localOnlyUrls = mediaUrls.filter(isLocalOnlyUrl);
+  if (localOnlyUrls.length) {
+    throw new BridgeError(
+      "Seedance 远端无法访问本地素材地址。当前素材 URL 指向 localhost/127.0.0.1/内网 IP，请配置 VIDEOGEN_PUBLIC_ASSET_BASE_URL 为公网可访问的 /assets 地址，或使用公网存储素材 URL。",
+      400
+    );
+  }
+}
+
+async function normalizeSeedanceMediaUrls(req: express.Request, body: SeedanceCreateTaskBridgeRequest["body"]) {
+  return {
+    ...body,
+    metadata: {
+      ...body.metadata,
+      ...(body.metadata.image_files ? { image_files: await normalizeSeedanceMediaUrlList(req, body.metadata.image_files) } : {}),
+      ...(body.metadata.audio_files ? { audio_files: await normalizeSeedanceMediaUrlList(req, body.metadata.audio_files) } : {}),
+      ...(body.metadata.video_files ? { video_files: await normalizeSeedanceMediaUrlList(req, body.metadata.video_files) } : {})
+    }
+  };
+}
+
+async function normalizeSeedanceMediaUrlList(req: express.Request, urls: string[]) {
+  return Promise.all(urls.map((url) => normalizeSeedanceMediaUrl(req, url)));
+}
+
+async function normalizeSeedanceMediaUrl(req: express.Request, value: string) {
+  const localAsset = resolveLocalAssetUrl(value);
+  if (localAsset && isOssConfigured()) {
+    const signed = await uploadAndSignOssAsset({
+      relativeDir: localAsset.relativeDir,
+      fileName: localAsset.fileName,
+      localPath: localAsset.localPath,
+      mime: mimeFromFileName(localAsset.fileName)
+    });
+    if (signed) return signed.signedUrl;
+  }
+  return normalizeAssetUrl(req, value);
+}
+
+function normalizeWorkbenchAssetUrls(req: express.Request, state: WorkbenchLibraryState) {
+  return normalizeAssetUrlsInValue(req, state) as WorkbenchLibraryState;
+}
+
+function normalizeAssetUrlsInValue(req: express.Request, value: unknown): unknown {
+  if (typeof value === "string") return normalizeAssetUrl(req, value);
+  if (Array.isArray(value)) return value.map((item) => normalizeAssetUrlsInValue(req, item));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, normalizeAssetUrlsInValue(req, item)]));
+}
+
+function normalizeAssetUrl(req: express.Request, value: string) {
+  try {
+    const url = new URL(value);
+    if (!isLocalOnlyUrl(value) || !url.pathname.startsWith("/assets/")) return value;
+    const publicAssets = new URL(`${assetBaseUrl(req)}/`);
+    const relativePath = url.pathname.slice("/assets/".length);
+    return `${publicAssets.href}${relativePath}${url.search}`;
+  } catch {
+    return value;
+  }
+}
+
+function resolveLocalAssetUrl(value: string) {
+  try {
+    const url = new URL(value);
+    if (!url.pathname.startsWith("/assets/")) return undefined;
+    const decodedPath = decodeURIComponent(url.pathname.slice("/assets/".length));
+    const localPath = path.resolve(assetRootDir, decodedPath);
+    resolveAssetLocalPath(localPath);
+    return {
+      relativeDir: path.dirname(decodedPath),
+      fileName: path.basename(decodedPath),
+      localPath
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+async function ossAssetFields(relativeDir: string, fileName: string, localPath: string, mime?: string) {
+  const signed = await uploadAndSignOssAsset({ relativeDir, fileName, localPath, mime });
+  return signed
+    ? {
+        ossObjectKey: signed.objectKey,
+        remoteAssetUrl: signed.signedUrl,
+        remoteAssetUrlExpiresAt: signed.expiresAt
+      }
+    : {};
+}
+
+function mimeFromFileName(fileName: string) {
+  const extension = path.extname(fileName).toLowerCase();
+  if (extension === ".mp4") return "video/mp4";
+  if (extension === ".mov") return "video/quicktime";
+  if (extension === ".jpg" || extension === ".jpeg") return "image/jpeg";
+  if (extension === ".png") return "image/png";
+  if (extension === ".webp") return "image/webp";
+  return undefined;
+}
+
+function isLocalOnlyUrl(value: string) {
+  try {
+    const url = new URL(value);
+    const hostname = url.hostname.toLowerCase();
+    return hostname === "localhost"
+      || hostname === "127.0.0.1"
+      || hostname === "::1"
+      || hostname === "0.0.0.0"
+      || hostname.startsWith("10.")
+      || hostname.startsWith("192.168.")
+      || /^172\.(1[6-9]|2\d|3[0-1])\./.test(hostname);
+  } catch {
+    return false;
+  }
 }
 
 function stringifyOptional(value: unknown) {
