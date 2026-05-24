@@ -3,6 +3,7 @@ import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { VideoSegment } from "../../types";
 import { createId } from "../../services/id";
+import { formatDateTime } from "../../services/formatters";
 import {
   createSeedanceBridgeTask,
   getSeedanceBridgeTask,
@@ -79,19 +80,19 @@ const defaultAiPromptTemplates: AiPromptTemplate[] = [
   {
     id: "tpl_replace_product_keep_audio",
     name: "更换产品，保留声音",
-    content: "全面参考【@视频1】视频《{videoName}》{imageInstruction}，保留视频声音。",
+    content: "全面参考【@视频1】视频{imageInstruction}，保留视频声音。",
     builtin: true
   },
   {
     id: "tpl_product_only",
     name: "只换产品信息",
-    content: "参考【@视频1】视频《{videoName}》的镜头、动作和声音{productInstruction}。",
+    content: "参考【@视频1】视频的镜头、动作和声音{productInstruction}。",
     builtin: true
   },
   {
     id: "tpl_face_product",
     name: "产品与人脸参考",
-    content: "全面参考【@视频1】视频《{videoName}》{productInstruction}{faceInstruction}，保留视频声音。",
+    content: "全面参考【@视频1】视频{productInstruction}{faceInstruction}，保留视频声音。",
     builtin: true
   }
 ];
@@ -213,6 +214,7 @@ export function DepthVideoWorkbenchPage({
   const [depthLetterbox, setDepthLetterbox] = useState(true);
   const [depthEdgeFilterStrength, setDepthEdgeFilterStrength] = useState(0.35);
   const [depthEdgeFilterDiameter, setDepthEdgeFilterDiameter] = useState(7);
+  const [aiClockNow, setAiClockNow] = useState(Date.now());
   const libraryHydratedRef = useRef(false);
   const lastSavedLibraryRef = useRef("");
 
@@ -232,6 +234,13 @@ export function DepthVideoWorkbenchPage({
     () => clips.filter((clip) => !isPreprocessDoneForMethod(clip, preprocessMethod) && !isDepthBusy(clip)).map((clip) => clip.id),
     [clips, preprocessMethod]
   );
+  const aiJobRows = useMemo(
+    () => clips
+      .flatMap((clip) => clip.aiJobs.map((job) => ({ clip, job })))
+      .sort((a, b) => new Date(b.job.createdAt).getTime() - new Date(a.job.createdAt).getTime()),
+    [clips]
+  );
+  const aiMonitorStats = useMemo(() => buildAiMonitorStats(aiJobRows, aiClockNow), [aiClockNow, aiJobRows]);
 
   useEffect(() => {
     if (aiReferenceClipId && clips.some((clip) => clip.id === aiReferenceClipId)) return;
@@ -240,7 +249,7 @@ export function DepthVideoWorkbenchPage({
 
   useEffect(() => {
     const template = aiPromptTemplates.find((item) => item.id === activePromptTemplateId) || aiPromptTemplates[0] || defaultAiPromptTemplates[0];
-    setPromptTemplateDraft(template.content);
+    setPromptTemplateDraft(sanitizeAiPromptTemplate(template.content));
   }, [activePromptTemplateId, aiPromptTemplates]);
 
   useEffect(() => {
@@ -342,6 +351,12 @@ export function DepthVideoWorkbenchPage({
     }, 1000);
     return () => window.clearInterval(timer);
   }, [clips, onClips]);
+
+  useEffect(() => {
+    if (!aiJobRows.some(({ job }) => isAiJobActive(job))) return;
+    const timer = window.setInterval(() => setAiClockNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [aiJobRows]);
 
   function toggleSelected(id: string) {
     setSelectedIds((items) => (items.includes(id) ? items.filter((item) => item !== id) : [...items, id]));
@@ -913,7 +928,7 @@ export function DepthVideoWorkbenchPage({
   }
 
   function saveCurrentPromptTemplate() {
-    const content = promptTemplateDraft.trim();
+    const content = sanitizeAiPromptTemplate(promptTemplateDraft).trim();
     if (!content) {
       onNotice("模板内容不能为空。");
       return;
@@ -1055,6 +1070,12 @@ export function DepthVideoWorkbenchPage({
         error: error instanceof Error ? error.message : "Seedance 任务刷新失败。"
       });
     }
+  }
+
+  function refreshAiJobNow(clipId: string, job: VideoAiJob) {
+    if (job.provider !== "seedance_api" || !job.remoteTaskId || job.status === "done") return;
+    void refreshSeedanceAiJob(clipId, job.id, job.remoteTaskId);
+    onNotice(`正在刷新 Seedance 任务：${job.remoteTaskId}`);
   }
 
   function updateAiJob(clipId: string, jobId: string, patch: Partial<VideoAiJob>) {
@@ -1646,7 +1667,7 @@ export function DepthVideoWorkbenchPage({
                 <span>2</span>
                 <div>
                   <strong>参考图片</strong>
-                  <small>可多选，图片名会写入提示词</small>
+                  <small>可多选，提示词按 @图片编号引用</small>
                 </div>
               </div>
               <div className="image-library-tabs compact-tabs">
@@ -1758,21 +1779,70 @@ export function DepthVideoWorkbenchPage({
             <div className="ai-panel-title">
               <span>4</span>
               <div>
-                <strong>最近任务</strong>
-                <small>查看当前素材库里的 AI 加工状态</small>
+                <strong>生成任务看板</strong>
+                <small>实时查看 AI 视频生成状态、耗时、进度和产物同步</small>
               </div>
             </div>
-            <div className="depth-table ai-job-table">
-              {clips.map((clip) => (
-                <div className="depth-table-row" key={clip.id}>
-                  <strong>{clip.title}</strong>
-                  <span title={clip.aiJobs[0]?.error || undefined}>
-                    {clip.aiJobs[0] ? renderAiJobStatus(clip.aiJobs[0]) : "未AI加工"}
-                  </span>
-                  <small>{clip.aiJobs[0] ? `${providerLabel(clip.aiJobs[0].provider)} · ${clip.aiJobs[0].cost.generationSec}s · ¥${clip.aiJobs[0].cost.estimatedCash.toFixed(2)}` : "选择为参考视频后提交加工"}</small>
+
+            <div className="ai-monitor-stats">
+              <StatCard label="任务总数" value={aiMonitorStats.total} />
+              <StatCard label="生成中" value={aiMonitorStats.active} />
+              <StatCard label="已完成" value={aiMonitorStats.done} />
+              <StatCard label="失败" value={aiMonitorStats.failed} />
+              <StatCard label="累计耗时" value={formatDuration(aiMonitorStats.elapsedSec)} />
+              <StatCard label="预计成本" value={`¥${aiMonitorStats.cash.toFixed(2)}`} />
+            </div>
+
+            <div className="ai-job-board">
+              {aiJobRows.map(({ clip, job }) => {
+                const elapsedSec = displayAiJobElapsed(job, aiClockNow);
+                const progress = normalizeJobProgress(job);
+                return (
+                  <article className="ai-job-card" key={job.id}>
+                    <div className="ai-job-card-head">
+                      <div>
+                        <strong>{clip.title}</strong>
+                        <small>{providerLabel(job.provider)} · {aiInputTypeLabel(job.inputAssetType)} · {formatDateTime(job.createdAt)}</small>
+                      </div>
+                      <span className={`ai-job-status ${job.status}`}>{renderAiJobStatus(job, aiClockNow)}</span>
+                    </div>
+                    <div className="ai-job-progress" aria-label="AI 任务进度">
+                      <span style={{ width: `${progress}%` }} />
+                    </div>
+                    <div className="ai-job-meta-grid">
+                      <InfoChip label="本地任务" value={job.id} />
+                      <InfoChip label="远端任务" value={job.remoteTaskId || "-"} />
+                      <InfoChip label="远端状态" value={job.remoteStatus || "-"} />
+                      <InfoChip label="进度" value={`${progress}%`} />
+                      <InfoChip label="已耗时" value={formatDuration(elapsedSec)} />
+                      <InfoChip label="预计成本" value={`¥${job.cost.estimatedCash.toFixed(2)}`} />
+                    </div>
+                    {job.error && <div className="ai-job-error" title={job.error}>{job.error}</div>}
+                    <div className="ai-job-actions">
+                      {job.outputVideoUrl && (
+                        <a className="secondary-button compact" href={job.outputVideoUrl} target="_blank" rel="noreferrer">
+                          查看产物
+                        </a>
+                      )}
+                      <button
+                        className="secondary-button compact"
+                        onClick={() => refreshAiJobNow(clip.id, job)}
+                        disabled={job.provider !== "seedance_api" || !job.remoteTaskId || job.status === "done"}
+                      >
+                        <RefreshCw size={15} />
+                        刷新状态
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+              {!aiJobRows.length && (
+                <div className="empty-state compact-empty">
+                  <Wand2 size={34} />
+                  <strong>暂无 AI 生成任务</strong>
+                  <span>选择参考视频和素材后提交 AI 加工，任务会出现在这里。</span>
                 </div>
-              ))}
-              {!clips.length && <p className="muted-note">素材片段库为空，请先导入素材。</p>}
+              )}
             </div>
           </section>
         </section>
@@ -1858,6 +1928,15 @@ function StatCard({ label, value }: { label: string; value: number | string }) {
     <div className="depth-stat-card">
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function InfoChip({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="ai-info-chip">
+      <span>{label}</span>
+      <strong title={value}>{value}</strong>
     </div>
   );
 }
@@ -2358,6 +2437,11 @@ function outputTypeLabel(type: MaterialOutput["type"]) {
   return labels[type];
 }
 
+function aiInputTypeLabel(type: VideoAiJob["inputAssetType"]) {
+  if (type === "ai_output") return "AI产物";
+  return outputTypeLabel(type);
+}
+
 function formatRangeLabel(startSec: number, endSec: number) {
   return `${formatTimestamp(startSec)}-${formatTimestamp(endSec)}`;
 }
@@ -2404,7 +2488,7 @@ function loadSavedAiPromptTemplates(): AiPromptTemplate[] {
         .map((item) => ({
           id: typeof item.id === "string" ? item.id : createId("prompt_tpl"),
           name: item.name,
-          content: item.content,
+          content: sanitizeAiPromptTemplate(item.content),
           builtin: false
         }))
     ];
@@ -2414,26 +2498,26 @@ function loadSavedAiPromptTemplates(): AiPromptTemplate[] {
 }
 
 function renderAiPrompt(template: string, clip?: MaterialClip, images: ImageMaterial[] = []) {
-  const videoName = clip?.title || "未选择参考视频";
-  const imageNames = formatPromptNames(images.map((image) => image.title));
-  const productImages = formatPromptNames(images.filter((image) => image.category === "product").map((image) => image.title));
-  const faceImages = formatPromptNames(images.filter((image) => image.category === "face").map((image) => image.title));
-  const styleImages = formatPromptNames(images.filter((image) => image.category === "other").map((image) => image.title));
+  const videoName = "";
+  const imageNames = images.length ? "参考图片" : "";
+  const productImages = images.some((image) => image.category === "product") ? "参考产品" : imageNames;
+  const faceImages = images.some((image) => image.category === "face") ? "参考人脸" : "";
+  const styleImages = images.some((image) => image.category === "other") ? "参考风格" : "";
   const imageRefs = formatSeedanceImageRefs(images);
   const productImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "product"), images);
   const faceImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "face"), images);
   const styleImageRefs = formatSeedanceImageRefs(images.filter((image) => image.category === "other"), images);
-  const imageInstruction = images.length ? `，根据${imageRefs}更换产品信息为${imageNames}` : "";
+  const imageInstruction = images.length ? `，根据${imageRefs}更换产品信息` : "";
   const productInstruction = productImageRefs
-    ? `，根据${productImageRefs}将产品信息替换为${productImages}`
+    ? `，根据${productImageRefs}将产品信息替换为参考产品`
     : imageRefs
-      ? `，根据${imageRefs}将产品信息替换为${imageNames}`
+      ? `，根据${imageRefs}将产品信息替换为参考产品`
       : "";
-  const faceInstruction = faceImageRefs ? `，人物或人脸参考${faceImageRefs}${faceImages}` : "";
-  const styleInstruction = styleImageRefs ? `，风格参考${styleImageRefs}${styleImages}` : "";
+  const faceInstruction = faceImageRefs ? `，人物或人脸参考${faceImageRefs}` : "";
+  const styleInstruction = styleImageRefs ? `，风格参考${styleImageRefs}` : "";
   const videoTags = clip?.tags.map((tag) => tag.label).join("、") || "无";
   const imageTags = unique(images.flatMap((image) => image.tags.map((tag) => tag.label))).join("、") || "无";
-  return [
+  return cleanRenderedAiPrompt([
     ["{videoName}", videoName],
     ["{imageNames}", imageNames || "未选择参考图片"],
     ["{productImages}", productImages || imageNames || "未选择产品图片"],
@@ -2449,11 +2533,25 @@ function renderAiPrompt(template: string, clip?: MaterialClip, images: ImageMate
     ["{styleInstruction}", styleInstruction],
     ["{videoTags}", videoTags],
     ["{imageTags}", imageTags]
-  ].reduce((text, [token, value]) => text.split(token).join(value), template);
+  ].reduce((text, [token, value]) => text.split(token).join(value), sanitizeAiPromptTemplate(template)));
 }
 
-function formatPromptNames(names: string[]) {
-  return names.filter(Boolean).map((name) => `《${name}》`).join("");
+function sanitizeAiPromptTemplate(template: string) {
+  return template
+    .split("《{videoName}》").join("")
+    .split("《{imageNames}》").join("{imageNames}")
+    .split("《{productImages}》").join("{productImages}")
+    .split("《{faceImages}》").join("{faceImages}")
+    .split("《{styleImages}》").join("{styleImages}");
+}
+
+function cleanRenderedAiPrompt(prompt: string) {
+  return prompt
+    .split("《》").join("")
+    .replace(/《参考(图片|产品|人脸|风格)》/g, "参考$1")
+    .replace(/\s+，/g, "，")
+    .replace(/，{2,}/g, "，")
+    .trim();
 }
 
 function formatSeedanceImageRefs(targetImages: ImageMaterial[], allImages = targetImages) {
@@ -2504,7 +2602,7 @@ function createAiJob(
     inputVideoUrl: inputOutput?.videoUrl || clip.originalVideoUrl,
     provider,
     status: "queued" as const,
-    prompt: `${prompt}\n\n参考图片：${referenceImages.map((image) => image.title).join("、") || "无"}`,
+    prompt: prompt,
     referenceImageUrls: referenceImages.map((image) => image.imageUrl),
     cost,
     createdAt: now
@@ -2545,6 +2643,49 @@ function buildStats(clips: MaterialClip[]) {
     },
     { depthDone: 0, aiDone: 0, credits: 0, cash: 0 }
   );
+}
+
+function buildAiMonitorStats(rows: Array<{ job: VideoAiJob }>, nowMs: number) {
+  return rows.reduce(
+    (stats, { job }) => {
+      stats.total += 1;
+      if (isAiJobActive(job)) stats.active += 1;
+      if (job.status === "done") stats.done += 1;
+      if (job.status === "failed") stats.failed += 1;
+      stats.elapsedSec += displayAiJobElapsed(job, nowMs);
+      stats.cash += job.cost.estimatedCash;
+      return stats;
+    },
+    { total: 0, active: 0, done: 0, failed: 0, elapsedSec: 0, cash: 0 }
+  );
+}
+
+function isAiJobActive(job: VideoAiJob) {
+  return job.status === "queued" || job.status === "uploading" || job.status === "generating" || job.status === "capturing";
+}
+
+function displayAiJobElapsed(job: VideoAiJob, nowMs: number) {
+  if (!isAiJobActive(job) && job.elapsedSec !== undefined) return job.elapsedSec;
+  const startIso = job.startedAt || job.createdAt;
+  return Math.max(0, Math.floor((nowMs - new Date(startIso).getTime()) / 1000));
+}
+
+function normalizeJobProgress(job: VideoAiJob) {
+  if (job.status === "done") return 100;
+  if (job.status === "failed") return job.progress ?? 0;
+  if (job.progress !== undefined) return Math.max(0, Math.min(99, Math.round(job.progress)));
+  if (job.status === "generating") return 35;
+  if (job.status === "uploading") return 15;
+  if (job.status === "capturing") return 82;
+  return 5;
+}
+
+function formatDuration(totalSec: number) {
+  const sec = Math.max(0, Math.floor(totalSec));
+  const minutes = Math.floor(sec / 60);
+  const seconds = sec % 60;
+  if (minutes <= 0) return `${seconds}s`;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
 }
 
 function buildDepthMonitor(clips: MaterialClip[]) {
@@ -2687,15 +2828,15 @@ function aiStatusLabel(status: string) {
   return labels[status] ?? status;
 }
 
-function renderAiJobStatus(job: VideoAiJob) {
+function renderAiJobStatus(job: VideoAiJob, nowMs = Date.now()) {
   if (job.status === "generating") {
     const progressText = job.progress !== undefined ? ` ${job.progress}%` : "";
     const remoteText = job.remoteStatus ? ` [${job.remoteStatus}]` : "";
-    const elapsedText = job.elapsedSec !== undefined ? ` ${job.elapsedSec}s` : "";
+    const elapsedText = ` ${formatDuration(displayAiJobElapsed(job, nowMs))}`;
     return `生成中${progressText}${remoteText}${elapsedText}`;
   }
   if (job.status === "done") {
-    const elapsedText = job.elapsedSec !== undefined ? ` (${job.elapsedSec}s)` : "";
+    const elapsedText = job.elapsedSec !== undefined ? ` (${formatDuration(job.elapsedSec)})` : "";
     return `完成${elapsedText}`;
   }
   if (job.status === "failed") {

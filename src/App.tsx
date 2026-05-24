@@ -898,9 +898,9 @@ export default function App() {
         );
       } else {
         setNotice(
-          health.seedance?.hasApiKey
-            ? "Video Bridge 在线，Seedance API Key 已配置。"
-            : `Video Bridge 在线，但未配置 ${providerSettings.seedance.apiKeyEnvName}。`
+          health.seedance?.authReady
+            ? `Video Bridge 在线，Seedance 鉴权可用（${health.seedance.authMode === "login-token" ? "登录令牌" : "API Key"}）。`
+            : `Video Bridge 在线，但未配置 ${providerSettings.seedance.apiKeyEnvName} 或 NEWAPI_USERNAME/NEWAPI_PASSWORD。`
         );
       }
       return health;
@@ -917,8 +917,8 @@ export default function App() {
     if (options.provider !== "seedance" && options.provider !== "comfyui") return true;
     const health = await checkVideoBridge();
     if (!health) return false;
-    if (options.provider === "seedance" && !health.seedance?.hasApiKey) {
-      setNotice(`请先在 video bridge 进程配置 ${providerSettings.seedance.apiKeyEnvName}，再调用 Seedance。`);
+    if (options.provider === "seedance" && !health.seedance?.authReady) {
+      setNotice(`请先在 video bridge 进程配置 ${providerSettings.seedance.apiKeyEnvName} 或 NEWAPI_USERNAME/NEWAPI_PASSWORD，再调用 Seedance。`);
       return false;
     }
     if (options.provider === "comfyui" && !health.comfyui?.reachable) {

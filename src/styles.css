@@ -2020,6 +2020,12 @@ label.secondary-button:focus-within {
   background: white;
 }
 
+.ai-monitor-stats {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px;
+}
+
 .ai-panel-title {
   display: flex;
   align-items: center;
@@ -2234,6 +2240,138 @@ label.secondary-button:focus-within {
 
 .ai-job-table {
   margin-top: 0;
+}
+
+.ai-job-board {
+  display: grid;
+  gap: 10px;
+}
+
+.ai-job-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.ai-job-card-head,
+.ai-job-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ai-job-card-head > div {
+  min-width: 0;
+}
+
+.ai-job-card-head strong,
+.ai-job-card-head small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-job-card-head small {
+  margin-top: 3px;
+  color: var(--muted);
+}
+
+.ai-job-status {
+  flex: 0 0 auto;
+  max-width: 300px;
+  padding: 6px 9px;
+  border-radius: 8px;
+  background: #eef4f0;
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-job-status.queued,
+.ai-job-status.uploading,
+.ai-job-status.generating,
+.ai-job-status.capturing {
+  background: #fff3dd;
+  color: var(--orange);
+}
+
+.ai-job-status.done {
+  background: #e2f4eb;
+  color: var(--accent-dark);
+}
+
+.ai-job-status.failed {
+  background: #ffe7e3;
+  color: var(--danger);
+}
+
+.ai-job-progress {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #dfe8e3;
+}
+
+.ai-job-progress span {
+  display: block;
+  height: 100%;
+  min-width: 5%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.ai-job-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ai-info-chip {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+}
+
+.ai-info-chip span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.ai-info-chip strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ai-job-error {
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: #fff0ed;
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .depth-table-row {
@@ -4162,6 +4300,8 @@ label.secondary-button:focus-within {
   .depth-tabs,
   .depth-two-column,
   .ai-workbench-grid,
+  .ai-monitor-stats,
+  .ai-job-meta-grid,
   .comfyui-test-layout {
     grid-template-columns: 1fr;
   }
@@ -4230,8 +4370,16 @@ label.secondary-button:focus-within {
   .image-grid,
   .recipe-row,
   .inline-tag-editor,
+  .ai-job-card-head,
+  .ai-job-actions,
   .depth-table-row {
     grid-template-columns: 1fr;
+  }
+
+  .ai-job-card-head,
+  .ai-job-actions {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .mask-timeline-header {

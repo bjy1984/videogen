@@ -24,6 +24,7 @@ import {
   DEFAULT_SEEDANCE_ARK_BASE_URL,
   DEFAULT_SEEDANCE_BRIDGE_URL,
   DEFAULT_SEEDANCE_MODEL,
+  SEEDANCE_MODEL_PRICING,
   buildSeedanceCreateTaskRequest,
   buildSeedanceCreateUrl,
   buildSeedanceTaskUrl,
@@ -110,6 +111,7 @@ await run("merges provider settings and selects provider-specific params", () =>
   assert.equal(settings.seedance.endpoint, DEFAULT_SEEDANCE_ARK_BASE_URL);
   assert.equal(settings.seedance.model, DEFAULT_SEEDANCE_MODEL);
   assert.equal(settings.seedance.apiKeyEnvName, "NEWAPI_API_KEY");
+  assert.equal(SEEDANCE_MODEL_PRICING.find((item) => item.model === DEFAULT_SEEDANCE_MODEL)?.cnyPerSecond, 0.55);
 
   const comfyParams = providerParamsFor("comfyui", settings);
   assert.equal(comfyParams.endpoint, "http://localhost:8188");

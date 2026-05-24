@@ -420,7 +420,7 @@ function bridgeStatusText(provider: Provider, health: VideoGenerationBridgeHealt
   if (provider === "comfyui") {
     return `${health.service} · ${health.comfyui?.reachable ? "ComfyUI 可达" : "ComfyUI 不可达"}`;
   }
-  return `${health.service} · ${health.seedance?.hasApiKey ? "API Key 已配置" : "缺少 API Key"}`;
+  return `${health.service} · ${health.seedance?.authReady ? "Seedance 鉴权可用" : "缺少 Seedance 鉴权"}`;
 }
 
 function SegmentVideoGrid({ segments, sourcePreviewUrl }: { segments: VideoSegment[]; sourcePreviewUrl: string }) {

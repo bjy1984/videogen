@@ -17,7 +17,7 @@ export const SEEDANCE_MODEL_PRICING: SeedanceModelPricing[] = [
     model: "xsdoubao/seedance2.0_fast_direct",
     label: "Seedance 2.0 Fast Direct",
     resolution: "720p",
-    cnyPerSecond: 0.75,
+    cnyPerSecond: 0.55,
     supportsReferenceMedia: false
   },
   {

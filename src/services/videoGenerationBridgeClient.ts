@@ -26,6 +26,9 @@ export interface VideoGenerationBridgeHealth {
     endpoint: string;
     apiKeyEnvName: string;
     hasApiKey: boolean;
+    hasLogin?: boolean;
+    authReady?: boolean;
+    authMode?: "api-key" | "login-token" | "missing";
   };
   comfyui?: {
     endpoint: string;

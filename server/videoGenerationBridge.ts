@@ -115,7 +115,13 @@ app.get("/health", async (req, res) => {
       endpoint: resolveSeedanceEndpoint(DEFAULT_SEEDANCE_ARK_BASE_URL),
       apiKeyEnvName,
       hasApiKey: Boolean(process.env[apiKeyEnvName]),
-      hasLogin: Boolean(process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD)
+      hasLogin: Boolean(process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD),
+      authReady: Boolean(process.env[apiKeyEnvName] || (process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD)),
+      authMode: process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD
+        ? "login-token"
+        : process.env[apiKeyEnvName]
+          ? "api-key"
+          : "missing"
     },
     comfyui: {
       endpoint: comfyEndpoint,
@@ -793,7 +799,6 @@ interface TimedRequestInit extends RequestInit {
 
 interface SeedanceAuth {
   authorization?: string;
-  cookie?: string;
 }
 
 let cachedSeedanceLogin: { endpoint: string; auth: SeedanceAuth; expiresAt: number } | undefined;
@@ -810,7 +815,7 @@ async function requestSeedanceTask(url: string, auth: SeedanceAuth, init: TimedR
   const payload = await readPayload(response);
   if (!response.ok) {
     throw new BridgeError(
-      extractUpstreamError(payload) || `Seedance upstream request failed: ${response.status}`,
+      formatSeedanceUpstreamError(payload, response.status),
       502
     );
   }
@@ -1725,6 +1730,9 @@ function containsPromptId(value: unknown, promptId: string): boolean {
 }
 
 async function resolveSeedanceAuth(apiKeyEnvName: string, requestUrl: string): Promise<SeedanceAuth> {
+  if (process.env.NEWAPI_USERNAME && process.env.NEWAPI_PASSWORD) {
+    return loginSeedance(requestUrl);
+  }
   const apiKey = readApiKeyOptional(apiKeyEnvName);
   if (apiKey) return { authorization: `Bearer ${apiKey}` };
   return loginSeedance(requestUrl);
@@ -1759,10 +1767,16 @@ async function loginSeedance(requestUrl: string): Promise<SeedanceAuth> {
       response.status === 401 || response.status === 403 ? response.status : 502
     );
   }
-  const auth = seedanceAuthFromLogin(response, payload);
-  if (!auth.authorization && !auth.cookie) {
-    throw new BridgeError("NewAPI 登录成功但未返回 token 或 cookie，无法认证视频接口。请在控制台生成 Bearer 密钥并配置 NEWAPI_API_KEY。", 400);
+  const userId = extractLoginUserId(payload);
+  const cookie = response.headers.get("set-cookie")?.split(",").map((item) => item.split(";")[0].trim()).filter(Boolean).join("; ");
+  if (!userId || !cookie) {
+    throw new BridgeError("NewAPI 登录成功但未返回用户 ID 或 session cookie，无法自动获取视频接口令牌。", 400);
   }
+  const apiKey = await resolveSeedanceApiToken(endpoint, cookie, userId);
+  if (!apiKey) {
+    throw new BridgeError("未能自动获取 NewAPI 视频接口令牌。请在令牌管理中创建令牌，并配置 NEWAPI_API_KEY。", 400);
+  }
+  const auth = { authorization: `Bearer ${apiKey}` };
   cachedSeedanceLogin = {
     endpoint,
     auth,
@@ -1773,29 +1787,77 @@ async function loginSeedance(requestUrl: string): Promise<SeedanceAuth> {
 
 function seedanceAuthHeaders(auth: SeedanceAuth): Record<string, string> {
   return {
-    ...(auth.authorization ? { Authorization: auth.authorization } : {}),
-    ...(auth.cookie ? { Cookie: auth.cookie } : {})
+    ...(auth.authorization ? { Authorization: auth.authorization } : {})
   };
 }
 
-function seedanceAuthFromLogin(response: Response, payload: unknown): SeedanceAuth {
-  const token = extractLoginToken(payload);
-  const cookie = response.headers.get("set-cookie")?.split(",").map((item) => item.split(";")[0].trim()).filter(Boolean).join("; ");
-  return {
-    ...(token ? { authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}` } : {}),
-    ...(cookie ? { cookie } : {})
-  };
+async function resolveSeedanceApiToken(endpoint: string, cookie: string, userId: string) {
+  const token = await findSeedanceApiToken(endpoint, cookie, userId);
+  if (token) return token;
+  await createSeedanceApiToken(endpoint, cookie, userId);
+  return findSeedanceApiToken(endpoint, cookie, userId);
 }
 
-function extractLoginToken(payload: unknown): string | undefined {
-  if (!isRecord(payload)) return undefined;
-  for (const key of ["token", "access_token", "key", "api_key", "session_token"]) {
-    if (typeof payload[key] === "string") return payload[key];
+async function findSeedanceApiToken(endpoint: string, cookie: string, userId: string) {
+  const response = await fetchWithTimeout(`${endpoint}/api/token/?p=0&page_size=100`, {
+    method: "GET",
+    timeoutMs: 30_000,
+    headers: {
+      Cookie: cookie,
+      "New-Api-User": userId
+    }
+  });
+  const payload = await readPayload(response);
+  if (!response.ok) {
+    throw new BridgeError(extractUpstreamError(payload) || `读取 NewAPI 令牌失败：${response.status}`, 502);
   }
-  for (const key of ["data", "result", "user"]) {
+  const tokens = extractTokenItems(payload)
+    .filter((item) => item.status !== 2 && typeof item.key === "string" && item.key)
+    .sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+  return stringifyOptional(tokens[0]?.key);
+}
+
+async function createSeedanceApiToken(endpoint: string, cookie: string, userId: string) {
+  const response = await fetchWithTimeout(`${endpoint}/api/token/`, {
+    method: "POST",
+    timeoutMs: 30_000,
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: cookie,
+      "New-Api-User": userId
+    },
+    body: JSON.stringify({
+      name: "videogen-local",
+      remain_quota: 500000,
+      unlimited_quota: false,
+      expired_time: 0
+    })
+  });
+  const payload = await readPayload(response);
+  if (!response.ok) {
+    throw new BridgeError(extractUpstreamError(payload) || `创建 NewAPI 令牌失败：${response.status}`, 502);
+  }
+}
+
+function extractTokenItems(payload: unknown): Array<Record<string, unknown>> {
+  if (Array.isArray(payload)) return payload.filter(isRecord);
+  if (!isRecord(payload)) return [];
+  if (Array.isArray(payload.data)) return payload.data.filter(isRecord);
+  if (isRecord(payload.data) && Array.isArray(payload.data.items)) return payload.data.items.filter(isRecord);
+  if (Array.isArray(payload.items)) return payload.items.filter(isRecord);
+  return [];
+}
+
+function extractLoginUserId(payload: unknown): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  if (typeof payload.id === "number" || typeof payload.id === "string") return String(payload.id);
+  if (isRecord(payload.data) && (typeof payload.data.id === "number" || typeof payload.data.id === "string")) {
+    return String(payload.data.id);
+  }
+  for (const key of ["result", "user"]) {
     const nested = payload[key];
-    const token = extractLoginToken(nested);
-    if (token) return token;
+    const id = extractLoginUserId(nested);
+    if (id) return id;
   }
   return undefined;
 }
@@ -1848,6 +1910,14 @@ function extractUpstreamError(payload: unknown) {
   if (typeof payload.error === "string") return payload.error;
   if (isRecord(payload.error) && typeof payload.error.message === "string") return payload.error.message;
   return undefined;
+}
+
+function formatSeedanceUpstreamError(payload: unknown, status: number) {
+  const message = extractUpstreamError(payload) || `Seedance upstream request failed: ${status}`;
+  if (/api key|ak\/sk|missing or invalid/i.test(message)) {
+    return `${message}。本地 NewAPI Bearer 鉴权已通过，但 apicoco 的 Seedance 渠道上游 API Key/AK/SK 缺失或无效，请在 apicoco 后台检查 xsdoubao/seedance 渠道配置。`;
+  }
+  return message;
 }
 
 function stringifyOptional(value: unknown) {
