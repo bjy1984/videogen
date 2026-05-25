@@ -2239,7 +2239,7 @@ async function createClipFromFile(file: File, now: string, projectId: string, br
   const lineageId = createId("lineage");
   const originalOutputId = createId("output");
   const uploaded = await uploadWorkbenchAsset(file, "video", projectId, id, bridgeUrl);
-  const videoUrl = uploaded?.localAssetUrl || URL.createObjectURL(file);
+  const videoUrl = uploaded?.remoteAssetUrl || uploaded?.localAssetUrl || URL.createObjectURL(file);
   return {
     id,
     lineageId,
@@ -2329,7 +2329,7 @@ async function createImageMaterial(file: File, category: ImageLibraryCategory, n
   const id = createId("image");
   const lineageId = createId("lineage");
   const uploaded = await uploadWorkbenchAsset(file, "image", projectId, id, bridgeUrl);
-  const imageUrl = uploaded?.localAssetUrl || URL.createObjectURL(file);
+  const imageUrl = uploaded?.remoteAssetUrl || uploaded?.localAssetUrl || URL.createObjectURL(file);
   return {
     id,
     lineageId,
