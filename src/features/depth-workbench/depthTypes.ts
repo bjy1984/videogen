@@ -104,12 +104,29 @@ export interface VideoAiJob {
   inputAssetType: "original" | "depth_video" | "grayscale_video" | "ai_output";
   inputVideoUrl: string;
   provider: DepthAiProvider;
+  generationMode?: "direct_reference" | "frame_replacement";
   status: "queued" | "uploading" | "generating" | "capturing" | "done" | "failed";
   prompt: string;
   outputVideoUrl?: string;
   outputThumbnailUrl?: string;
   remoteTaskId?: string;
   referenceImageUrls?: string[];
+  frameSample?: {
+    intervalSec: number;
+    maxFrames: number;
+    durationSec: number;
+    frameUrls: string[];
+  };
+  transcript?: {
+    text: string;
+    language?: string;
+    durationSec?: number;
+    segments: Array<{
+      startSec: number;
+      endSec: number;
+      text: string;
+    }>;
+  };
   error?: string;
   cost: AiGenerationCost;
   createdAt: string;
@@ -128,6 +145,7 @@ export interface MaterialOutput {
   type: "original" | "depth_video" | "grayscale_video" | "ai_video";
   provider: string;
   videoUrl: string;
+  localPath?: string;
   jobId?: string;
   createdAt: string;
 }

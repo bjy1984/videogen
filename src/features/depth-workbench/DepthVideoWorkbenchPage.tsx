@@ -6,6 +6,7 @@ import { createId } from "../../services/id";
 import { formatDateTime } from "../../services/formatters";
 import {
   createSeedanceBridgeTask,
+  extractVideoFramesBridge,
   getSeedanceBridgeTask,
   loadWorkbenchLibraryState,
   preprocessDepthVideoBridge,
@@ -13,6 +14,7 @@ import {
   preprocessSplitVideoBridge,
   saveWorkbenchLibraryState,
   syncSeedanceBridgeAsset,
+  transcribeVideoBridge,
   uploadVideoGenerationBridgeAsset
 } from "../../services/videoGenerationBridgeClient";
 import {
@@ -67,6 +69,11 @@ const providerOptions: Array<{ value: DepthAiProvider; label: string }> = [
   { value: "kling_web", label: "可灵网页版" },
   { value: "gemini_web", label: "Gemini 网页版" }
 ];
+
+type AiGenerationMode = "direct_reference" | "frame_replacement";
+
+const seedanceFastDirectModel = "xsdoubao/seedance2.0_fast_direct";
+const frameReplacementMaxFrames = 12;
 
 interface AiPromptTemplate {
   id: string;
@@ -163,6 +170,7 @@ export function DepthVideoWorkbenchPage({
   projectId,
   bridgeUrl,
   seedanceSettings,
+  onSeedanceSettings,
   onClips,
   onImages,
   onRecipe,
@@ -183,6 +191,7 @@ export function DepthVideoWorkbenchPage({
   projectId: string;
   bridgeUrl: string;
   seedanceSettings: SeedanceProviderConfig;
+  onSeedanceSettings: (settings: SeedanceProviderConfig) => void;
   onClips: Dispatch<SetStateAction<MaterialClip[]>>;
   onImages: Dispatch<SetStateAction<ImageMaterial[]>>;
   onRecipe: Dispatch<SetStateAction<ComposeRecipeStep[]>>;
@@ -200,8 +209,12 @@ export function DepthVideoWorkbenchPage({
   const [imageTagType, setImageTagType] = useState<MaterialTagType>("product");
   const [customImageTag, setCustomImageTag] = useState("");
   const [aiProvider, setAiProvider] = useState<DepthAiProvider>("seedance_api");
+  const [aiGenerationMode, setAiGenerationMode] = useState<AiGenerationMode>("direct_reference");
   const [aiReferenceClipId, setAiReferenceClipId] = useState("");
   const [aiReferenceOutputType, setAiReferenceOutputType] = useState<MaterialOutput["type"]>("original");
+  const [frameReplacementDuration, setFrameReplacementDuration] = useState(5);
+  const [sourceTranscriptByClipId, setSourceTranscriptByClipId] = useState<Record<string, VideoAiJob["transcript"]>>({});
+  const [isTranscribingSource, setIsTranscribingSource] = useState(false);
   const [aiPromptTemplates, setAiPromptTemplates] = useState<AiPromptTemplate[]>(loadSavedAiPromptTemplates);
   const [activePromptTemplateId, setActivePromptTemplateId] = useState(defaultAiPromptTemplates[0].id);
   const [promptTemplateDraft, setPromptTemplateDraft] = useState(defaultAiPromptTemplates[0].content);
@@ -224,6 +237,7 @@ export function DepthVideoWorkbenchPage({
     () => selectedImageIds.map((id) => images.find((image) => image.id === id)).filter((image): image is ImageMaterial => Boolean(image)),
     [images, selectedImageIds]
   );
+  const sourceTranscript = aiReferenceClip ? sourceTranscriptByClipId[aiReferenceClip.id] : undefined;
   const stats = useMemo(() => buildStats(clips), [clips]);
   const depthMonitor = useMemo(() => buildDepthMonitor(clips), [clips]);
   const depthProcessableIds = useMemo(
@@ -248,6 +262,10 @@ export function DepthVideoWorkbenchPage({
   }, [aiReferenceClipId, clips]);
 
   useEffect(() => {
+    setFrameReplacementDuration(seedanceDurationFromClip(aiReferenceClip, undefined, seedanceSettings.defaultDuration));
+  }, [aiReferenceClip, seedanceSettings.defaultDuration]);
+
+  useEffect(() => {
     const template = aiPromptTemplates.find((item) => item.id === activePromptTemplateId) || aiPromptTemplates[0] || defaultAiPromptTemplates[0];
     setPromptTemplateDraft(sanitizeAiPromptTemplate(template.content));
   }, [activePromptTemplateId, aiPromptTemplates]);
@@ -262,8 +280,8 @@ export function DepthVideoWorkbenchPage({
 
   useEffect(() => {
     if (promptDirty) return;
-    setPrompt(renderAiPrompt(promptTemplateDraft, aiReferenceClip, aiReferenceImages));
-  }, [aiReferenceClip, aiReferenceImages, promptDirty, promptTemplateDraft]);
+    setPrompt(renderAiPromptForMode(aiGenerationMode, promptTemplateDraft, aiReferenceClip, aiReferenceImages, sourceTranscript, seedanceSettings.defaultDuration));
+  }, [aiGenerationMode, aiReferenceClip, aiReferenceImages, promptDirty, promptTemplateDraft, seedanceSettings.defaultDuration, sourceTranscript]);
 
   useEffect(() => {
     let cancelled = false;
@@ -856,6 +874,7 @@ export function DepthVideoWorkbenchPage({
             type: method === "depth" ? "depth_video" : "grayscale_video",
             provider: "local-bridge",
             videoUrl: outputVideoUrl,
+            localPath: trace.localPath,
             createdAt: now
           }),
           updatedAt: now
@@ -923,7 +942,13 @@ export function DepthVideoWorkbenchPage({
   }
 
   function regenerateAiPrompt() {
-    setPrompt(renderAiPrompt(promptTemplateDraft, aiReferenceClip, aiReferenceImages));
+    setPrompt(renderAiPromptForMode(aiGenerationMode, promptTemplateDraft, aiReferenceClip, aiReferenceImages, sourceTranscript, seedanceSettings.defaultDuration));
+    setPromptDirty(false);
+  }
+
+  function changeAiGenerationMode(nextMode: AiGenerationMode) {
+    setAiGenerationMode(nextMode);
+    setPrompt(renderAiPromptForMode(nextMode, promptTemplateDraft, aiReferenceClip, aiReferenceImages, sourceTranscript, seedanceSettings.defaultDuration));
     setPromptDirty(false);
   }
 
@@ -969,7 +994,7 @@ export function DepthVideoWorkbenchPage({
       return;
     }
     const now = new Date().toISOString();
-    const job = createAiJob(aiReferenceClip, aiProvider, finalPrompt, now, aiReferenceImages, aiReferenceOutputType, seedanceSettings);
+    const job = createAiJob(aiReferenceClip, aiProvider, finalPrompt, now, aiReferenceImages, aiReferenceOutputType, seedanceSettings, aiGenerationMode, sourceTranscript);
     onClips((current) =>
       current.map((clip) => {
         if (clip.id !== aiReferenceClip.id) return clip;
@@ -989,6 +1014,9 @@ export function DepthVideoWorkbenchPage({
         remoteTaskId: task.id,
         status: mapSeedanceTaskStatus(task.status) === "done" ? "done" : "generating",
         outputVideoUrl: task.content?.video_url,
+        prompt: task.finalPrompt || finalPrompt,
+        frameSample: task.frameSample,
+        transcript: task.transcript,
         error: extractSeedanceTaskError(task)
       });
       onNotice(`Seedance 任务已提交：${task.id || "等待返回任务ID"}。可稍后刷新任务状态。`);
@@ -1005,6 +1033,9 @@ export function DepthVideoWorkbenchPage({
   }
 
   async function submitSeedanceAiJob(clip: MaterialClip, job: VideoAiJob, finalPrompt: string) {
+    if (aiGenerationMode === "frame_replacement") {
+      return submitSeedanceFrameReplacementJob(clip, job, finalPrompt);
+    }
     const sourceVideoUrl = persistentAiVideoUrl(clip, aiReferenceOutputType);
     if (!sourceVideoUrl) {
       throw new Error("Seedance 需要可访问的参考视频 URL。请先上传素材到本地素材库，并配置可被后台访问的 VIDEOGEN_PUBLIC_ASSET_BASE_URL。");
@@ -1030,7 +1061,129 @@ export function DepthVideoWorkbenchPage({
       }
     });
     const task = await createSeedanceBridgeTask({ bridgeUrl, request });
-    return { ...task, localJobId: job.id };
+    return { ...task, localJobId: job.id, finalPrompt, frameSample: undefined, transcript: undefined };
+  }
+
+  async function submitSeedanceFrameReplacementJob(clip: MaterialClip, job: VideoAiJob, scriptPrompt: string) {
+    const sourceInput = seedanceSourceInput(clip);
+    if (!sourceInput.sourceVideoUrl && !sourceInput.sourceLocalPath && !sourceInput.video) {
+      throw new Error("分帧替换需要可读取的素材视频。请先上传素材到本地素材库。");
+    }
+    const frameResult = await extractVideoFramesBridge({
+      bridgeUrl,
+      projectId,
+      clipId: clip.id,
+      video: sourceInput.video,
+      sourceLocalPath: sourceInput.sourceLocalPath,
+      sourceVideoUrl: sourceInput.sourceVideoUrl,
+      sourceVideoName: sourceInput.sourceVideoName,
+      intervalSec: 1,
+      maxFrames: frameReplacementMaxFrames
+    });
+    const frameUrls = frameResult.frames.map((frame) => frame.imageUrl);
+    const productImages = aiReferenceImages.filter((image) => image.category === "product");
+    const replacementImages = (productImages.length ? productImages : aiReferenceImages)
+      .map((image) => image.imageUrl)
+      .filter((url) => url && !url.startsWith("blob:"));
+    if (!replacementImages.length) {
+      throw new Error("分帧替换需要至少选择一张产品图片素材。");
+    }
+    const duration = normalizeSeedanceDuration(frameReplacementDuration, clip, frameResult.trace.summary.durationSec, seedanceSettings.defaultDuration);
+    const finalPrompt = promptDirty
+      ? scriptPrompt
+      : buildFrameReplacementPrompt({
+          scriptPrompt: cleanFrameReplacementScript(promptTemplateDraft),
+          transcript: sourceTranscript,
+          frameCount: frameUrls.length,
+          productCount: replacementImages.length
+        });
+    const request = buildSeedanceCreateTaskRequest({
+      prompt: finalPrompt,
+      aspectRatio: "9:16",
+      duration,
+      referenceImageUrls: [...frameUrls, ...replacementImages],
+      params: {
+        bridgeUrl,
+        endpoint: seedanceSettings.endpoint,
+        apiKeyEnvName: seedanceSettings.apiKeyEnvName,
+        model: seedanceFastDirectModel,
+        defaultDuration: duration,
+        resolution: "720p",
+        seed: seedanceSettings.seed,
+        generateAudio: seedanceSettings.generateAudio,
+        watermark: seedanceSettings.watermark,
+        returnLastFrame: seedanceSettings.returnLastFrame
+      }
+    });
+    const task = await createSeedanceBridgeTask({ bridgeUrl, request });
+    return {
+      ...task,
+      localJobId: job.id,
+      finalPrompt,
+      transcript: sourceTranscript,
+      frameSample: {
+        intervalSec: 1,
+        maxFrames: frameReplacementMaxFrames,
+        durationSec: frameResult.trace.summary.durationSec,
+        frameUrls
+      }
+    };
+  }
+
+  async function transcribeAiReferenceClip() {
+    if (!aiReferenceClip) {
+      onNotice("请先选择一条参考视频。");
+      return;
+    }
+    const sourceInput = seedanceSourceInput(aiReferenceClip);
+    if (!sourceInput.sourceVideoUrl && !sourceInput.sourceLocalPath && !sourceInput.video) {
+      onNotice("该素材缺少可转写的视频文件或本地资产链接。");
+      return;
+    }
+    setIsTranscribingSource(true);
+    try {
+      const result = await transcribeVideoBridge({
+        bridgeUrl,
+        projectId,
+        clipId: aiReferenceClip.id,
+        video: sourceInput.video,
+        sourceLocalPath: sourceInput.sourceLocalPath,
+        sourceVideoUrl: sourceInput.sourceVideoUrl,
+        sourceVideoName: sourceInput.sourceVideoName,
+        language: "zh"
+      });
+      setSourceTranscriptByClipId((current) => ({ ...current, [aiReferenceClip.id]: result.transcript }));
+      onNotice(`已提取素材语音文案：${result.transcript.segments.length} 段。`);
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : "素材语音转文字失败。");
+    } finally {
+      setIsTranscribingSource(false);
+    }
+  }
+
+  function updateSourceTranscriptText(text: string) {
+    if (!aiReferenceClip) return;
+    const nextTranscript = {
+      text,
+      segments: sourceTranscript?.segments || [],
+      ...(sourceTranscript?.durationSec ? { durationSec: sourceTranscript.durationSec } : {}),
+      ...(sourceTranscript?.language ? { language: sourceTranscript.language } : {})
+    };
+    setSourceTranscriptByClipId((current) => {
+      const existing = current[aiReferenceClip.id];
+      return {
+        ...current,
+        [aiReferenceClip.id]: {
+          text,
+          segments: existing?.segments || [],
+          ...(existing?.durationSec ? { durationSec: existing.durationSec } : {}),
+          ...(existing?.language ? { language: existing.language } : {})
+        }
+      };
+    });
+    if (aiGenerationMode === "frame_replacement" && !promptDirty) {
+      setPrompt(renderAiPromptForMode(aiGenerationMode, promptTemplateDraft, aiReferenceClip, aiReferenceImages, nextTranscript, seedanceSettings.defaultDuration));
+    }
   }
 
   async function refreshSeedanceAiJob(clipId: string, jobId: string, taskId: string) {
@@ -1063,7 +1216,7 @@ export function DepthVideoWorkbenchPage({
         assetId: jobId,
         sourceUrl: task.content?.video_url
       });
-      markAiDoneWithOutput(clipId, jobId, synced.asset.localAssetUrl);
+      markAiDoneWithOutput(clipId, jobId, synced.asset.localAssetUrl, synced.asset.localPath);
     } catch (error) {
       updateAiJob(clipId, jobId, {
         status: "failed",
@@ -1152,6 +1305,7 @@ export function DepthVideoWorkbenchPage({
             type: "ai_video",
             provider: job.provider,
             videoUrl: job.outputVideoUrl || clip.originalVideoUrl,
+            localPath: localAssetPathFromUrl(job.outputVideoUrl || clip.originalVideoUrl),
             jobId: job.id,
             createdAt: now
           }),
@@ -1162,7 +1316,7 @@ export function DepthVideoWorkbenchPage({
     onNotice("AI 加工任务已完成，已写入成本、耗时 and 生成产物。");
   }
 
-  function markAiDoneWithOutput(clipId: string, jobId: string, outputVideoUrl: string) {
+  function markAiDoneWithOutput(clipId: string, jobId: string, outputVideoUrl: string, outputLocalPath?: string) {
     const now = new Date().toISOString();
     onClips((current) =>
       current.map((clip) => {
@@ -1195,6 +1349,7 @@ export function DepthVideoWorkbenchPage({
             type: "ai_video",
             provider: job.provider,
             videoUrl: outputVideoUrl,
+            localPath: outputLocalPath || localAssetPathFromUrl(outputVideoUrl),
             jobId: job.id,
             createdAt: now
           }),
@@ -1762,12 +1917,86 @@ export function DepthVideoWorkbenchPage({
               </label>
               <label className="ai-provider-select">
                 <span>加工方式</span>
-                <select value={aiProvider} onChange={(event) => setAiProvider(event.target.value as DepthAiProvider)}>
+                <select
+                  value={aiProvider}
+                  onChange={(event) => {
+                    const nextProvider = event.target.value as DepthAiProvider;
+                    setAiProvider(nextProvider);
+                    if (nextProvider !== "seedance_api") changeAiGenerationMode("direct_reference");
+                  }}
+                >
                   {providerOptions.map((item) => (
                     <option value={item.value} key={item.value}>{item.label}</option>
                   ))}
                 </select>
               </label>
+              {aiProvider === "seedance_api" && (
+                <label className="ai-provider-select">
+                  <span>处理方法</span>
+                  <select value={aiGenerationMode} onChange={(event) => changeAiGenerationMode(event.target.value as AiGenerationMode)}>
+                    <option value="direct_reference">常规参考生成</option>
+                    <option value="frame_replacement">fast_direct 分帧替换生成</option>
+                  </select>
+                </label>
+              )}
+              {aiProvider === "seedance_api" && (
+                <label className="ai-provider-select">
+                  <span>Seedance 模型</span>
+                  <select
+                    disabled={aiGenerationMode === "frame_replacement"}
+                    value={aiGenerationMode === "frame_replacement" ? `${seedanceFastDirectModel}__720p` : `${seedanceSettings.model}__${seedanceSettings.resolution}`}
+                    onChange={(event) => {
+                      const option = SEEDANCE_MODEL_PRICING.find((item) => `${item.model}__${item.resolution}` === event.target.value);
+                      if (!option) return;
+                      onSeedanceSettings({
+                        ...seedanceSettings,
+                        model: option.model,
+                        resolution: option.resolution
+                      });
+                    }}
+                  >
+                    {SEEDANCE_MODEL_PRICING.map((item) => (
+                      <option value={`${item.model}__${item.resolution}`} key={`${item.model}_${item.resolution}`}>
+                        {formatSeedanceModelOption(item)}
+                      </option>
+                    ))}
+                  </select>
+                  {aiGenerationMode === "frame_replacement" && (
+                    <small>分帧替换固定使用 xsdoubao/seedance2.0_fast_direct · 720p，时长按素材长度控制。</small>
+                  )}
+                </label>
+              )}
+              {aiProvider === "seedance_api" && aiGenerationMode === "frame_replacement" && (
+                <div className="ai-source-summary">
+                  <strong>分帧替换输入</strong>
+                  <span>抽帧：每秒 1 帧，最多 {frameReplacementMaxFrames} 帧</span>
+                  <span>产品图：{aiReferenceImages.filter((image) => image.category === "product").length || aiReferenceImages.length} 张</span>
+                  <label className="ai-duration-editor">
+                    <span>生成时长</span>
+                    <input
+                      type="number"
+                      min={3}
+                      max={10}
+                      step={1}
+                      value={frameReplacementDuration}
+                      onChange={(event) => setFrameReplacementDuration(normalizeSeedanceDuration(Number(event.target.value), aiReferenceClip, undefined, seedanceSettings.defaultDuration))}
+                    />
+                    <small>秒，提交时写入 duration 参数</small>
+                  </label>
+                  <label className="ai-transcript-editor">
+                    <span>语音文案</span>
+                    <textarea
+                      value={sourceTranscript?.text || ""}
+                      placeholder="提取后可编辑，也可以直接填写原视频口播文案。"
+                      onChange={(event) => updateSourceTranscriptText(event.target.value)}
+                    />
+                  </label>
+                  <button className="secondary-button compact" onClick={transcribeAiReferenceClip} disabled={!aiReferenceClip || isTranscribingSource}>
+                    {isTranscribingSource ? <RefreshCw className="spin" size={15} /> : <Sparkles size={15} />}
+                    提取素材语音文案
+                  </button>
+                </div>
+              )}
               <button className="primary-button" onClick={runAiGeneration} disabled={!aiReferenceClip}>
                 <Wand2 size={16} />
                 提交AI加工
@@ -2191,12 +2420,29 @@ function LineageOutputs({ outputs }: { outputs: MaterialOutput[] }) {
   if (!outputs.length) return null;
   return (
     <div className="lineage-output-list">
-      {outputs.map((output) => (
-        <div className="lineage-output-row" key={output.id}>
-          <span>{outputTypeLabel(output.type)}</span>
-          <small>{output.id}{output.parentOutputId ? ` ← ${output.parentOutputId}` : " · root"}</small>
-        </div>
-      ))}
+      {outputs.map((output) => {
+        const localPath = output.localPath || localAssetPathFromUrl(output.videoUrl);
+        return (
+          <div className="lineage-output-row" key={output.id}>
+            <span>{outputTypeLabel(output.type)}</span>
+            <div className="lineage-output-links">
+              <a
+                href={localPath ? localFileHref(localPath) : output.videoUrl}
+                title={localPath || output.videoUrl}
+                target="_blank"
+                rel="noreferrer"
+              >
+                {localPath || output.videoUrl}
+              </a>
+              {localPath && output.videoUrl && (
+                <a href={output.videoUrl} title={output.videoUrl} target="_blank" rel="noreferrer">
+                  预览地址
+                </a>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -2227,7 +2473,7 @@ function createClipFromSegment(
     tags: tag ? [{ ...tag, id: createId("tag"), source: "import", createdAt: now }] : [],
     customTags: [],
     aiJobs: [],
-    outputs: videoUrl ? [{ id: originalOutputId, sourceClipId: id, lineageId, type: "original", provider: "import", videoUrl, createdAt: now }] : [],
+    outputs: videoUrl ? [{ id: originalOutputId, sourceClipId: id, lineageId, type: "original", provider: "import", videoUrl, localPath: sourceLocalPath, createdAt: now }] : [],
     usageCount: 0,
     createdAt: now,
     updatedAt: now
@@ -2255,7 +2501,7 @@ async function createClipFromFile(file: File, now: string, projectId: string, br
     tags: [],
     customTags: [],
     aiJobs: [],
-    outputs: [{ id: originalOutputId, sourceClipId: id, lineageId, type: "original", provider: "upload", videoUrl, createdAt: now }],
+    outputs: [{ id: originalOutputId, sourceClipId: id, lineageId, type: "original", provider: "upload", videoUrl, localPath: uploaded?.localPath, createdAt: now }],
     usageCount: 0,
     createdAt: now,
     updatedAt: now
@@ -2317,6 +2563,7 @@ function createClipFromSplitSegment(sourceClip: MaterialClip, segment: SplitBrid
       type: "original",
       provider: "split",
       videoUrl: segment.videoUrl,
+      localPath: segment.localPath,
       createdAt: now
     }],
     usageCount: 0,
@@ -2419,6 +2666,115 @@ function persistentAiVideoUrl(clip: MaterialClip, preferredType: MaterialOutput[
   const videoUrl = selectedClipVideoUrl(clip, preferredType);
   if (!videoUrl || videoUrl.startsWith("blob:")) return undefined;
   return videoUrl;
+}
+
+function localFileHref(localPath: string) {
+  return `file://${localPath.split("/").map((part) => encodeURIComponent(part)).join("/")}`;
+}
+
+function localAssetPathFromUrl(value: string | undefined) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    const marker = "/assets/";
+    const index = url.pathname.indexOf(marker);
+    if (index < 0) return undefined;
+    const relativePath = decodeURIComponent(url.pathname.slice(index + marker.length));
+    return `/Volumes/7up/github/videogen/.videogen-assets/${relativePath}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function seedanceSourceInput(clip: MaterialClip) {
+  return {
+    video: clip.sourceFile instanceof File ? clip.sourceFile : undefined,
+    sourceLocalPath: clip.sourceLocalPath,
+    sourceVideoUrl: persistentVideoUrl(clip),
+    sourceVideoName: clip.sourceFileName || clip.title
+  };
+}
+
+function seedanceDurationFromClip(clip: MaterialClip | undefined, probedDurationSec: number | undefined, fallback: number) {
+  const duration = clip?.duration || probedDurationSec || fallback || 5;
+  return Math.min(10, Math.max(3, Math.round(duration)));
+}
+
+function normalizeSeedanceDuration(value: number, clip: MaterialClip | undefined, probedDurationSec: number | undefined, fallback: number) {
+  const defaultDuration = seedanceDurationFromClip(clip, probedDurationSec, fallback);
+  const duration = Number.isFinite(value) ? value : defaultDuration;
+  return Math.min(10, Math.max(3, Math.round(duration)));
+}
+
+function plannedFrameCountFromClip(clip: MaterialClip | undefined, fallbackDuration: number) {
+  const duration = seedanceDurationFromClip(clip, undefined, fallbackDuration);
+  return Math.min(frameReplacementMaxFrames, Math.max(1, Math.floor(duration)));
+}
+
+function renderAiPromptForMode(
+  mode: AiGenerationMode,
+  template: string,
+  clip: MaterialClip | undefined,
+  images: ImageMaterial[],
+  transcript: VideoAiJob["transcript"] | undefined,
+  fallbackDuration: number
+) {
+  const basePrompt = renderAiPrompt(template, clip, images);
+  if (mode !== "frame_replacement") return basePrompt;
+  const productImages = images.filter((image) => image.category === "product");
+  return buildFrameReplacementPrompt({
+    scriptPrompt: cleanFrameReplacementScript(template),
+    transcript,
+    frameCount: plannedFrameCountFromClip(clip, fallbackDuration),
+    productCount: Math.max(1, productImages.length || images.length)
+  });
+}
+
+function buildFrameReplacementPrompt(input: {
+  scriptPrompt: string;
+  transcript?: VideoAiJob["transcript"];
+  frameCount: number;
+  productCount: number;
+}) {
+  const frameRefs = formatImageRefs(1, input.frameCount);
+  const productStart = input.frameCount + 1;
+  const productRefs = formatImageRefs(productStart, input.productCount);
+  const transcriptText = input.transcript?.text?.trim();
+  const scriptText = cleanFrameReplacementScript(input.scriptPrompt);
+  return cleanRenderedAiPrompt([
+    `参考${frameRefs}的画面节奏、镜头构图、人物动作和场景变化。`,
+    `使用和替换为${productRefs}的产品信息，包括产品外观、颜色、包装、使用状态。`,
+    transcriptText ? `使用以下文案：${transcriptText}。` : "",
+    scriptText ? `结合脚本：${scriptText}。` : "",
+    "生成一条电商短视频，保持真实实拍质感，突出产品卖点和转化氛围。"
+  ].filter(Boolean).join("\n"));
+}
+
+function formatImageRefs(startIndex: number, count: number) {
+  return Array.from({ length: Math.max(1, count) }, (_, index) => `【@图片${startIndex + index}】`).join("");
+}
+
+function cleanFrameReplacementScript(script: string) {
+  return sanitizeAiPromptTemplate(script)
+    .split("{imageInstruction}").join("")
+    .split("{productInstruction}").join("")
+    .split("{faceInstruction}").join("")
+    .split("{styleInstruction}").join("")
+    .split("{videoName}").join("")
+    .split("{imageNames}").join("")
+    .split("{productImages}").join("")
+    .split("{faceImages}").join("")
+    .split("{styleImages}").join("")
+    .split("{imageRefs}").join("")
+    .split("{productImageRefs}").join("")
+    .split("{faceImageRefs}").join("")
+    .split("{styleImageRefs}").join("")
+    .split("{videoTags}").join("")
+    .split("{imageTags}").join("")
+    .replace(/全面参考【@视频1】视频[，,]?\s*/g, "")
+    .replace(/参考【@视频1】视频[，,]?\s*/g, "")
+    .replace(/保留视频声音。?/g, "")
+    .trim();
 }
 
 function getBestParentOutputForAi(clip: MaterialClip) {
@@ -2551,6 +2907,7 @@ function cleanRenderedAiPrompt(prompt: string) {
     .replace(/《参考(图片|产品|人脸|风格)》/g, "参考$1")
     .replace(/\s+，/g, "，")
     .replace(/，{2,}/g, "，")
+    .replace(/。{2,}/g, "。")
     .trim();
 }
 
@@ -2588,7 +2945,9 @@ function createAiJob(
   now: string,
   referenceImages: ImageMaterial[],
   preferredInputType: MaterialOutput["type"],
-  seedanceSettings: SeedanceProviderConfig
+  seedanceSettings: SeedanceProviderConfig,
+  generationMode: AiGenerationMode,
+  transcript?: VideoAiJob["transcript"]
 ) {
   const cost = estimateProviderCost(provider, seedanceSettings);
   const inputOutput = preferredInputType === "original"
@@ -2601,9 +2960,11 @@ function createAiJob(
     inputAssetType: inputOutput?.type === "depth_video" || inputOutput?.type === "grayscale_video" ? inputOutput.type : "original" as const,
     inputVideoUrl: inputOutput?.videoUrl || clip.originalVideoUrl,
     provider,
+    generationMode,
     status: "queued" as const,
     prompt: prompt,
     referenceImageUrls: referenceImages.map((image) => image.imageUrl),
+    transcript,
     cost,
     createdAt: now
   };
@@ -2798,6 +3159,12 @@ function clipCost(clip: MaterialClip) {
 
 function providerLabel(provider: DepthAiProvider) {
   return providerOptions.find((item) => item.value === provider)?.label ?? provider;
+}
+
+function formatSeedanceModelOption(item: (typeof SEEDANCE_MODEL_PRICING)[number]) {
+  const stabilityNote = item.model.includes("_direct") ? " · 生成时间不稳定" : "";
+  const mediaNote = item.supportsReferenceMedia ? " · 支持多模态参考" : " · 文生视频";
+  return `${item.model} · ${item.resolution} · ¥${item.cnyPerSecond}/秒${mediaNote}${stabilityNote}`;
 }
 
 function depthStatusLabel(status?: string) {

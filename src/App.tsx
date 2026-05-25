@@ -1470,6 +1470,7 @@ export default function App() {
           projectId={projectId}
           bridgeUrl={providerSettings.seedance.bridgeUrl}
           seedanceSettings={providerSettings.seedance}
+          onSeedanceSettings={(seedance) => setProviderSettings((current) => ({ ...current, seedance }))}
           onClips={setDepthClips}
           onImages={setDepthImages}
           onRecipe={setDepthRecipe}

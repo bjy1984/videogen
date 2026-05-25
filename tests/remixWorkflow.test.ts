@@ -111,7 +111,7 @@ await run("merges provider settings and selects provider-specific params", () =>
   assert.equal(settings.seedance.endpoint, DEFAULT_SEEDANCE_ARK_BASE_URL);
   assert.equal(settings.seedance.model, DEFAULT_SEEDANCE_MODEL);
   assert.equal(settings.seedance.apiKeyEnvName, "NEWAPI_API_KEY");
-  assert.equal(SEEDANCE_MODEL_PRICING.find((item) => item.model === DEFAULT_SEEDANCE_MODEL)?.cnyPerSecond, 0.55);
+  assert.equal(SEEDANCE_MODEL_PRICING.find((item) => item.model === DEFAULT_SEEDANCE_MODEL)?.cnyPerSecond, 0.75);
 
   const comfyParams = providerParamsFor("comfyui", settings);
   assert.equal(comfyParams.endpoint, "http://localhost:8188");
@@ -161,6 +161,28 @@ await run("builds NewAPI Seedance task payload and URLs", () => {
   assert.equal(mapSeedanceTaskStatus("succeeded"), "done");
   assert.equal(mapSeedanceTaskStatus("completed"), "done");
   assert.equal(mapSeedanceTaskStatus("expired"), "failed");
+});
+
+await run("omits invalid Seedance seed values", () => {
+  const request = buildSeedanceCreateTaskRequest({
+    prompt: "测试 Seedance 随机种子",
+    aspectRatio: "9:16",
+    duration: 5,
+    params: {
+      seed: "-1"
+    }
+  });
+  assert.equal(request.body.metadata.seed, undefined);
+
+  const tooLarge = buildSeedanceCreateTaskRequest({
+    prompt: "测试 Seedance 超大随机种子",
+    aspectRatio: "9:16",
+    duration: 5,
+    params: {
+      seed: "4294967296"
+    }
+  });
+  assert.equal(tooLarge.body.metadata.seed, undefined);
 });
 
 await run("injects ComfyUI workflow controls and parses output history", () => {

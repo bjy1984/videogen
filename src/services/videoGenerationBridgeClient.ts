@@ -406,6 +406,101 @@ export async function preprocessSplitVideoBridge(input: {
   }>(input.bridgeUrl, "/video/preprocess/split", formData, 600_000);
 }
 
+export async function extractVideoFramesBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  sourceVideoName?: string;
+  intervalSec?: number;
+  maxFrames?: number;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("clipId", input.clipId);
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.intervalSec) formData.set("intervalSec", String(input.intervalSec));
+  if (input.maxFrames) formData.set("maxFrames", String(input.maxFrames));
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  return requestBridgeForm<{
+    trace: {
+      id: string;
+      kind: "video-frame-extract";
+      provider: "local-bridge";
+      status: "done";
+      sourceVideoName?: string;
+      sourceVideoUrl?: string;
+      localPath?: string;
+      summary: {
+        durationSec: number;
+        intervalSec: number;
+        maxFrames: number;
+        frameCount: number;
+        elapsedSec: number;
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+    frames: Array<{
+      index: number;
+      timestampSec: number;
+      imageUrl: string;
+      localPath: string;
+      fileName: string;
+    }>;
+  }>(input.bridgeUrl, "/video/preprocess/extract-frames", formData, 300_000);
+}
+
+export async function transcribeVideoBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  video?: File;
+  sourceLocalPath?: string;
+  sourceVideoUrl?: string;
+  sourceVideoName?: string;
+  language?: string;
+}) {
+  const formData = new FormData();
+  formData.set("projectId", input.projectId);
+  formData.set("clipId", input.clipId);
+  if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
+  if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
+  if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.language) formData.set("language", input.language);
+  if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
+  return requestBridgeForm<{
+    transcript: {
+      text: string;
+      segments: Array<{
+        startSec: number;
+        endSec: number;
+        text: string;
+      }>;
+      language?: string;
+      durationSec?: number;
+    };
+    trace: {
+      id: string;
+      kind: "video-transcript";
+      provider: "faster-whisper";
+      status: "done";
+      localPath?: string;
+      summary: {
+        segmentCount: number;
+        elapsedSec: number;
+        model: string;
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+  }>(input.bridgeUrl, "/video/transcribe", formData, 900_000);
+}
+
 export async function getSeedanceBridgeTask(input: {
   bridgeUrl?: string;
   endpoint: string;

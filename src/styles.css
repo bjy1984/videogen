@@ -1650,7 +1650,7 @@ label.secondary-button:focus-within {
   min-width: 0;
   grid-template-columns: 68px minmax(0, 1fr);
   gap: 8px;
-  align-items: center;
+  align-items: start;
 }
 
 .lineage-output-row span {
@@ -1659,13 +1659,23 @@ label.secondary-button:focus-within {
   font-weight: 800;
 }
 
-.lineage-output-row small {
+.lineage-output-links {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.lineage-output-links a {
   min-width: 0;
   overflow: hidden;
   color: var(--muted);
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.lineage-output-links a:hover {
+  color: var(--accent-dark);
 }
 
 .tag-pill,
@@ -2204,6 +2214,36 @@ label.secondary-button:focus-within {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ai-duration-editor,
+.ai-transcript-editor {
+  display: grid;
+  gap: 6px;
+  color: var(--text);
+}
+
+.ai-duration-editor {
+  grid-template-columns: minmax(0, 1fr) 90px auto;
+  align-items: center;
+}
+
+.ai-duration-editor input {
+  width: 100%;
+}
+
+.ai-duration-editor small {
+  color: var(--muted);
+}
+
+.ai-transcript-editor span {
+  overflow: visible;
+  white-space: normal;
+}
+
+.ai-transcript-editor textarea {
+  min-height: 92px;
+  resize: vertical;
 }
 
 .ai-prompt-panel .control-grid,

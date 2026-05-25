@@ -1,3 +1,4 @@
+import "./env";
 import cors from "cors";
 import express from "express";
 import multer from "multer";
@@ -600,6 +601,177 @@ app.post("/video/preprocess/split", upload.single("video"), async (req, res) => 
   }
 });
 
+app.post("/video/preprocess/extract-frames", upload.single("video"), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const sourceLocalPath = String(body.sourceLocalPath || "").trim();
+    const sourceVideoUrl = String(body.sourceVideoUrl || "").trim();
+    if (!req.file && !sourceLocalPath && !sourceVideoUrl) {
+      throw new BridgeError("请上传需要抽帧的原素材，或传入本地素材路径/素材 URL。", 400);
+    }
+    assertFfmpegReady();
+    const startedAt = Date.now();
+    const projectId = safePathPart(String(body.projectId || "default_project"));
+    const clipId = safePathPart(String(body.clipId || "clip"));
+    const preprocessId = safePathPart(`frames_${Date.now()}`);
+    const intervalSec = clampNumber(Number(body.intervalSec || 1), 0.2, 10);
+    const maxFrames = Math.round(clampNumber(Number(body.maxFrames || 12), 1, 24));
+    const extension =
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(req.file?.originalname || "") ||
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceVideoUrl) ||
+      "mp4";
+    const sourceName = req.file?.originalname || String(body.sourceVideoName || `source.${extension}`);
+    const relativeDir = path.join("frames", projectId, clipId, preprocessId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    await copyPreprocessSource({
+      uploadPath: req.file?.path,
+      sourceLocalPath,
+      sourceVideoUrl,
+      targetPath: sourcePath,
+      providerLabel: "抽帧源素材"
+    });
+    const durationSec = await probeMediaDuration(sourcePath);
+    if (!durationSec) {
+      throw new BridgeError("无法读取源视频时长，抽帧失败。", 400);
+    }
+    const timestamps = planFrameSampleTimestamps(durationSec, intervalSec, maxFrames);
+    const frames = [];
+    for (const [index, timestampSec] of timestamps.entries()) {
+      const fileName = `frame_${String(index + 1).padStart(3, "0")}.jpg`;
+      const outputPath = path.join(outputDir, fileName);
+      await extractVideoFrame({
+        inputPath: sourcePath,
+        outputPath,
+        timestampSec
+      });
+      frames.push({
+        index,
+        timestampSec: Number(timestampSec.toFixed(3)),
+        imageUrl: assetUrl(req, relativeDir, fileName),
+        localPath: outputPath,
+        fileName
+      });
+    }
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: preprocessId,
+        kind: "video-frame-extract",
+        provider: "local-bridge",
+        status: "done",
+        sourceVideoName: sourceName,
+        sourceVideoUrl: assetUrl(req, relativeDir, `source.${extension}`),
+        localPath: outputDir,
+        summary: {
+          durationSec: Number(durationSec.toFixed(3)),
+          intervalSec,
+          maxFrames,
+          frameCount: frames.length,
+          elapsedSec: Math.max(0, Math.round((Date.now() - startedAt) / 1000))
+        },
+        createdAt: now,
+        updatedAt: now
+      },
+      frames
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Video frame extraction failed."
+    });
+  }
+});
+
+app.post("/video/transcribe", upload.single("video"), async (req, res) => {
+  try {
+    const body = req.body || {};
+    const sourceLocalPath = String(body.sourceLocalPath || "").trim();
+    const sourceVideoUrl = String(body.sourceVideoUrl || "").trim();
+    if (!req.file && !sourceLocalPath && !sourceVideoUrl) {
+      throw new BridgeError("请上传需要转文字的原素材，或传入本地素材路径/素材 URL。", 400);
+    }
+    assertFfmpegReady();
+    assertFasterWhisperReady();
+    const startedAt = Date.now();
+    const projectId = safePathPart(String(body.projectId || "default_project"));
+    const clipId = safePathPart(String(body.clipId || "clip"));
+    const transcriptId = safePathPart(`asr_${Date.now()}`);
+    const language = String(body.language || "zh").trim();
+    const extension =
+      extensionFromContentType(req.file?.mimetype || null) ||
+      extensionFromUrl(req.file?.originalname || "") ||
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceVideoUrl) ||
+      "mp4";
+    const relativeDir = path.join("transcripts", projectId, clipId, transcriptId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    await copyPreprocessSource({
+      uploadPath: req.file?.path,
+      sourceLocalPath,
+      sourceVideoUrl,
+      targetPath: sourcePath,
+      providerLabel: "语音转文字源素材"
+    });
+    const audioPath = path.join(outputDir, "audio.wav");
+    const transcriptPath = path.join(outputDir, "transcript.json");
+    await extractAudioForAsr(sourcePath, audioPath);
+    await runFasterWhisperTranscription({
+      audioPath,
+      outputPath: transcriptPath,
+      language
+    });
+    const parsed = JSON.parse(await readFile(transcriptPath, "utf8")) as {
+      text?: string;
+      language?: string;
+      durationSec?: number;
+      segments?: Array<{ startSec?: number; endSec?: number; text?: string }>;
+    };
+    const transcript = {
+      text: String(parsed.text || "").trim(),
+      language: parsed.language,
+      durationSec: positiveNumberOptional(Number(parsed.durationSec)),
+      segments: Array.isArray(parsed.segments)
+        ? parsed.segments.map((segment) => ({
+            startSec: Number(segment.startSec || 0),
+            endSec: Number(segment.endSec || 0),
+            text: String(segment.text || "").trim()
+          })).filter((segment) => segment.text)
+        : []
+    };
+    const now = new Date().toISOString();
+    res.json({
+      transcript,
+      trace: {
+        id: transcriptId,
+        kind: "video-transcript",
+        provider: "faster-whisper",
+        status: "done",
+        localPath: outputDir,
+        summary: {
+          segmentCount: transcript.segments.length,
+          elapsedSec: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
+          model: resolveFasterWhisperModel()
+        },
+        createdAt: now,
+        updatedAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Video transcription failed."
+    });
+  }
+});
+
 app.post("/seedance/tasks", async (req, res) => {
   const request = req.body as SeedanceCreateTaskBridgeRequest;
   try {
@@ -1100,6 +1272,82 @@ async function splitVideoRange(input: {
   await stat(input.outputPath);
 }
 
+function planFrameSampleTimestamps(durationSec: number, intervalSec: number, maxFrames: number) {
+  const intervalCount = Math.max(1, Math.floor(durationSec / intervalSec));
+  const count = Math.min(maxFrames, intervalCount);
+  if (intervalCount <= maxFrames) {
+    return Array.from({ length: count }, (_, index) => Math.min(durationSec - 0.05, index * intervalSec + intervalSec / 2));
+  }
+  return Array.from({ length: count }, (_, index) => {
+    const ratio = (index + 0.5) / count;
+    return Math.min(durationSec - 0.05, Math.max(0, durationSec * ratio));
+  });
+}
+
+async function extractVideoFrame(input: {
+  inputPath: string;
+  outputPath: string;
+  timestampSec: number;
+}) {
+  const args = [
+    "-y",
+    "-ss",
+    formatFfmpegNumber(Math.max(0, input.timestampSec)),
+    "-i",
+    input.inputPath,
+    "-frames:v",
+    "1",
+    "-q:v",
+    "2",
+    input.outputPath
+  ];
+  await runProcess(resolveFfmpegCommand(), args, 120_000);
+  await stat(input.outputPath);
+}
+
+async function extractAudioForAsr(inputPath: string, outputPath: string) {
+  const args = [
+    "-y",
+    "-i",
+    inputPath,
+    "-vn",
+    "-ac",
+    "1",
+    "-ar",
+    "16000",
+    "-c:a",
+    "pcm_s16le",
+    outputPath
+  ];
+  await runProcess(resolveFfmpegCommand(), args, 180_000);
+  await stat(outputPath);
+}
+
+async function runFasterWhisperTranscription(input: {
+  audioPath: string;
+  outputPath: string;
+  language: string;
+}) {
+  const args = [
+    path.join(rootDir, "scripts", "transcribe_faster_whisper.py"),
+    "--input",
+    input.audioPath,
+    "--output",
+    input.outputPath,
+    "--model",
+    resolveFasterWhisperModel(),
+    "--device",
+    process.env.VIDEOGEN_FASTER_WHISPER_DEVICE || "auto",
+    "--compute-type",
+    process.env.VIDEOGEN_FASTER_WHISPER_COMPUTE_TYPE || "default"
+  ];
+  if (input.language) {
+    args.push("--language", input.language);
+  }
+  await runProcess(resolveFasterWhisperPythonPath(), args, Number(process.env.VIDEOGEN_FASTER_WHISPER_TIMEOUT_MS || 900_000));
+  await stat(input.outputPath);
+}
+
 async function probeMediaDurationWithFfmpeg(filePath: string) {
   const result = await runProcessAllowFailure(resolveFfmpegCommand(), ["-i", filePath], 30_000);
   const match = result.stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
@@ -1116,6 +1364,17 @@ function resolveFfmpegCommand() {
 
 function resolveFfprobeCommand() {
   return process.env.VIDEOGEN_FFPROBE_PATH?.trim() || "ffprobe";
+}
+
+function resolveFasterWhisperPythonPath() {
+  return process.env.VIDEOGEN_FASTER_WHISPER_PYTHON?.trim() ||
+    (process.platform === "win32"
+      ? path.join(rootDir, ".venv-faster-whisper", "Scripts", "python.exe")
+      : path.join(rootDir, ".venv-faster-whisper", "bin", "python"));
+}
+
+function resolveFasterWhisperModel() {
+  return process.env.VIDEOGEN_FASTER_WHISPER_MODEL?.trim() || "medium";
 }
 
 function resolveImageioFfmpegCommand() {
@@ -1392,6 +1651,23 @@ function ffmpegReady() {
 function assertFfmpegReady() {
   if (ffmpegReady()) return;
   throw new BridgeError(FFMPEG_SETUP_HINT, 500);
+}
+
+function assertFasterWhisperReady() {
+  const pythonPath = resolveFasterWhisperPythonPath();
+  if (!existsSync(pythonPath)) {
+    throw new BridgeError(
+      `faster-whisper Python 环境不存在：${pythonPath}。请运行 bash scripts/setup-faster-whisper-venv.sh，或设置 VIDEOGEN_FASTER_WHISPER_PYTHON。`,
+      500
+    );
+  }
+  const result = spawnSync(pythonPath, ["-c", "import faster_whisper"], { encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new BridgeError(
+      `faster-whisper 不可用：${result.stderr.trim() || result.stdout.trim() || "import failed"}。请运行 bash scripts/setup-faster-whisper-venv.sh。`,
+      500
+    );
+  }
 }
 
 function stripTrailingSlash(value: string) {
@@ -2063,6 +2339,11 @@ function numberOptional(value: unknown) {
 function positiveNumberOptional(value: unknown) {
   const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   return Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

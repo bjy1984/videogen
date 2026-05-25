@@ -17,7 +17,7 @@ export const SEEDANCE_MODEL_PRICING: SeedanceModelPricing[] = [
     model: "xsdoubao/seedance2.0_fast_direct",
     label: "Seedance 2.0 Fast Direct",
     resolution: "720p",
-    cnyPerSecond: 0.55,
+    cnyPerSecond: 0.75,
     supportsReferenceMedia: false
   },
   {
@@ -236,7 +236,9 @@ function parseSeed(seed?: string) {
   if (!seed?.trim()) return undefined;
   const parsed = Number(seed);
   if (!Number.isFinite(parsed)) return undefined;
-  return Math.floor(parsed);
+  const integer = Math.floor(parsed);
+  if (integer < 0 || integer > 4_294_967_295) return undefined;
+  return integer;
 }
 
 function uniqueNonEmpty(items: Array<string | undefined>) {
