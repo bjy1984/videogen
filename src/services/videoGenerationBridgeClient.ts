@@ -501,6 +501,70 @@ export async function transcribeVideoBridge(input: {
   }>(input.bridgeUrl, "/video/transcribe", formData, 900_000);
 }
 
+export async function replaceProductFramesBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  replacementId: string;
+  prompt: string;
+  sourceFrames: Array<{
+    index: number;
+    timestampSec: number;
+    imageUrl: string;
+    localPath?: string;
+  }>;
+  productImageUrls: string[];
+}) {
+  return requestBridge<{
+    trace: {
+      id: string;
+      kind: "product-frame-replacement";
+      provider: "image2";
+      status: "done";
+      localPath?: string;
+      summary: {
+        sourceFrameCount: number;
+        frameCount: number;
+        productImageCount: number;
+        elapsedSec: number;
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        estimatedUsd: number;
+      };
+      createdAt: string;
+      updatedAt: string;
+    };
+    frames: Array<{
+      index: number;
+      timestampSec: number;
+      sourceImageUrl: string;
+      imageUrl: string;
+      localPath: string;
+      remoteImageUrl?: string;
+      fileName: string;
+      prompt: string;
+      usage?: {
+        inputTokens: number;
+        outputTokens: number;
+        totalTokens: number;
+        estimatedUsd: number;
+      };
+    }>;
+  }>(input.bridgeUrl, "/image2/product-frame-replacement", {
+    method: "POST",
+    body: JSON.stringify({
+      projectId: input.projectId,
+      clipId: input.clipId,
+      replacementId: input.replacementId,
+      prompt: input.prompt,
+      sourceFrames: input.sourceFrames,
+      productImageUrls: input.productImageUrls
+    }),
+    timeoutMs: 900_000
+  });
+}
+
 export async function getSeedanceBridgeTask(input: {
   bridgeUrl?: string;
   endpoint: string;

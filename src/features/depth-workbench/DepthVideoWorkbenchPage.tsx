@@ -12,6 +12,7 @@ import {
   preprocessDepthVideoBridge,
   preprocessGrayscaleVideoBridge,
   preprocessSplitVideoBridge,
+  replaceProductFramesBridge,
   saveWorkbenchLibraryState,
   syncSeedanceBridgeAsset,
   transcribeVideoBridge,
@@ -36,6 +37,8 @@ import type {
   MaterialOutput,
   MaterialTag,
   MaterialTagType,
+  ProductFrameReplacementRecord,
+  VideoFrameExtractionRecord,
   VideoPreprocessMethod,
   VideoAiJob
 } from "./depthTypes";
@@ -135,7 +138,7 @@ const depthQualityDefaults: Record<DepthQualityPreset, {
 
 const workbenchTabs: Array<{ key: DepthWorkbenchTab; title: string; subtitle: string }> = [
   { key: "library", title: "素材片段库", subtitle: "导入 / 标签 / 选择" },
-  { key: "preprocess", title: "前置处理", subtitle: "深度 / 黑白" },
+  { key: "preprocess", title: "前置处理", subtitle: "抽帧 / 替换" },
   { key: "ai", title: "AI加工", subtitle: "多平台生成" },
   { key: "cost", title: "成本追踪", subtitle: "积分 / 时间 / 产物" },
   { key: "compose", title: "标签拼接", subtitle: "排序 / 抽取 / 预览" }
@@ -227,6 +230,12 @@ export function DepthVideoWorkbenchPage({
   const [depthLetterbox, setDepthLetterbox] = useState(true);
   const [depthEdgeFilterStrength, setDepthEdgeFilterStrength] = useState(0.35);
   const [depthEdgeFilterDiameter, setDepthEdgeFilterDiameter] = useState(7);
+  const [productFrameIntervalSec, setProductFrameIntervalSec] = useState(1);
+  const [productFrameMaxFrames, setProductFrameMaxFrames] = useState(12);
+  const [productFramePrompt, setProductFramePrompt] = useState(
+    "保留原视频抽帧中的人物、场景、光线、构图和动作，只替换画面中的产品信息。"
+  );
+  const [expandedFrameClipIds, setExpandedFrameClipIds] = useState<string[]>([]);
   const [aiClockNow, setAiClockNow] = useState(Date.now());
   const libraryHydratedRef = useRef(false);
   const lastSavedLibraryRef = useRef("");
@@ -237,6 +246,13 @@ export function DepthVideoWorkbenchPage({
     () => selectedImageIds.map((id) => images.find((image) => image.id === id)).filter((image): image is ImageMaterial => Boolean(image)),
     [images, selectedImageIds]
   );
+  const selectedProductImages = useMemo(() => {
+    const selected = selectedImageIds
+      .map((id) => images.find((image) => image.id === id))
+      .filter((image): image is ImageMaterial => Boolean(image))
+      .filter((image) => image.category === "product");
+    return selected.length ? selected : images.filter((image) => image.category === "product");
+  }, [images, selectedImageIds]);
   const sourceTranscript = aiReferenceClip ? sourceTranscriptByClipId[aiReferenceClip.id] : undefined;
   const stats = useMemo(() => buildStats(clips), [clips]);
   const depthMonitor = useMemo(() => buildDepthMonitor(clips), [clips]);
@@ -663,6 +679,12 @@ export function DepthVideoWorkbenchPage({
     onNotice(`已删除图片素材「${image.title}」。`);
   }
 
+  function toggleFrameInspection(clipId: string) {
+    setExpandedFrameClipIds((current) =>
+      current.includes(clipId) ? current.filter((id) => id !== clipId) : [...current, clipId]
+    );
+  }
+
   function clearSelectedImageTags() {
     if (!selectedImageIds.length) {
       onNotice("请先选择要清除标签的图片素材。");
@@ -687,9 +709,60 @@ export function DepthVideoWorkbenchPage({
     }
     const now = new Date().toISOString();
     const methodLabel = preprocessMethodLabel(method);
+    const productImagesForReplacement = selectedProductImages;
+    if (method === "product_frame_replace" && !productImagesForReplacement.length) {
+      onNotice("产品信息替换需要至少 1 张产品图片素材。请先在图片素材库选择或上传产品图。");
+      return;
+    }
+    if (method === "product_frame_replace") {
+      const missingFrameClip = nextTargetIds
+        .map((id) => clips.find((clip) => clip.id === id))
+        .find((clip) => clip && (clip.frameExtraction?.status !== "done" || !clip.frameExtraction.frames.length));
+      if (missingFrameClip) {
+        onNotice(`「${missingFrameClip.title}」还没有完成视频抽帧，请先执行「视频抽帧」。`);
+        return;
+      }
+    }
+    if (method === "video_frame_extract" && !nextTargetIds.length) {
+      return;
+    }
     onClips((current) =>
       current.map((clip) => {
         if (!nextTargetIds.includes(clip.id)) return clip;
+        const frameExtraction: VideoFrameExtractionRecord | undefined = method === "video_frame_extract"
+          ? {
+              id: createId("frames"),
+              sourceClipId: clip.id,
+              lineageId: clip.lineageId,
+              status: "queued",
+              provider: "local-bridge",
+              inputVideoUrl: clip.originalVideoUrl,
+              intervalSec: productFrameIntervalSec,
+              maxFrames: productFrameMaxFrames,
+              frames: [],
+              cost: { elapsedSec: 0 },
+              createdAt: now,
+              updatedAt: now
+            }
+          : undefined;
+        const productFrameReplacement: ProductFrameReplacementRecord | undefined = method === "product_frame_replace"
+          ? {
+              id: createId("pfr"),
+              sourceClipId: clip.id,
+              lineageId: clip.lineageId,
+              status: "queued",
+              provider: "image2",
+              inputVideoUrl: clip.originalVideoUrl,
+              productImageUrls: productImagesForReplacement.map((image) => image.imageUrl),
+              prompt: productFramePrompt,
+              intervalSec: productFrameIntervalSec,
+              maxFrames: productFrameMaxFrames,
+              frames: [],
+              cost: { elapsedSec: 0 },
+              createdAt: now,
+              updatedAt: now
+            }
+          : undefined;
         return {
           ...clip,
           preprocess: {
@@ -703,7 +776,15 @@ export function DepthVideoWorkbenchPage({
             params: {
               resolution: "1080p",
               fps: 24,
-              depthModel: method === "depth" ? "depth-anything-dnn" : method === "grayscale" ? "opencv-grayscale" : "ffmpeg-split",
+              depthModel: method === "depth"
+                ? "depth-anything-dnn"
+                : method === "grayscale"
+                  ? "opencv-grayscale"
+                  : method === "split"
+                    ? "ffmpeg-split"
+                    : method === "video_frame_extract"
+                      ? "ffmpeg-frame-extract"
+                      : "image2-product-frame-replacement",
               inputSize: method === "depth" ? depthInputSize : undefined,
               letterbox: method === "depth" ? depthLetterbox : undefined,
               edgeFilterStrength: method === "depth" ? depthEdgeFilterStrength : undefined,
@@ -715,6 +796,8 @@ export function DepthVideoWorkbenchPage({
             finishedAt: undefined,
             updatedAt: now
           },
+          ...(frameExtraction ? { frameExtraction } : {}),
+          ...(productFrameReplacement ? { productFrameReplacement } : {}),
           updatedAt: now
         };
       })
@@ -748,6 +831,57 @@ export function DepthVideoWorkbenchPage({
             sourceVideoName: clip.sourceFileName || clip.title
           });
           markSplitDone(clipId, result);
+          continue;
+        }
+        if (method === "product_frame_replace") {
+          const activeProductUrls = productImagesForReplacement.map((image) => image.imageUrl).filter((url) => url && !url.startsWith("blob:"));
+          if (!activeProductUrls.length) {
+            markDepthFailed(clipId, "产品信息替换需要已保存到素材库的产品图片 URL。");
+            continue;
+          }
+          const extractedFrames = clip.frameExtraction?.frames || [];
+          if (clip.frameExtraction?.status !== "done" || !extractedFrames.length) {
+            markDepthFailed(clipId, "请先执行「视频抽帧」，再执行「产品信息替换」。");
+            continue;
+          }
+          const sourceFrames = extractedFrames
+            .map((frame) => ({
+              index: frame.index,
+              timestampSec: frame.timestampSec,
+              imageUrl: frame.imageUrl,
+              localPath: frame.localPath
+            }))
+            .filter((frame) => frame.imageUrl && !frame.imageUrl.startsWith("blob:"));
+          if (!sourceFrames.length) {
+            markDepthFailed(clipId, "视频抽帧结果没有可用的图片 URL，请重新执行「视频抽帧」。");
+            continue;
+          }
+          const replacementId = createId("image2");
+          const replacementResult = await replaceProductFramesBridge({
+            bridgeUrl,
+            projectId,
+            clipId: clip.id,
+            replacementId,
+            prompt: productFramePrompt,
+            sourceFrames,
+            productImageUrls: activeProductUrls
+          });
+          markProductFrameReplacementDone(clipId, replacementResult);
+          continue;
+        }
+        if (method === "video_frame_extract") {
+          const frameResult = await extractVideoFramesBridge({
+            bridgeUrl,
+            projectId,
+            clipId: clip.id,
+            video,
+            sourceLocalPath,
+            sourceVideoUrl,
+            sourceVideoName: clip.sourceFileName || clip.title,
+            intervalSec: productFrameIntervalSec,
+            maxFrames: productFrameMaxFrames
+          });
+          markFrameExtractionDone(clipId, frameResult);
           continue;
         }
         const result = method === "depth"
@@ -792,7 +926,17 @@ export function DepthVideoWorkbenchPage({
     onClips((current) =>
       current.map((clip) =>
         clip.id === clipId && clip.preprocess
-          ? { ...clip, preprocess: { ...clip.preprocess, status: "processing", startedAt: now, updatedAt: now }, updatedAt: now }
+          ? {
+              ...clip,
+              preprocess: { ...clip.preprocess, status: "processing", startedAt: now, updatedAt: now },
+              frameExtraction: clip.preprocess.method === "video_frame_extract" && clip.frameExtraction
+                ? { ...clip.frameExtraction, status: "processing", startedAt: now, updatedAt: now }
+                : clip.frameExtraction,
+              productFrameReplacement: clip.preprocess.method === "product_frame_replace" && clip.productFrameReplacement
+                ? { ...clip.productFrameReplacement, status: "processing", startedAt: now, updatedAt: now }
+                : clip.productFrameReplacement,
+              updatedAt: now
+            }
           : clip
       )
     );
@@ -816,6 +960,36 @@ export function DepthVideoWorkbenchPage({
                 },
                 updatedAt: now
               },
+              productFrameReplacement: clip.preprocess.method === "product_frame_replace" && clip.productFrameReplacement
+                ? {
+                    ...clip.productFrameReplacement,
+                    status: "failed",
+                    error: message,
+                    finishedAt: now,
+                    cost: {
+                      ...clip.productFrameReplacement.cost,
+                      elapsedSec: clip.productFrameReplacement.startedAt
+                        ? elapsedBetween(clip.productFrameReplacement.startedAt, now)
+                        : clip.productFrameReplacement.cost.elapsedSec
+                    },
+                    updatedAt: now
+                  }
+                : clip.productFrameReplacement,
+              frameExtraction: clip.preprocess.method === "video_frame_extract" && clip.frameExtraction
+                ? {
+                    ...clip.frameExtraction,
+                    status: "failed",
+                    error: message,
+                    finishedAt: now,
+                    cost: {
+                      ...clip.frameExtraction.cost,
+                      elapsedSec: clip.frameExtraction.startedAt
+                        ? elapsedBetween(clip.frameExtraction.startedAt, now)
+                        : clip.frameExtraction.cost.elapsedSec
+                    },
+                    updatedAt: now
+                  }
+                : clip.frameExtraction,
               updatedAt: now
             }
           : clip
@@ -882,6 +1056,116 @@ export function DepthVideoWorkbenchPage({
       })
     );
     onNotice(`${preprocessMethodLabel(method)}生成完成，已写入真实产物。`);
+  }
+
+  function markFrameExtractionDone(
+    clipId: string,
+    frameResult: Awaited<ReturnType<typeof extractVideoFramesBridge>>
+  ) {
+    const now = new Date().toISOString();
+    onClips((current) =>
+      current.map((clip) => {
+        if (clip.id !== clipId || !clip.preprocess || !clip.frameExtraction) return clip;
+        const elapsedSec = frameResult.trace.summary.elapsedSec;
+        return {
+          ...clip,
+          preprocess: {
+            ...clip.preprocess,
+            status: "done" as const,
+            method: "video_frame_extract" as const,
+            provider: "local-bridge" as const,
+            params: {
+              ...clip.preprocess.params,
+              depthModel: "ffmpeg-frame-extract",
+              fps: 1
+            },
+            cost: { elapsedSec, gpuSec: 0 },
+            finishedAt: now,
+            updatedAt: now
+          },
+          frameExtraction: {
+            ...clip.frameExtraction,
+            status: "done" as const,
+            durationSec: frameResult.trace.summary.durationSec,
+            intervalSec: frameResult.trace.summary.intervalSec,
+            maxFrames: frameResult.trace.summary.maxFrames,
+            frames: frameResult.frames.map((frame) => ({
+              index: frame.index,
+              timestampSec: frame.timestampSec,
+              imageUrl: frame.imageUrl,
+              localPath: frame.localPath,
+              fileName: frame.fileName
+            })),
+            cost: { elapsedSec },
+            finishedAt: now,
+            updatedAt: now
+          },
+          updatedAt: now
+        };
+      })
+    );
+    onNotice(`视频抽帧完成，已生成 ${frameResult.frames.length} 张图片帧。`);
+  }
+
+  function markProductFrameReplacementDone(
+    clipId: string,
+    replacementResult: Awaited<ReturnType<typeof replaceProductFramesBridge>>
+  ) {
+    const now = new Date().toISOString();
+    onClips((current) =>
+      current.map((clip) => {
+        if (clip.id !== clipId || !clip.preprocess || !clip.productFrameReplacement) return clip;
+        const elapsedSec = replacementResult.trace.summary.elapsedSec;
+        const sourceByIndex = new Map((clip.frameExtraction?.frames || []).map((frame) => [frame.index, frame]));
+        return {
+          ...clip,
+          preprocess: {
+            ...clip.preprocess,
+            status: "done" as const,
+            method: "product_frame_replace" as const,
+            provider: "local-bridge" as const,
+            params: {
+              ...clip.preprocess.params,
+              depthModel: "image2-product-frame-replacement",
+              fps: 1
+            },
+            cost: { elapsedSec, gpuSec: 0 },
+            finishedAt: now,
+            updatedAt: now
+          },
+          productFrameReplacement: {
+            ...clip.productFrameReplacement,
+            status: "done" as const,
+            durationSec: clip.frameExtraction?.durationSec,
+            frames: replacementResult.frames.map((frame) => {
+              const source = sourceByIndex.get(frame.index);
+              return {
+                index: frame.index,
+                timestampSec: frame.timestampSec,
+                sourceImageUrl: frame.sourceImageUrl || source?.imageUrl || "",
+                sourceLocalPath: source?.localPath,
+                imageUrl: frame.imageUrl,
+                localPath: frame.localPath,
+                remoteImageUrl: frame.remoteImageUrl,
+                prompt: frame.prompt,
+                usage: frame.usage
+              };
+            }),
+            cost: {
+              elapsedSec,
+              estimatedUsd: replacementResult.trace.summary.estimatedUsd,
+              inputTokens: replacementResult.trace.summary.inputTokens,
+              outputTokens: replacementResult.trace.summary.outputTokens,
+              totalTokens: replacementResult.trace.summary.totalTokens
+            },
+            finishedAt: now,
+            updatedAt: now
+          },
+          updatedAt: now
+        };
+      })
+    );
+    onNotice(`产品信息替换完成，已生成 ${replacementResult.frames.length} 张替换帧。`);
   }
 
   function markSplitDone(
@@ -1065,43 +1349,29 @@ export function DepthVideoWorkbenchPage({
   }
 
   async function submitSeedanceFrameReplacementJob(clip: MaterialClip, job: VideoAiJob, scriptPrompt: string) {
-    const sourceInput = seedanceSourceInput(clip);
-    if (!sourceInput.sourceVideoUrl && !sourceInput.sourceLocalPath && !sourceInput.video) {
-      throw new Error("分帧替换需要可读取的素材视频。请先上传素材到本地素材库。");
+    const replacement = clip.productFrameReplacement;
+    if (replacement?.status !== "done" || !replacement.frames.length) {
+      throw new Error("fast_direct 分帧替换生成需要先在前置处理依次执行「视频抽帧」和「产品信息替换」。");
     }
-    const frameResult = await extractVideoFramesBridge({
-      bridgeUrl,
-      projectId,
-      clipId: clip.id,
-      video: sourceInput.video,
-      sourceLocalPath: sourceInput.sourceLocalPath,
-      sourceVideoUrl: sourceInput.sourceVideoUrl,
-      sourceVideoName: sourceInput.sourceVideoName,
-      intervalSec: 1,
-      maxFrames: frameReplacementMaxFrames
-    });
-    const frameUrls = frameResult.frames.map((frame) => frame.imageUrl);
-    const productImages = aiReferenceImages.filter((image) => image.category === "product");
-    const replacementImages = (productImages.length ? productImages : aiReferenceImages)
-      .map((image) => image.imageUrl)
-      .filter((url) => url && !url.startsWith("blob:"));
-    if (!replacementImages.length) {
-      throw new Error("分帧替换需要至少选择一张产品图片素材。");
+    const frameUrls = replacement.frames
+      .map((frame) => frame.imageUrl)
+      .filter((url): url is string => typeof url === "string" && Boolean(url) && !url.startsWith("blob:"));
+    if (!frameUrls.length) {
+      throw new Error("产品信息替换没有可用的替换帧 URL，请重新执行「产品信息替换」。");
     }
-    const duration = normalizeSeedanceDuration(frameReplacementDuration, clip, frameResult.trace.summary.durationSec, seedanceSettings.defaultDuration);
+    const duration = normalizeSeedanceDuration(frameReplacementDuration, clip, replacement.durationSec, seedanceSettings.defaultDuration);
     const finalPrompt = promptDirty
       ? scriptPrompt
-      : buildFrameReplacementPrompt({
+      : buildProductFrameVideoPrompt({
           scriptPrompt: cleanFrameReplacementScript(promptTemplateDraft),
           transcript: sourceTranscript,
-          frameCount: frameUrls.length,
-          productCount: replacementImages.length
+          frameCount: frameUrls.length
         });
     const request = buildSeedanceCreateTaskRequest({
       prompt: finalPrompt,
       aspectRatio: "9:16",
       duration,
-      referenceImageUrls: [...frameUrls, ...replacementImages],
+      referenceImageUrls: frameUrls,
       params: {
         bridgeUrl,
         endpoint: seedanceSettings.endpoint,
@@ -1122,9 +1392,9 @@ export function DepthVideoWorkbenchPage({
       finalPrompt,
       transcript: sourceTranscript,
       frameSample: {
-        intervalSec: 1,
-        maxFrames: frameReplacementMaxFrames,
-        durationSec: frameResult.trace.summary.durationSec,
+        intervalSec: replacement.intervalSec,
+        maxFrames: replacement.maxFrames,
+        durationSec: replacement.durationSec || duration,
         frameUrls
       }
     };
@@ -1589,6 +1859,20 @@ export function DepthVideoWorkbenchPage({
                 <small>按 9.9 秒切片，自动保障末段不少于 5 秒且每段不超过 10 秒。</small>
               </span>
             </button>
+            <button className={preprocessMethod === "video_frame_extract" ? "active" : ""} onClick={() => setPreprocessMethod("video_frame_extract")}>
+              <ImageIcon size={16} />
+              <span>
+                <strong>视频抽帧</strong>
+                <small>按间隔从原视频抽取图片帧，作为后续产品替换输入。</small>
+              </span>
+            </button>
+            <button className={preprocessMethod === "product_frame_replace" ? "active" : ""} onClick={() => setPreprocessMethod("product_frame_replace")}>
+              <Sparkles size={16} />
+              <span>
+                <strong>产品信息替换</strong>
+                <small>基于已抽取的视频帧调用 image2，替换画面中的产品信息。</small>
+              </span>
+            </button>
           </div>
           {preprocessMethod === "depth" && <div className="depth-quality-panel">
             <div className="quality-preset-row">
@@ -1707,6 +1991,93 @@ export function DepthVideoWorkbenchPage({
               </div>
             </div>
           )}
+          {preprocessMethod === "video_frame_extract" && (
+            <div className="depth-quality-panel">
+              <div className="quality-control-grid">
+                <label>
+                  <span>抽帧间隔</span>
+                  <input
+                    type="number"
+                    min={0.2}
+                    max={10}
+                    step={0.1}
+                    value={productFrameIntervalSec}
+                    onChange={(event) => setProductFrameIntervalSec(Math.max(0.2, Number(event.target.value) || 1))}
+                  />
+                  <small>默认每秒 1 帧。这里只保存原视频抽帧，不调用 image2。</small>
+                </label>
+                <label>
+                  <span>最多帧数</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={24}
+                    step={1}
+                    value={productFrameMaxFrames}
+                    onChange={(event) => setProductFrameMaxFrames(Math.min(24, Math.max(1, Math.round(Number(event.target.value) || 12))))}
+                  />
+                  <small>建议不超过 12 帧，后续产品信息替换和 fast_direct 都会沿用这些帧。</small>
+                </label>
+              </div>
+              <div className="quality-help-grid">
+                <div>
+                  <strong>第一步</strong>
+                  <small>输出原始图片帧，可在列表中查看第一张抽帧。</small>
+                </div>
+                <div>
+                  <strong>后续步骤</strong>
+                  <small>抽帧完成后再运行「产品信息替换」，image2 不会重复读取原视频。</small>
+                </div>
+                <div>
+                  <strong>服务依赖</strong>
+                  <small>只依赖本地 ffmpeg；即使 image2 未配置，也可以先完成抽帧。</small>
+                </div>
+              </div>
+            </div>
+          )}
+          {preprocessMethod === "product_frame_replace" && (
+            <div className="depth-quality-panel">
+              <div className="quality-control-grid">
+                <label>
+                  <span>已抽帧素材</span>
+                  <input value={`${selectedClips.filter((clip) => clip.frameExtraction?.status === "done").length}/${selectedClips.length} 个已完成`} readOnly />
+                  <small>必须先执行「视频抽帧」，本步骤只处理已抽取的图片帧。</small>
+                </label>
+                <label>
+                  <span>产品图</span>
+                  <input value={`${selectedProductImages.length} 张`} readOnly />
+                  <small>优先使用已选产品图片；未选择时使用产品素材库中的全部产品图。</small>
+                </label>
+                <label>
+                  <span>替换输出</span>
+                  <input value="图片帧" readOnly />
+                  <small>输出已替换产品信息的图片帧，不直接生成视频。</small>
+                </label>
+              </div>
+              <label className="depth-textarea-control">
+                <span>image2 替换要求</span>
+                <textarea
+                  value={productFramePrompt}
+                  onChange={(event) => setProductFramePrompt(event.target.value)}
+                  rows={3}
+                />
+              </label>
+              <div className="quality-help-grid">
+                <div>
+                  <strong>第二步</strong>
+                  <small>从第一步抽帧结果读取图片，提交 image2 做产品信息替换。</small>
+                </div>
+                <div>
+                  <strong>生成方式</strong>
+                  <small>后续 AI 加工选择 fast_direct 分帧替换生成时，只引用这些替换帧。</small>
+                </div>
+                <div>
+                  <strong>服务配置</strong>
+                  <small>后端读取 IMAGE2_ENDPOINT、IMAGE2_API_KEY、IMAGE2_MODEL；素材远端访问继续复用 OSS。</small>
+                </div>
+              </div>
+            </div>
+          )}
           <div className="depth-action-card">
             <div>
               <strong>已选择 {selectedClips.length} 个素材</strong>
@@ -1758,11 +2129,24 @@ export function DepthVideoWorkbenchPage({
                       查看{preprocessMethodLabel(clip.preprocess.method || "depth")}
                     </a>
                   )}
+                  {clip.frameExtraction?.status === "done" && clip.frameExtraction.frames.length > 0 && (
+                    <button className="secondary-button compact" onClick={() => toggleFrameInspection(clip.id)}>
+                      {expandedFrameClipIds.includes(clip.id) ? "收起抽帧" : "检查抽帧"}
+                    </button>
+                  )}
+                  {clip.productFrameReplacement?.status === "done" && clip.productFrameReplacement.frames[0]?.imageUrl && (
+                    <a className="secondary-button compact" href={clip.productFrameReplacement.frames[0].imageUrl} target="_blank" rel="noreferrer">
+                      查看替换帧
+                    </a>
+                  )}
                   <button className="secondary-button compact" onClick={() => runDepthPreprocess([clip.id])} disabled={isDepthBusy(clip)}>
                     <RefreshCw size={15} />
                     {clip.preprocess?.status === "done" ? "重新处理" : "处理"}
                   </button>
                 </div>
+                {expandedFrameClipIds.includes(clip.id) && clip.frameExtraction?.status === "done" && (
+                  <FrameExtractionInspector record={clip.frameExtraction} />
+                )}
               </div>
             ))}
             {!clips.length && <p className="muted-note">素材片段库为空，请先导入素材。</p>}
@@ -1969,8 +2353,15 @@ export function DepthVideoWorkbenchPage({
               {aiProvider === "seedance_api" && aiGenerationMode === "frame_replacement" && (
                 <div className="ai-source-summary">
                   <strong>分帧替换输入</strong>
-                  <span>抽帧：每秒 1 帧，最多 {frameReplacementMaxFrames} 帧</span>
-                  <span>产品图：{aiReferenceImages.filter((image) => image.category === "product").length || aiReferenceImages.length} 张</span>
+                  <span>
+                    产品替换帧：{aiReferenceClip?.productFrameReplacement?.status === "done"
+                      ? aiReferenceClip.productFrameReplacement.frames.filter((frame) => frame.imageUrl).length
+                      : 0} 张
+                  </span>
+                  <span>
+                    前置参数：每 {aiReferenceClip?.productFrameReplacement?.intervalSec ?? productFrameIntervalSec} 秒 1 帧，
+                    最多 {aiReferenceClip?.productFrameReplacement?.maxFrames ?? productFrameMaxFrames} 帧
+                  </span>
                   <label className="ai-duration-editor">
                     <span>生成时长</span>
                     <input
@@ -2447,6 +2838,41 @@ function LineageOutputs({ outputs }: { outputs: MaterialOutput[] }) {
   );
 }
 
+function FrameExtractionInspector({ record }: { record: VideoFrameExtractionRecord }) {
+  return (
+    <div className="frame-inspector">
+      <div className="frame-inspector-heading">
+        <strong>抽帧素材检查</strong>
+        <small>
+          {record.frames.length} 张 · 每 {record.intervalSec}s 1 帧 · 源视频约 {record.durationSec ? `${record.durationSec.toFixed(1)}s` : "未知时长"}
+        </small>
+      </div>
+      <div className="frame-inspector-grid">
+        {record.frames.map((frame) => {
+          const localPath = frame.localPath || localAssetPathFromUrl(frame.imageUrl);
+          return (
+            <article className="frame-inspector-card" key={`${record.id}_${frame.index}`}>
+              <a className="frame-thumb-link" href={frame.imageUrl} target="_blank" rel="noreferrer" title="打开预览地址">
+                <img src={frame.imageUrl} alt={`抽帧 ${frame.index + 1}`} />
+              </a>
+              <div className="frame-card-meta">
+                <strong>#{frame.index + 1} · {formatTimestamp(frame.timestampSec)}</strong>
+                <div className="frame-card-links">
+                  <a href={frame.imageUrl} target="_blank" rel="noreferrer" title={frame.imageUrl}>预览地址</a>
+                  {localPath && (
+                    <a href={localFileHref(localPath)} target="_blank" rel="noreferrer" title={localPath}>本地文件</a>
+                  )}
+                </div>
+                <small title={localPath || frame.imageUrl}>{localPath || frame.imageUrl}</small>
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function createClipFromSegment(
   segment: VideoSegment,
   videoUrl: string,
@@ -2721,6 +3147,16 @@ function renderAiPromptForMode(
 ) {
   const basePrompt = renderAiPrompt(template, clip, images);
   if (mode !== "frame_replacement") return basePrompt;
+  const replacedFrameCount = clip?.productFrameReplacement?.status === "done"
+    ? clip.productFrameReplacement.frames.filter((frame) => frame.imageUrl).length
+    : 0;
+  if (replacedFrameCount) {
+    return buildProductFrameVideoPrompt({
+      scriptPrompt: cleanFrameReplacementScript(template),
+      transcript,
+      frameCount: replacedFrameCount
+    });
+  }
   const productImages = images.filter((image) => image.category === "product");
   return buildFrameReplacementPrompt({
     scriptPrompt: cleanFrameReplacementScript(template),
@@ -2728,6 +3164,22 @@ function renderAiPromptForMode(
     frameCount: plannedFrameCountFromClip(clip, fallbackDuration),
     productCount: Math.max(1, productImages.length || images.length)
   });
+}
+
+function buildProductFrameVideoPrompt(input: {
+  scriptPrompt: string;
+  transcript?: VideoAiJob["transcript"];
+  frameCount: number;
+}) {
+  const frameRefs = formatImageRefs(1, input.frameCount);
+  const transcriptText = input.transcript?.text?.trim();
+  const scriptText = cleanFrameReplacementScript(input.scriptPrompt);
+  return cleanRenderedAiPrompt([
+    `参考${frameRefs}的画面节奏、镜头构图、人物动作、场景变化和已替换后的产品呈现。`,
+    transcriptText ? `使用以下文案：${transcriptText}。` : "",
+    scriptText ? `结合脚本：${scriptText}。` : "",
+    "生成一条电商短视频，保持真实实拍质感，延续参考帧中的产品信息和展示方式。"
+  ].filter(Boolean).join("\n"));
 }
 
 function buildFrameReplacementPrompt(input: {
@@ -3104,6 +3556,10 @@ function depthMetaText(clip: MaterialClip) {
   const method = record.method || "depth";
   const quality = method === "split"
     ? `${clip.split?.segmentCount ?? 0} 个切片 · 每段 ≤10s`
+    : method === "video_frame_extract"
+    ? `${clip.frameExtraction?.frames.length ?? 0} 张抽帧 · ffmpeg`
+    : method === "product_frame_replace"
+    ? `${clip.productFrameReplacement?.frames.length ?? 0} 张替换帧 · image2 · ${formatImage2Cost(clip.productFrameReplacement)}`
     : method === "depth"
     ? `${record.params.inputSize ?? 518}px · ${record.params.letterbox === false ? "拉伸" : "Letterbox"} · 滤波 ${record.params.edgeFilterStrength ?? 0}`
     : "OpenCV 灰度转换";
@@ -3112,6 +3568,14 @@ function depthMetaText(clip: MaterialClip) {
   if (record.status === "processing") return `${record.params.depthModel} · 正在生成 · ${runtime}`;
   if (record.status === "done") return `${record.params.depthModel} · ${runtime}`;
   return `${record.params.depthModel} · 处理失败 · ${runtime}`;
+}
+
+function formatImage2Cost(record: ProductFrameReplacementRecord | undefined) {
+  if (!record?.cost.estimatedUsd) return "$0.000000";
+  const tokenText = record.cost.inputTokens !== undefined || record.cost.outputTokens !== undefined
+    ? ` · in ${record.cost.inputTokens ?? 0} / out ${record.cost.outputTokens ?? 0}`
+    : "";
+  return `$${record.cost.estimatedUsd.toFixed(6)}${tokenText}`;
 }
 
 function buildComposePlan(clips: MaterialClip[], recipe: ComposeRecipeStep[]): DepthComposePlanItem[] {
@@ -3180,6 +3644,8 @@ function depthStatusLabel(status?: string) {
 function preprocessMethodLabel(method: VideoPreprocessMethod) {
   if (method === "depth") return "深度视频";
   if (method === "grayscale") return "黑白视频";
+  if (method === "video_frame_extract") return "视频抽帧";
+  if (method === "product_frame_replace") return "产品信息替换";
   return "视频切分";
 }
 

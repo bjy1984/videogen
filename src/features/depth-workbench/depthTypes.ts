@@ -18,7 +18,7 @@ export interface MaterialTag {
   createdAt: string;
 }
 
-export type VideoPreprocessMethod = "depth" | "grayscale" | "split";
+export type VideoPreprocessMethod = "depth" | "grayscale" | "split" | "video_frame_extract" | "product_frame_replace";
 
 export interface VideoSourceRange {
   startSec: number;
@@ -72,6 +72,77 @@ export interface DepthPreprocessRecord {
     elapsedSec: number;
     gpuSec?: number;
     estimatedCash?: number;
+  };
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt: string;
+}
+
+export interface VideoFrameExtractionRecord {
+  id: string;
+  sourceClipId: string;
+  lineageId: string;
+  status: "queued" | "processing" | "done" | "failed";
+  provider: "local-bridge";
+  inputVideoUrl: string;
+  intervalSec: number;
+  maxFrames: number;
+  durationSec?: number;
+  frames: Array<{
+    index: number;
+    timestampSec: number;
+    imageUrl: string;
+    localPath?: string;
+    fileName?: string;
+  }>;
+  cost: {
+    elapsedSec: number;
+  };
+  error?: string;
+  createdAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  updatedAt: string;
+}
+
+export interface ProductFrameReplacementRecord {
+  id: string;
+  sourceClipId: string;
+  lineageId: string;
+  status: "queued" | "processing" | "done" | "failed";
+  provider: "image2";
+  inputVideoUrl: string;
+  productImageUrls: string[];
+  prompt: string;
+  intervalSec: number;
+  maxFrames: number;
+  durationSec?: number;
+  frames: Array<{
+    index: number;
+    timestampSec: number;
+    sourceImageUrl: string;
+    sourceLocalPath?: string;
+    imageUrl?: string;
+    localPath?: string;
+    remoteImageUrl?: string;
+    prompt?: string;
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      estimatedUsd: number;
+    };
+    error?: string;
+  }>;
+  cost: {
+    elapsedSec: number;
+    estimatedCash?: number;
+    estimatedUsd?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
   };
   error?: string;
   createdAt: string;
@@ -190,6 +261,8 @@ export interface MaterialClip {
   customTags: string[];
   split?: VideoSplitRecord;
   preprocess?: DepthPreprocessRecord;
+  frameExtraction?: VideoFrameExtractionRecord;
+  productFrameReplacement?: ProductFrameReplacementRecord;
   aiJobs: VideoAiJob[];
   outputs: MaterialOutput[];
   usageCount: number;

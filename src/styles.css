@@ -1858,7 +1858,8 @@ label.secondary-button:focus-within {
   line-height: 1.45;
 }
 
-.quality-control-grid input[type="number"] {
+.quality-control-grid input[type="number"],
+.quality-control-grid input[type="text"] {
   min-width: 0;
   min-height: 40px;
   padding: 7px 9px;
@@ -1866,6 +1867,23 @@ label.secondary-button:focus-within {
   border-radius: 8px;
   background: white;
   color: var(--text);
+}
+
+.depth-textarea-control {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.depth-textarea-control span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.depth-textarea-control textarea {
+  min-height: 92px;
+  resize: vertical;
 }
 
 .quality-toggle-card {
@@ -2549,6 +2567,90 @@ label.secondary-button:focus-within {
   min-height: 36px;
   padding: 7px 10px;
   white-space: nowrap;
+}
+
+.frame-inspector {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 12px;
+  padding: 12px;
+  border: 1px dashed #bfd8ca;
+  border-radius: 8px;
+  background: #fbfdfb;
+}
+
+.frame-inspector-heading {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.frame-inspector-heading strong,
+.frame-inspector-heading small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-inspector-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.frame-inspector-card {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: white;
+}
+
+.frame-thumb-link {
+  display: block;
+  background: #0f1411;
+}
+
+.frame-thumb-link img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 9 / 16;
+  object-fit: contain;
+}
+
+.frame-card-meta {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  padding: 9px;
+}
+
+.frame-card-meta strong,
+.frame-card-meta small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-card-links {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.frame-card-links a {
+  color: var(--accent-dark);
+  font-size: 12px;
+  font-weight: 900;
+  text-decoration: none;
+}
+
+.frame-card-links a:hover {
+  text-decoration: underline;
 }
 
 @keyframes depth-live-slide {

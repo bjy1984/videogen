@@ -47,6 +47,10 @@ const rootDir = path.resolve(__dirname, "..");
 const assetRootDir = process.env.VIDEOGEN_ASSET_ROOT || path.join(rootDir, ".videogen-assets");
 const uploadTempDir = path.join(assetRootDir, "_uploads");
 const port = Number(process.env.VIDEO_GENERATION_BRIDGE_PORT || 8790);
+const image2InputUsdPerMillionTokens = 8;
+const image2OutputUsdPerMillionTokens = 15;
+const defaultImage2Endpoint = "https://openrouter.ai/api/v1/chat/completions";
+const defaultImage2Model = "openai/gpt-5.4-image-2";
 const defaultDepthAnythingOnnxPath = path.join(
   rootDir,
   "models",
@@ -130,6 +134,15 @@ app.get("/health", async (req, res) => {
         : process.env[apiKeyEnvName]
           ? "api-key"
           : "missing"
+    },
+    image2: {
+      endpoint: resolveImage2Endpoint(),
+      model: resolveImage2Model(),
+      ready: Boolean(process.env.IMAGE2_API_KEY),
+      pricing: {
+        inputUsdPerMillionTokens: image2InputUsdPerMillionTokens,
+        outputUsdPerMillionTokens: image2OutputUsdPerMillionTokens
+      }
     },
     comfyui: {
       endpoint: comfyEndpoint,
@@ -837,6 +850,101 @@ app.post("/seedance/tasks/:id/sync", async (req, res) => {
   }
 });
 
+app.post("/image2/product-frame-replacement", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const projectId = safePathPart(String(body.projectId || "default_project"));
+    const clipId = safePathPart(String(body.clipId || "clip"));
+    const replacementId = safePathPart(String(body.replacementId || `image2_${Date.now()}`));
+    const sourceFrames = Array.isArray(body.sourceFrames) ? body.sourceFrames : [];
+    const productImageUrls = Array.isArray(body.productImageUrls)
+      ? body.productImageUrls.map((url) => String(url || "").trim()).filter(Boolean)
+      : [];
+    const basePrompt = String(body.prompt || "").trim();
+    if (!sourceFrames.length) {
+      throw new BridgeError("产品信息替换需要至少 1 张视频抽帧。", 400);
+    }
+    if (!productImageUrls.length) {
+      throw new BridgeError("产品信息替换需要至少 1 张产品图片素材。", 400);
+    }
+
+    const startedAt = Date.now();
+    const relativeDir = path.join("image2-product-frames", projectId, clipId, replacementId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+
+    const normalizedProductUrls = await normalizeImage2MediaUrlList(req, productImageUrls);
+    validateImage2RemoteMediaUrls(normalizedProductUrls);
+    const results = [];
+    const usageTotals = createEmptyImage2Usage();
+    for (const [frameOrder, rawFrame] of sourceFrames.entries()) {
+      if (!isRecord(rawFrame)) continue;
+      const sourceImageUrl = String(rawFrame.imageUrl || "").trim();
+      if (!sourceImageUrl) continue;
+      const index = Number.isFinite(Number(rawFrame.index)) ? Number(rawFrame.index) : frameOrder;
+      const timestampSec = Number.isFinite(Number(rawFrame.timestampSec)) ? Number(rawFrame.timestampSec) : 0;
+      const normalizedSourceUrl = await normalizeSeedanceMediaUrl(req, sourceImageUrl);
+      validateImage2RemoteMediaUrls([normalizedSourceUrl]);
+      const framePrompt = buildImage2ProductFramePrompt({
+        basePrompt,
+        frameIndex: index + 1,
+        productCount: normalizedProductUrls.length
+      });
+      const image2Result = await requestImage2Edit({
+        prompt: framePrompt,
+        sourceImageUrl: normalizedSourceUrl,
+        productImageUrls: normalizedProductUrls
+      });
+      addImage2Usage(usageTotals, image2Result.usage);
+      const fileName = `product_frame_${String(frameOrder + 1).padStart(3, "0")}.${image2Result.extension}`;
+      const localPath = path.join(outputDir, fileName);
+      await writeFile(localPath, image2Result.bytes);
+      results.push({
+        index,
+        timestampSec,
+        sourceImageUrl,
+        imageUrl: assetUrl(req, relativeDir, fileName),
+        localPath,
+        remoteImageUrl: image2Result.remoteImageUrl,
+        fileName,
+        prompt: framePrompt,
+        usage: image2Result.usage
+      });
+    }
+    if (!results.length) {
+      throw new BridgeError("没有可用的视频抽帧可提交 image2。", 400);
+    }
+    const now = new Date().toISOString();
+    res.json({
+      trace: {
+        id: replacementId,
+        kind: "product-frame-replacement",
+        provider: "image2",
+        status: "done",
+        localPath: outputDir,
+        summary: {
+          sourceFrameCount: sourceFrames.length,
+          frameCount: results.length,
+          productImageCount: normalizedProductUrls.length,
+          elapsedSec: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
+          inputTokens: usageTotals.inputTokens,
+          outputTokens: usageTotals.outputTokens,
+          totalTokens: usageTotals.totalTokens,
+          estimatedUsd: usageTotals.estimatedUsd
+        },
+        createdAt: now,
+        updatedAt: now
+      },
+      frames: results
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Image2 product frame replacement failed."
+    });
+  }
+});
+
 app.get("/seedance/tasks/:id", async (req, res) => {
   try {
     const endpoint = resolveSeedanceEndpoint(String(req.query.endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL));
@@ -1143,6 +1251,239 @@ async function downloadAsset(url: string, providerLabel = "Seedance", auth?: See
     contentType,
     extension: extensionFromContentType(contentType) || extensionFromUrl(url) || "mp4"
   };
+}
+
+async function requestImage2Edit(input: {
+  prompt: string;
+  sourceImageUrl: string;
+  productImageUrls: string[];
+}) {
+  if (process.env.IMAGE2_MOCK === "passthrough") {
+    const downloaded = await downloadAsset(input.sourceImageUrl, "Image2 mock");
+    return {
+      bytes: downloaded.bytes,
+      extension: imageExtensionFromDownload(downloaded.extension),
+      remoteImageUrl: input.sourceImageUrl,
+      usage: createEmptyImage2Usage()
+    };
+  }
+  const endpoint = resolveImage2Endpoint();
+  const apiKey = String(process.env.IMAGE2_API_KEY || "").trim();
+  if (!apiKey) {
+    throw new BridgeError("Image2 图片生成服务未配置。请在 .env 中设置 IMAGE2_API_KEY。", 400);
+  }
+  const model = resolveImage2Model();
+  const mediaUrls = [input.sourceImageUrl, ...input.productImageUrls];
+  const payload = isOpenRouterImage2Endpoint(endpoint)
+    ? buildOpenRouterImage2Payload({ model, prompt: input.prompt, mediaUrls })
+    : {
+        ...(model ? { model } : {}),
+        prompt: input.prompt,
+        images: mediaUrls,
+        image_urls: mediaUrls,
+        response_format: "url"
+      };
+  const response = await fetchWithTimeout(endpoint, {
+    method: "POST",
+    timeoutMs: 240_000,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      "HTTP-Referer": "http://localhost:5174",
+      "X-OpenRouter-Title": "videogen"
+    },
+    body: JSON.stringify(payload)
+  });
+  const responseText = await response.text();
+  let payloadJson: unknown;
+  try {
+    payloadJson = responseText ? JSON.parse(responseText) : {};
+  } catch {
+    payloadJson = { raw: responseText };
+  }
+  if (!response.ok) {
+    throw new BridgeError(extractUpstreamError(payloadJson) || `Image2 图片生成失败：${response.status}`, 502);
+  }
+  const parsed = extractImage2Output(payloadJson);
+  const usage = calculateImage2Usage(payloadJson);
+  if (parsed.b64Json) {
+    return {
+      bytes: Buffer.from(parsed.b64Json, "base64"),
+      extension: "png",
+      remoteImageUrl: undefined,
+      usage
+    };
+  }
+  if (!parsed.url) {
+    throw new BridgeError("Image2 响应中没有找到图片 URL 或 b64_json。", 502);
+  }
+  if (parsed.url.startsWith("data:image/")) {
+    const dataUrlImage = decodeImageDataUrl(parsed.url);
+    return {
+      bytes: dataUrlImage.bytes,
+      extension: dataUrlImage.extension,
+      remoteImageUrl: undefined,
+      usage
+    };
+  }
+  const downloaded = await downloadAsset(parsed.url, "Image2");
+  return {
+    bytes: downloaded.bytes,
+    extension: imageExtensionFromDownload(downloaded.extension),
+    remoteImageUrl: parsed.url,
+    usage
+  };
+}
+
+function resolveImage2Endpoint() {
+  return String(process.env.IMAGE2_ENDPOINT || defaultImage2Endpoint).trim();
+}
+
+function resolveImage2Model() {
+  return String(process.env.IMAGE2_MODEL || defaultImage2Model).trim();
+}
+
+function isOpenRouterImage2Endpoint(endpoint: string) {
+  try {
+    const url = new URL(endpoint);
+    return url.hostname.includes("openrouter.ai") && url.pathname.includes("/chat/completions");
+  } catch {
+    return false;
+  }
+}
+
+function buildOpenRouterImage2Payload(input: {
+  model: string;
+  prompt: string;
+  mediaUrls: string[];
+}) {
+  return {
+    model: input.model,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: input.prompt },
+          ...input.mediaUrls.map((url) => ({
+            type: "image_url",
+            image_url: { url }
+          }))
+        ]
+      }
+    ],
+    modalities: ["image", "text"],
+    stream: false
+  };
+}
+
+function calculateImage2Usage(payload: unknown) {
+  const usage = isRecord(payload) && isRecord(payload.usage) ? payload.usage : undefined;
+  const inputTokens = numberFromUnknown(usage?.prompt_tokens);
+  const outputTokens = numberFromUnknown(usage?.completion_tokens);
+  const totalTokens = numberFromUnknown(usage?.total_tokens) || inputTokens + outputTokens;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    estimatedUsd: image2TokenCostUsd(inputTokens, outputTokens)
+  };
+}
+
+function createEmptyImage2Usage() {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    estimatedUsd: 0
+  };
+}
+
+function addImage2Usage(
+  target: ReturnType<typeof createEmptyImage2Usage>,
+  usage: ReturnType<typeof createEmptyImage2Usage>
+) {
+  target.inputTokens += usage.inputTokens;
+  target.outputTokens += usage.outputTokens;
+  target.totalTokens += usage.totalTokens;
+  target.estimatedUsd = Number((target.estimatedUsd + usage.estimatedUsd).toFixed(8));
+}
+
+function image2TokenCostUsd(inputTokens: number, outputTokens: number) {
+  return Number((
+    inputTokens * image2InputUsdPerMillionTokens / 1_000_000 +
+    outputTokens * image2OutputUsdPerMillionTokens / 1_000_000
+  ).toFixed(8));
+}
+
+function numberFromUnknown(value: unknown) {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function decodeImageDataUrl(value: string) {
+  const match = value.match(/^data:image\/([a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) {
+    throw new BridgeError("Image2 返回了无法解析的 data URL 图片。", 502);
+  }
+  return {
+    bytes: Buffer.from(match[2], "base64"),
+    extension: imageExtensionFromDownload(match[1])
+  };
+}
+
+function extractImage2Output(payload: unknown): { url?: string; b64Json?: string } {
+  const stack: unknown[] = [payload];
+  const seen = new Set<unknown>();
+  while (stack.length) {
+    const current = stack.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    if (Array.isArray(current)) {
+      stack.push(...current);
+      continue;
+    }
+    if (!isRecord(current)) continue;
+    const b64Json = stringField(current, "b64_json") || stringField(current, "base64") || stringField(current, "image_base64");
+    if (b64Json) return { b64Json: stripDataUrlPrefix(b64Json) };
+    const url = stringField(current, "url")
+      || stringField(current, "image_url")
+      || stringField(current, "output_url")
+      || stringField(current, "signed_url");
+    if (url) return { url };
+    stack.push(...Object.values(current));
+  }
+  return {};
+}
+
+function buildImage2ProductFramePrompt(input: {
+  basePrompt: string;
+  frameIndex: number;
+  productCount: number;
+}) {
+  const productRefs = formatNumberedRefs("产品图", input.productCount);
+  return [
+    `以视频抽帧${input.frameIndex}为画面主体，保持原画面的构图、人物、场景、光线、动作和镜头透视。`,
+    `将画面中的原产品信息替换为${productRefs}中的产品信息，匹配产品外观、颜色、包装和使用状态。`,
+    "不要改变人物身份、背景结构、画面比例和文字以外的关键内容。",
+    input.basePrompt
+  ].filter(Boolean).join("\n");
+}
+
+function formatNumberedRefs(label: string, count: number) {
+  return Array.from({ length: Math.max(1, count) }, (_, index) => `【${label}${index + 1}】`).join("");
+}
+
+function stringField(record: Record<string, unknown>, key: string) {
+  return typeof record[key] === "string" ? record[key] : undefined;
+}
+
+function stripDataUrlPrefix(value: string) {
+  const match = value.match(/^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/);
+  return match?.[1] || value;
+}
+
+function imageExtensionFromDownload(extension: string) {
+  return ["jpg", "jpeg", "png", "webp"].includes(extension.toLowerCase()) ? extension : "png";
 }
 
 async function copyPreprocessSource(input: {
@@ -2237,6 +2578,10 @@ async function normalizeSeedanceMediaUrlList(req: express.Request, urls: string[
   return Promise.all(urls.map((url) => normalizeSeedanceMediaUrl(req, url)));
 }
 
+async function normalizeImage2MediaUrlList(req: express.Request, urls: string[]) {
+  return Promise.all(urls.map((url) => normalizeSeedanceMediaUrl(req, url)));
+}
+
 async function normalizeSeedanceMediaUrl(req: express.Request, value: string) {
   const localAsset = resolveLocalAssetUrl(value);
   if (localAsset && isOssConfigured()) {
@@ -2249,6 +2594,16 @@ async function normalizeSeedanceMediaUrl(req: express.Request, value: string) {
     if (signed) return signed.signedUrl;
   }
   return normalizeAssetUrl(req, value);
+}
+
+function validateImage2RemoteMediaUrls(urls: string[]) {
+  const localOnlyUrls = urls.filter(isLocalOnlyUrl);
+  if (localOnlyUrls.length) {
+    throw new BridgeError(
+      "Image2 远端无法访问本地素材地址。当前素材 URL 指向 localhost/127.0.0.1/内网 IP，请确认 OSS 已配置，或设置 VIDEOGEN_PUBLIC_ASSET_BASE_URL 为公网可访问的 /assets 地址。",
+      400
+    );
+  }
 }
 
 function normalizeWorkbenchAssetUrls(req: express.Request, state: WorkbenchLibraryState) {
