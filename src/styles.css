@@ -2653,6 +2653,131 @@ label.secondary-button:focus-within {
   text-decoration: underline;
 }
 
+.frame-edit-button {
+  justify-self: start;
+  min-height: 32px;
+  padding: 6px 9px;
+}
+
+.frame-mask-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(10, 18, 14, 0.62);
+}
+
+.frame-mask-panel {
+  display: grid;
+  width: min(1180px, 96vw);
+  max-height: 94vh;
+  overflow: hidden;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 8px;
+  background: white;
+  box-shadow: 0 18px 70px rgba(0, 0, 0, 0.28);
+}
+
+.frame-mask-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.frame-mask-head h2 {
+  margin: 0;
+}
+
+.frame-mask-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 280px;
+  gap: 14px;
+  min-height: 0;
+}
+
+.frame-mask-stage {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f1411;
+  cursor: crosshair;
+}
+
+.frame-mask-canvas {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  max-height: calc(94vh - 150px);
+  touch-action: none;
+}
+
+.frame-mask-canvas img {
+  display: block;
+  max-width: 100%;
+  max-height: calc(94vh - 150px);
+  object-fit: contain;
+  user-select: none;
+}
+
+.frame-mask-rect {
+  position: absolute;
+  border: 2px solid #12b981;
+  background: rgba(18, 185, 129, 0.18);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.12);
+  pointer-events: none;
+}
+
+.frame-mask-sidebar {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.frame-mask-sidebar label,
+.frame-mask-info {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.frame-mask-sidebar label span,
+.frame-mask-info span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.frame-mask-sidebar select {
+  min-height: 38px;
+}
+
+.frame-mask-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.frame-mask-error {
+  margin: 0;
+  padding: 9px 10px;
+  border-radius: 8px;
+  background: #fff0f0;
+  color: #a73939;
+  font-weight: 800;
+}
+
 @keyframes depth-live-slide {
   from {
     transform: translateX(0);

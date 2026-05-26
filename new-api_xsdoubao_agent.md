@@ -24,7 +24,7 @@ curl --location 'https://xxx.ai/v1/videos/{task_id}/content' \
 - xsdoubao/seedance2.0_fast_vision 720p 0.912 cny/秒
 - xsdoubao/seedance2.0_vision 720p 1.368 cny/秒
 - xsdoubao/seedance2.0_vision 1080p 2.28 cny/秒
-
+xsdoubao/seedance2.0_vision
 
 # 参考请求报文
 - /v1/video/generations 接口

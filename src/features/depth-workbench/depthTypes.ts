@@ -96,6 +96,20 @@ export interface VideoFrameExtractionRecord {
     imageUrl: string;
     localPath?: string;
     fileName?: string;
+    modifiedImageUrl?: string;
+    modifiedLocalPath?: string;
+    maskEdits?: Array<{
+      id: string;
+      effect: "mosaic" | "blur" | "solid";
+      strength: number;
+      rect: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+      };
+      createdAt: string;
+    }>;
   }>;
   cost: {
     elapsedSec: number;

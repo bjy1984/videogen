@@ -318,6 +318,78 @@ app.post("/privacy/brand-mask", upload.single("video"), async (req, res) => {
   }
 });
 
+app.post("/privacy/frame-mask", async (req, res) => {
+  try {
+    assertPrivacyPythonReady();
+    const body = req.body || {};
+    const projectId = safePathPart(String(body.projectId || "default_project"));
+    const clipId = safePathPart(String(body.clipId || "clip"));
+    const frameIndex = Math.max(0, Math.floor(Number(body.frameIndex || 0)));
+    const sourceImageUrl = String(body.sourceImageUrl || "").trim();
+    const sourceLocalPath = String(body.sourceLocalPath || "").trim();
+    const rects = Array.isArray(body.rects) ? body.rects : [];
+    if (!sourceImageUrl && !sourceLocalPath) {
+      throw new BridgeError("单帧打码需要传入抽帧图片地址或本地路径。", 400);
+    }
+    if (!rects.length) {
+      throw new BridgeError("单帧打码至少需要一个矩形遮罩。", 400);
+    }
+    const editId = safePathPart(String(body.editId || `frame_mask_${Date.now()}`));
+    const extension =
+      extensionFromUrl(sourceLocalPath) ||
+      extensionFromUrl(sourceImageUrl) ||
+      "jpg";
+    const relativeDir = path.join("frame-masks", projectId, clipId, editId);
+    const outputDir = path.join(assetRootDir, relativeDir);
+    await mkdir(outputDir, { recursive: true });
+    const sourcePath = path.join(outputDir, `source.${extension}`);
+    const outputName = `frame_${String(frameIndex + 1).padStart(3, "0")}_masked.${extension}`;
+    const outputPath = path.join(outputDir, outputName);
+    if (sourceLocalPath) {
+      await copyFile(resolveAssetLocalPath(sourceLocalPath), sourcePath);
+    } else {
+      const localPath = resolveAssetUrlLocalPath(sourceImageUrl);
+      if (localPath) {
+        await copyFile(localPath, sourcePath);
+      } else {
+        const downloaded = await downloadAsset(sourceImageUrl, "抽帧图片");
+        await writeFile(sourcePath, downloaded.bytes);
+      }
+    }
+    const scriptPath = path.join(rootDir, "scripts", "frame_mask.py");
+    await runProcess(
+      resolvePrivacyPythonPath(),
+      [
+        scriptPath,
+        "--input",
+        sourcePath,
+        "--output",
+        outputPath,
+        "--rects",
+        JSON.stringify(rects)
+      ],
+      120_000
+    );
+    await stat(outputPath);
+    const now = new Date().toISOString();
+    res.json({
+      edit: {
+        id: editId,
+        frameIndex,
+        imageUrl: assetUrl(req, relativeDir, outputName),
+        localPath: outputPath,
+        rects,
+        createdAt: now
+      }
+    });
+  } catch (error) {
+    const status = error instanceof BridgeError ? error.status : 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : "Frame mask failed."
+    });
+  }
+});
+
 app.post("/assets/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
@@ -533,6 +605,8 @@ app.post("/video/preprocess/split", upload.single("video"), async (req, res) => 
     const clipId = safePathPart(String(req.body.clipId || "clip"));
     const lineageId = safePathPart(String(req.body.lineageId || "lineage"));
     const preprocessId = safePathPart(`split_${Date.now()}`);
+    const targetSec = normalizeSplitTargetSec(Number(req.body.targetSec || 10));
+    const minLastSec = Math.max(1, Math.min(5, targetSec));
     const extension =
       extensionFromContentType(req.file?.mimetype || null) ||
       extensionFromUrl(req.file?.originalname || "") ||
@@ -556,7 +630,11 @@ app.post("/video/preprocess/split", upload.single("video"), async (req, res) => 
     if (!durationSec) {
       throw new BridgeError("无法读取源视频时长，切分失败。", 400);
     }
-    const ranges = planVideoSplitRanges(durationSec);
+    const ranges = planVideoSplitRanges(durationSec, {
+      targetSec,
+      maxSec: targetSec,
+      minLastSec
+    });
     const segmentResults = [];
     for (const range of ranges) {
       const segmentId = safePathPart(`${clipId}_part_${String(range.index + 1).padStart(2, "0")}`);
@@ -596,9 +674,9 @@ app.post("/video/preprocess/split", upload.single("video"), async (req, res) => 
         summary: {
           sourceDurationSec: Number(durationSec.toFixed(3)),
           segmentCount: segmentResults.length,
-          targetSec: 9.9,
-          maxSec: 10,
-          minLastSec: 5,
+          targetSec,
+          maxSec: targetSec,
+          minLastSec,
           elapsedSec: Math.max(0, Math.round((Date.now() - startedAt) / 1000))
         },
         createdAt: now,
@@ -2491,6 +2569,10 @@ function extractLoginUserId(payload: unknown): string | undefined {
 
 function resolveSeedanceEndpoint(endpoint: string) {
   return process.env.SEEDANCE_NEWAPI_BASE_URL || process.env.NEWAPI_BASE_URL || endpoint || DEFAULT_SEEDANCE_ARK_BASE_URL;
+}
+
+function normalizeSplitTargetSec(value: number) {
+  return Math.min(10, Math.max(1, Math.round(Number.isFinite(value) ? value : 10)));
 }
 
 function publicBaseUrl(req: express.Request) {

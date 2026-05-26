@@ -361,6 +361,7 @@ export async function preprocessSplitVideoBridge(input: {
   sourceLocalPath?: string;
   sourceVideoUrl?: string;
   sourceVideoName?: string;
+  targetSec?: number;
 }) {
   const formData = new FormData();
   formData.set("projectId", input.projectId);
@@ -369,6 +370,7 @@ export async function preprocessSplitVideoBridge(input: {
   if (input.sourceLocalPath) formData.set("sourceLocalPath", input.sourceLocalPath);
   if (input.sourceVideoUrl) formData.set("sourceVideoUrl", input.sourceVideoUrl);
   if (input.sourceVideoName) formData.set("sourceVideoName", input.sourceVideoName);
+  if (input.targetSec) formData.set("targetSec", String(input.targetSec));
   if (input.video) formData.set("video", input.video, input.video.name || `${input.clipId}.mp4`);
   return requestBridgeForm<{
     trace: {
@@ -562,6 +564,46 @@ export async function replaceProductFramesBridge(input: {
       productImageUrls: input.productImageUrls
     }),
     timeoutMs: 900_000
+  });
+}
+
+export async function maskExtractedFrameBridge(input: {
+  bridgeUrl?: string;
+  projectId: string;
+  clipId: string;
+  frameIndex: number;
+  sourceImageUrl: string;
+  sourceLocalPath?: string;
+  rects: Array<{
+    rect: { x: number; y: number; width: number; height: number };
+    effect: "mosaic" | "blur" | "solid";
+    strength: number;
+  }>;
+}) {
+  return requestBridge<{
+    edit: {
+      id: string;
+      frameIndex: number;
+      imageUrl: string;
+      localPath: string;
+      rects: Array<{
+        rect: { x: number; y: number; width: number; height: number };
+        effect: "mosaic" | "blur" | "solid";
+        strength: number;
+      }>;
+      createdAt: string;
+    };
+  }>(input.bridgeUrl, "/privacy/frame-mask", {
+    method: "POST",
+    body: JSON.stringify({
+      projectId: input.projectId,
+      clipId: input.clipId,
+      frameIndex: input.frameIndex,
+      sourceImageUrl: input.sourceImageUrl,
+      sourceLocalPath: input.sourceLocalPath,
+      rects: input.rects
+    }),
+    timeoutMs: 180_000
   });
 }
 

@@ -1,5 +1,5 @@
 import { Check, Clock3, Coins, Film, Image as ImageIcon, Layers3, Plus, RefreshCw, Sparkles, Tag, Trash2, Upload, Wand2 } from "lucide-react";
-import type { Dispatch, SetStateAction } from "react";
+import type { Dispatch, PointerEvent, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { VideoSegment } from "../../types";
 import { createId } from "../../services/id";
@@ -9,6 +9,7 @@ import {
   extractVideoFramesBridge,
   getSeedanceBridgeTask,
   loadWorkbenchLibraryState,
+  maskExtractedFrameBridge,
   preprocessDepthVideoBridge,
   preprocessGrayscaleVideoBridge,
   preprocessSplitVideoBridge,
@@ -74,6 +75,19 @@ const providerOptions: Array<{ value: DepthAiProvider; label: string }> = [
 ];
 
 type AiGenerationMode = "direct_reference" | "frame_replacement";
+type FrameMaskEffect = "mosaic" | "blur" | "solid";
+
+interface FrameMaskDraft {
+  clipId: string;
+  frameIndex: number;
+}
+
+interface NormalizedRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 const seedanceFastDirectModel = "xsdoubao/seedance2.0_fast_direct";
 const frameReplacementMaxFrames = 12;
@@ -230,12 +244,19 @@ export function DepthVideoWorkbenchPage({
   const [depthLetterbox, setDepthLetterbox] = useState(true);
   const [depthEdgeFilterStrength, setDepthEdgeFilterStrength] = useState(0.35);
   const [depthEdgeFilterDiameter, setDepthEdgeFilterDiameter] = useState(7);
+  const [splitTargetSec, setSplitTargetSec] = useState(10);
   const [productFrameIntervalSec, setProductFrameIntervalSec] = useState(1);
   const [productFrameMaxFrames, setProductFrameMaxFrames] = useState(12);
   const [productFramePrompt, setProductFramePrompt] = useState(
     "保留原视频抽帧中的人物、场景、光线、构图和动作，只替换画面中的产品信息。"
   );
   const [expandedFrameClipIds, setExpandedFrameClipIds] = useState<string[]>([]);
+  const [frameMaskDraft, setFrameMaskDraft] = useState<FrameMaskDraft | undefined>();
+  const [frameMaskRect, setFrameMaskRect] = useState<NormalizedRect | undefined>();
+  const [frameMaskEffect, setFrameMaskEffect] = useState<FrameMaskEffect>("mosaic");
+  const [frameMaskStrength, setFrameMaskStrength] = useState(0.85);
+  const [isMaskingFrame, setIsMaskingFrame] = useState(false);
+  const [frameMaskError, setFrameMaskError] = useState("");
   const [aiClockNow, setAiClockNow] = useState(Date.now());
   const libraryHydratedRef = useRef(false);
   const lastSavedLibraryRef = useRef("");
@@ -271,6 +292,8 @@ export function DepthVideoWorkbenchPage({
     [clips]
   );
   const aiMonitorStats = useMemo(() => buildAiMonitorStats(aiJobRows, aiClockNow), [aiClockNow, aiJobRows]);
+  const activeFrameMaskClip = frameMaskDraft ? clips.find((clip) => clip.id === frameMaskDraft.clipId) : undefined;
+  const activeFrameMaskFrame = activeFrameMaskClip?.frameExtraction?.frames.find((frame) => frame.index === frameMaskDraft?.frameIndex);
 
   useEffect(() => {
     if (aiReferenceClipId && clips.some((clip) => clip.id === aiReferenceClipId)) return;
@@ -685,6 +708,80 @@ export function DepthVideoWorkbenchPage({
     );
   }
 
+  function openFrameMaskEditor(clipId: string, frameIndex: number) {
+    setFrameMaskDraft({ clipId, frameIndex });
+    setFrameMaskRect(undefined);
+    setFrameMaskEffect("mosaic");
+    setFrameMaskStrength(0.85);
+    setFrameMaskError("");
+  }
+
+  async function applyFrameMask() {
+    if (!frameMaskDraft || !frameMaskRect) {
+      setFrameMaskError("请先在图片上拖拽选择需要打码的区域。");
+      return;
+    }
+    const clip = clips.find((item) => item.id === frameMaskDraft.clipId);
+    const frame = clip?.frameExtraction?.frames.find((item) => item.index === frameMaskDraft.frameIndex);
+    if (!clip || !frame) {
+      setFrameMaskError("没有找到要修改的抽帧素材。");
+      return;
+    }
+    setIsMaskingFrame(true);
+    setFrameMaskError("");
+    try {
+      const result = await maskExtractedFrameBridge({
+        bridgeUrl,
+        projectId,
+        clipId: clip.id,
+        frameIndex: frame.index,
+        sourceImageUrl: frame.modifiedImageUrl || frame.imageUrl,
+        sourceLocalPath: frame.modifiedLocalPath || frame.localPath,
+        rects: [{ rect: frameMaskRect, effect: frameMaskEffect, strength: frameMaskStrength }]
+      });
+      const now = new Date().toISOString();
+      onClips((current) =>
+        current.map((item) => {
+          if (item.id !== clip.id || !item.frameExtraction) return item;
+          return {
+            ...item,
+            frameExtraction: {
+              ...item.frameExtraction,
+              frames: item.frameExtraction.frames.map((currentFrame) =>
+                currentFrame.index === frame.index
+                  ? {
+                      ...currentFrame,
+                      modifiedImageUrl: result.edit.imageUrl,
+                      modifiedLocalPath: result.edit.localPath,
+                      maskEdits: [
+                        ...(currentFrame.maskEdits || []),
+                        {
+                          id: result.edit.id,
+                          effect: frameMaskEffect,
+                          strength: frameMaskStrength,
+                          rect: frameMaskRect,
+                          createdAt: now
+                        }
+                      ]
+                    }
+                  : currentFrame
+              ),
+              updatedAt: now
+            },
+            updatedAt: now
+          };
+        })
+      );
+      setFrameMaskDraft(undefined);
+      setFrameMaskRect(undefined);
+      onNotice(`已修改第 ${frame.index + 1} 张抽帧素材，后续产品信息替换会优先使用修改后的帧。`);
+    } catch (error) {
+      setFrameMaskError(error instanceof Error ? error.message : "抽帧打码失败。");
+    } finally {
+      setIsMaskingFrame(false);
+    }
+  }
+
   function clearSelectedImageTags() {
     if (!selectedImageIds.length) {
       onNotice("请先选择要清除标签的图片素材。");
@@ -828,7 +925,8 @@ export function DepthVideoWorkbenchPage({
             video,
             sourceLocalPath,
             sourceVideoUrl,
-            sourceVideoName: clip.sourceFileName || clip.title
+            sourceVideoName: clip.sourceFileName || clip.title,
+            targetSec: splitTargetSec
           });
           markSplitDone(clipId, result);
           continue;
@@ -848,8 +946,8 @@ export function DepthVideoWorkbenchPage({
             .map((frame) => ({
               index: frame.index,
               timestampSec: frame.timestampSec,
-              imageUrl: frame.imageUrl,
-              localPath: frame.localPath
+              imageUrl: frame.modifiedImageUrl || frame.imageUrl,
+              localPath: frame.modifiedLocalPath || frame.localPath
             }))
             .filter((frame) => frame.imageUrl && !frame.imageUrl.startsWith("blob:"));
           if (!sourceFrames.length) {
@@ -1856,7 +1954,7 @@ export function DepthVideoWorkbenchPage({
               <Layers3 size={16} />
               <span>
                 <strong>视频切分</strong>
-                <small>按 9.9 秒切片，自动保障末段不少于 5 秒且每段不超过 10 秒。</small>
+                <small>按设定秒数切片，最小 1 秒，最大不超过 10 秒。</small>
               </span>
             </button>
             <button className={preprocessMethod === "video_frame_extract" ? "active" : ""} onClick={() => setPreprocessMethod("video_frame_extract")}>
@@ -1975,14 +2073,28 @@ export function DepthVideoWorkbenchPage({
           )}
           {preprocessMethod === "split" && (
             <div className="depth-quality-panel">
+              <div className="quality-control-grid">
+                <label>
+                  <span>分段时长</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={10}
+                    step={1}
+                    value={splitTargetSec}
+                    onChange={(event) => setSplitTargetSec(normalizeSplitTargetSec(Number(event.target.value)))}
+                  />
+                  <small>秒。按 1 秒为最小单位增减，提交时用于视频切分。</small>
+                </label>
+              </div>
               <div className="quality-help-grid">
                 <div>
                   <strong>切分规则</strong>
-                  <small>以 9.9 秒为目标长度切分；最后一段不足 5 秒时，从前面片段均匀挪出时长。</small>
+                  <small>以 {splitTargetSec} 秒为目标长度切分；最后一段过短时，从前面片段均匀挪出时长。</small>
                 </div>
                 <div>
                   <strong>长度限制</strong>
-                  <small>所有切片都会保持不超过 10 秒，适配后续 AI 再加工的视频时长限制。</small>
+                  <small>所有切片都会保持不超过设定时长，适配后续 AI 再加工的视频时长限制。</small>
                 </div>
                 <div>
                   <strong>关联关系</strong>
@@ -2145,7 +2257,7 @@ export function DepthVideoWorkbenchPage({
                   </button>
                 </div>
                 {expandedFrameClipIds.includes(clip.id) && clip.frameExtraction?.status === "done" && (
-                  <FrameExtractionInspector record={clip.frameExtraction} />
+                  <FrameExtractionInspector record={clip.frameExtraction} onEditFrame={(frameIndex) => openFrameMaskEditor(clip.id, frameIndex)} />
                 )}
               </div>
             ))}
@@ -2539,6 +2651,25 @@ export function DepthVideoWorkbenchPage({
           </div>
         </section>
       )}
+      {frameMaskDraft && activeFrameMaskFrame && (
+        <FrameMaskEditor
+          frame={activeFrameMaskFrame}
+          rect={frameMaskRect}
+          effect={frameMaskEffect}
+          strength={frameMaskStrength}
+          busy={isMaskingFrame}
+          error={frameMaskError}
+          onRect={setFrameMaskRect}
+          onEffect={setFrameMaskEffect}
+          onStrength={setFrameMaskStrength}
+          onApply={applyFrameMask}
+          onClose={() => {
+            setFrameMaskDraft(undefined);
+            setFrameMaskRect(undefined);
+            setFrameMaskError("");
+          }}
+        />
+      )}
     </section>
   );
 }
@@ -2838,7 +2969,7 @@ function LineageOutputs({ outputs }: { outputs: MaterialOutput[] }) {
   );
 }
 
-function FrameExtractionInspector({ record }: { record: VideoFrameExtractionRecord }) {
+function FrameExtractionInspector({ record, onEditFrame }: { record: VideoFrameExtractionRecord; onEditFrame: (frameIndex: number) => void }) {
   return (
     <div className="frame-inspector">
       <div className="frame-inspector-heading">
@@ -2849,26 +2980,156 @@ function FrameExtractionInspector({ record }: { record: VideoFrameExtractionReco
       </div>
       <div className="frame-inspector-grid">
         {record.frames.map((frame) => {
-          const localPath = frame.localPath || localAssetPathFromUrl(frame.imageUrl);
+          const displayUrl = frame.modifiedImageUrl || frame.imageUrl;
+          const localPath = frame.modifiedLocalPath || frame.localPath || localAssetPathFromUrl(displayUrl);
           return (
             <article className="frame-inspector-card" key={`${record.id}_${frame.index}`}>
-              <a className="frame-thumb-link" href={frame.imageUrl} target="_blank" rel="noreferrer" title="打开预览地址">
-                <img src={frame.imageUrl} alt={`抽帧 ${frame.index + 1}`} />
+              <a className="frame-thumb-link" href={displayUrl} target="_blank" rel="noreferrer" title="打开预览地址">
+                <img src={displayUrl} alt={`抽帧 ${frame.index + 1}`} />
               </a>
               <div className="frame-card-meta">
-                <strong>#{frame.index + 1} · {formatTimestamp(frame.timestampSec)}</strong>
+                <strong>#{frame.index + 1} · {formatTimestamp(frame.timestampSec)}{frame.modifiedImageUrl ? " · 已修改" : ""}</strong>
                 <div className="frame-card-links">
-                  <a href={frame.imageUrl} target="_blank" rel="noreferrer" title={frame.imageUrl}>预览地址</a>
+                  <a href={displayUrl} target="_blank" rel="noreferrer" title={displayUrl}>预览地址</a>
                   {localPath && (
                     <a href={localFileHref(localPath)} target="_blank" rel="noreferrer" title={localPath}>本地文件</a>
                   )}
                 </div>
+                <button className="secondary-button compact frame-edit-button" onClick={() => onEditFrame(frame.index)}>
+                  素材修改/打码
+                </button>
                 <small title={localPath || frame.imageUrl}>{localPath || frame.imageUrl}</small>
               </div>
             </article>
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function FrameMaskEditor({
+  frame,
+  rect,
+  effect,
+  strength,
+  busy,
+  error,
+  onRect,
+  onEffect,
+  onStrength,
+  onApply,
+  onClose
+}: {
+  frame: VideoFrameExtractionRecord["frames"][number];
+  rect?: NormalizedRect;
+  effect: FrameMaskEffect;
+  strength: number;
+  busy: boolean;
+  error?: string;
+  onRect: (rect: NormalizedRect | undefined) => void;
+  onEffect: (effect: FrameMaskEffect) => void;
+  onStrength: (strength: number) => void;
+  onApply: () => void;
+  onClose: () => void;
+}) {
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | undefined>();
+  const imageUrl = frame.modifiedImageUrl || frame.imageUrl;
+
+  function pointFromEvent(event: PointerEvent<HTMLDivElement>) {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height));
+    return { x, y };
+  }
+
+  function rectFromPoints(start: { x: number; y: number }, end: { x: number; y: number }) {
+    return {
+      x: Math.min(start.x, end.x),
+      y: Math.min(start.y, end.y),
+      width: Math.abs(end.x - start.x),
+      height: Math.abs(end.y - start.y)
+    };
+  }
+
+  return (
+    <div className="frame-mask-sheet" role="dialog" aria-modal="true">
+      <section className="frame-mask-panel">
+        <div className="frame-mask-head">
+          <div>
+            <p className="eyebrow">Frame Edit</p>
+            <h2>素材修改/打码</h2>
+            <small>拖拽选择需要遮罩的区域，保存后后续产品信息替换会使用修改后的帧。</small>
+          </div>
+          <button className="secondary-button compact" onClick={onClose} disabled={busy}>关闭</button>
+        </div>
+        <div className="frame-mask-layout">
+          <div className="frame-mask-stage">
+            <div
+              className="frame-mask-canvas"
+              onPointerDown={(event) => {
+                const point = pointFromEvent(event);
+                setDragStart(point);
+                onRect({ x: point.x, y: point.y, width: 0, height: 0 });
+              }}
+              onPointerMove={(event) => {
+                if (!dragStart) return;
+                onRect(rectFromPoints(dragStart, pointFromEvent(event)));
+              }}
+              onPointerUp={(event) => {
+                if (!dragStart) return;
+                const nextRect = rectFromPoints(dragStart, pointFromEvent(event));
+                setDragStart(undefined);
+                if (nextRect.width < 0.01 || nextRect.height < 0.01) {
+                  onRect(undefined);
+                  return;
+                }
+                onRect(nextRect);
+              }}
+            >
+              <img src={imageUrl} alt={`编辑抽帧 ${frame.index + 1}`} draggable={false} />
+              {rect && (
+                <span
+                  className="frame-mask-rect"
+                  style={{
+                    left: `${rect.x * 100}%`,
+                    top: `${rect.y * 100}%`,
+                    width: `${rect.width * 100}%`,
+                    height: `${rect.height * 100}%`
+                  }}
+                />
+              )}
+            </div>
+          </div>
+          <aside className="frame-mask-sidebar">
+            <label>
+              <span>打码方式</span>
+              <select value={effect} onChange={(event) => onEffect(event.target.value as FrameMaskEffect)}>
+                <option value="mosaic">马赛克</option>
+                <option value="blur">模糊</option>
+                <option value="solid">遮挡</option>
+              </select>
+            </label>
+            <label>
+              <span>强度</span>
+              <input type="range" min={0.1} max={1} step={0.05} value={strength} onChange={(event) => onStrength(Number(event.target.value))} />
+              <strong>{Math.round(strength * 100)}%</strong>
+            </label>
+            <div className="frame-mask-info">
+              <strong>当前帧</strong>
+              <span>#{frame.index + 1} · {formatTimestamp(frame.timestampSec)}</span>
+              <span>{frame.modifiedImageUrl ? "已存在修改版，可继续叠加打码。" : "正在编辑原始抽帧。"}</span>
+            </div>
+            {error && <p className="frame-mask-error">{error}</p>}
+            <div className="frame-mask-actions">
+              <button className="secondary-button compact" onClick={() => onRect(undefined)} disabled={busy || !rect}>清除区域</button>
+              <button className="primary-button compact" onClick={onApply} disabled={busy || !rect}>
+                {busy ? "处理中..." : "保存修改帧"}
+              </button>
+            </div>
+          </aside>
+        </div>
+      </section>
     </div>
   );
 }
@@ -3130,6 +3391,10 @@ function normalizeSeedanceDuration(value: number, clip: MaterialClip | undefined
   const defaultDuration = seedanceDurationFromClip(clip, probedDurationSec, fallback);
   const duration = Number.isFinite(value) ? value : defaultDuration;
   return Math.min(10, Math.max(3, Math.round(duration)));
+}
+
+function normalizeSplitTargetSec(value: number) {
+  return Math.min(10, Math.max(1, Math.round(Number.isFinite(value) ? value : 10)));
 }
 
 function plannedFrameCountFromClip(clip: MaterialClip | undefined, fallbackDuration: number) {
